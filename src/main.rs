@@ -20,7 +20,7 @@ struct BashConfig {
 
 struct BashRule {
     decision: Decision,
-    args: Option<Regex>,
+    args: Option<Pattern>,
     reason: String,
 }
 
@@ -86,7 +86,7 @@ struct WebFetchConfig {
 
 struct WebFetchRule {
     decision: Decision,
-    pattern: Regex,
+    pattern: Pattern,
     reason: String,
 }
 
@@ -136,30 +136,29 @@ impl<'de> Deserialize<'de> for WebFetchConfig {
     }
 }
 
-fn glob_to_regex(glob: &str) -> String {
-    let mut result = String::from("^");
-    for c in glob.chars() {
-        match c {
-            '*' => result.push_str(".*"),
-            '?' => result.push('.'),
-            '.' | '+' | '(' | ')' | '{' | '}' | '[' | ']' | '|' | '^' | '$' | '\\' => {
-                result.push('\\');
-                result.push(c);
-            }
-            _ => result.push(c),
-        }
-    }
-    result.push('$');
-    result
+enum Pattern {
+    Glob(String),
+    Regex(Regex),
 }
 
-fn compile_pattern(s: &str) -> Regex {
-    let pattern = if let Some(inner) = s.strip_prefix('/').and_then(|s| s.strip_suffix('/')) {
-        format!("^{inner}$")
+impl Pattern {
+    fn is_match(&self, text: &str) -> bool {
+        match self {
+            Pattern::Glob(g) => glob_match_ultra::glob_match(g, text),
+            Pattern::Regex(r) => r.is_match(text),
+        }
+    }
+}
+
+fn compile_pattern(s: &str) -> Pattern {
+    if let Some(inner) = s.strip_prefix('/').and_then(|s| s.strip_suffix('/')) {
+        Pattern::Regex(
+            Regex::new(&format!("^{inner}$"))
+                .unwrap_or_else(|e| panic!("Invalid pattern '{s}': {e}")),
+        )
     } else {
-        glob_to_regex(s)
-    };
-    Regex::new(&pattern).unwrap_or_else(|e| panic!("Invalid pattern '{s}': {e}"))
+        Pattern::Glob(s.to_string())
+    }
 }
 
 #[derive(Deserialize)]
@@ -287,7 +286,7 @@ fn resolve_command(bash: &BashConfig, name: &str, args: &str) -> Option<(Decisio
     None
 }
 
-fn matches_args(pattern: &Option<Regex>, args: &str) -> bool {
+fn matches_args(pattern: &Option<Pattern>, args: &str) -> bool {
     match pattern {
         None => true,
         Some(re) => re.is_match(args),
@@ -831,7 +830,7 @@ mod tests {
         let mut rules: HashMap<String, Vec<BashRule>> = HashMap::new();
         rules.entry("rm".to_string()).or_default().push(BashRule {
             decision: Decision::Deny,
-            args: Some(compile_pattern("-rf *")),
+            args: Some(compile_pattern("-rf **")),
             reason: "No recursive force deletes".into(),
         });
         rules.entry("rm".to_string()).or_default().push(BashRule {
@@ -852,7 +851,7 @@ mod tests {
         let mut rules: HashMap<String, Vec<BashRule>> = HashMap::new();
         rules.entry("rm".to_string()).or_default().push(BashRule {
             decision: Decision::Deny,
-            args: Some(compile_pattern("-rf *")),
+            args: Some(compile_pattern("-rf **")),
             reason: "No recursive force deletes".into(),
         });
         rules.entry("rm".to_string()).or_default().push(BashRule {
@@ -974,43 +973,114 @@ mod tests {
         );
     }
 
-    // --- glob_to_regex ---
+    // --- glob patterns ---
 
     #[test]
-    fn glob_star_wildcard() {
-        let re = Regex::new(&glob_to_regex("https://docs.rs/*")).unwrap();
-        assert!(re.is_match("https://docs.rs/regex/latest"));
-        assert!(!re.is_match("https://crates.io/foo"));
+    fn glob_star_single_segment() {
+        let p = compile_pattern("https://docs.rs/*");
+        assert!(p.is_match("https://docs.rs/foo"));
+        assert!(!p.is_match("https://docs.rs/foo/bar"));
+        assert!(!p.is_match("https://crates.io/foo"));
+    }
+
+    #[test]
+    fn glob_doublestar_crosses_segments() {
+        let p = compile_pattern("https://docs.rs/**");
+        assert!(p.is_match("https://docs.rs/foo"));
+        assert!(p.is_match("https://docs.rs/foo/bar/baz"));
+        assert!(!p.is_match("https://crates.io/foo"));
     }
 
     #[test]
     fn glob_question_mark() {
-        let re = Regex::new(&glob_to_regex("https://a.com/ab?")).unwrap();
-        assert!(re.is_match("https://a.com/abc"));
-        assert!(!re.is_match("https://a.com/abcd"));
+        let p = compile_pattern("ab?");
+        assert!(p.is_match("abc"));
+        assert!(!p.is_match("abcd"));
     }
 
     #[test]
-    fn glob_metachar_escaping() {
-        let re = Regex::new(&glob_to_regex("https://example.com/path")).unwrap();
-        assert!(re.is_match("https://example.com/path"));
-        assert!(!re.is_match("https://exampleXcom/path"));
+    fn glob_character_class() {
+        let p = compile_pattern("[a-z]*");
+        assert!(p.is_match("hello"));
+        assert!(!p.is_match("123"));
+    }
+
+    #[test]
+    fn glob_brace_expansion() {
+        let p = compile_pattern("{allow,deny}");
+        assert!(p.is_match("allow"));
+        assert!(p.is_match("deny"));
+        assert!(!p.is_match("ask"));
+    }
+
+    #[test]
+    fn glob_brace_with_space_star() {
+        let p = compile_pattern("{ls,why,info} *");
+        assert!(p.is_match("ls react"));
+        assert!(p.is_match("why lodash"));
+        assert!(!p.is_match("ls"));
+        assert!(!p.is_match("install react"));
+    }
+
+    #[test]
+    fn glob_doublestar_matches_empty() {
+        let p = compile_pattern("**");
+        assert!(p.is_match(""));
+        assert!(p.is_match("anything"));
+        assert!(p.is_match("a/b/c"));
+    }
+
+    #[test]
+    fn glob_brace_with_space_doublestar() {
+        let p = compile_pattern("{fmt,build,test} **");
+        assert!(p.is_match("fmt --check"));
+        assert!(p.is_match("test /some/path"));
+        assert!(!p.is_match("fmt"));
+        assert!(!p.is_match("run --release"));
+    }
+
+    #[test]
+    fn glob_empty_brace_alternation() {
+        let p = compile_pattern("{fmt,build,test}{, **}");
+        assert!(p.is_match("fmt"));
+        assert!(p.is_match("fmt --check"));
+        assert!(!p.is_match("run --release"));
+    }
+
+    #[test]
+    fn glob_doublestar_inside_brace() {
+        // ** inside brace should still cross /
+        let p = compile_pattern("{foo, **}");
+        assert!(p.is_match("foo"));
+        assert!(p.is_match(" a/b/c"));
+
+        let p2 = compile_pattern("test{, **}");
+        assert!(p2.is_match("test"));
+        assert!(p2.is_match("test --flag"));
+        assert!(p2.is_match("test /some/path"));
+    }
+
+    #[test]
+    fn glob_literal_dot() {
+        let p = compile_pattern("example.com");
+        assert!(p.is_match("example.com"));
+        assert!(!p.is_match("exampleXcom"));
     }
 
     // --- compile_pattern ---
 
     #[test]
     fn compile_pattern_glob() {
-        let re = compile_pattern("https://docs.rs/*");
-        assert!(re.is_match("https://docs.rs/foo"));
-        assert!(!re.is_match("https://evil.com/foo"));
+        let p = compile_pattern("https://docs.rs/**");
+        assert!(p.is_match("https://docs.rs/foo"));
+        assert!(!p.is_match("https://evil.com/foo"));
     }
 
     #[test]
     fn compile_pattern_regex() {
-        let re = compile_pattern("/https://docs\\.rs/.+/");
-        assert!(re.is_match("https://docs.rs/regex/latest"));
-        assert!(!re.is_match("https://docs.rs/"));
+        let p = compile_pattern("/https://docs\\.rs/.+/");
+        assert!(p.is_match("https://docs.rs/regex/latest"));
+        assert!(!p.is_match("https://docs.rs/"));
     }
 
     // --- handle_web_fetch ---
@@ -1020,7 +1090,7 @@ mod tests {
             rules: vec![
                 WebFetchRule {
                     decision: Decision::Deny,
-                    pattern: compile_pattern("https://evil.com/*"),
+                    pattern: compile_pattern("https://evil.com/**"),
                     reason: "Blocked domain".into(),
                 },
                 WebFetchRule {
@@ -1030,12 +1100,12 @@ mod tests {
                 },
                 WebFetchRule {
                     decision: Decision::Allow,
-                    pattern: compile_pattern("https://docs.rs/*"),
+                    pattern: compile_pattern("https://docs.rs/**"),
                     reason: "ok".into(),
                 },
                 WebFetchRule {
                     decision: Decision::Allow,
-                    pattern: compile_pattern("https://crates.io/*"),
+                    pattern: compile_pattern("https://crates.io/**"),
                     reason: "ok".into(),
                 },
             ],
@@ -1081,7 +1151,7 @@ mod tests {
             rules: vec![
                 WebFetchRule {
                     decision: Decision::Deny,
-                    pattern: compile_pattern("https://bad.internal.corp/*"),
+                    pattern: compile_pattern("https://bad.internal.corp/**"),
                     reason: "Denied".into(),
                 },
                 WebFetchRule {

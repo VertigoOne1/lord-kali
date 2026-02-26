@@ -78,6 +78,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "glob-match-ultra"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "be882a85ca19ca784d7819c1f9eef003df05bd8b696b2cc8e3d98838e8278bc9"
+
+[[package]]
 name = "hashbrown"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -120,6 +126,7 @@ name = "lord-kali"
 version = "0.1.0"
 dependencies = [
  "dirs",
+ "glob-match-ultra",
  "regex",
  "serde",
  "serde_json",

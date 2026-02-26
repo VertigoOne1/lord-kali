@@ -7,7 +7,7 @@ allowed_commands = [
   "awk", "basename", "cat", "cut", "date", "df", "diff", "dirname",
   "base64", "cd", "du", "echo", "env", "fd", "file", "find", "free", "grep",
   "head", "htop", "id", "jq", "less", "ls", "lsof", "md5sum", "more",
-  "od", "ping", "printenv", "printf", "ps", "pwd", "realpath", "rg",
+  "od", "pgrep", "ping", "printenv", "printf", "ps", "pwd", "realpath", "rg",
   "sed", "sha256sum", "sort", "stat", "tail", "tee", "top", "tr", "tree",
   "true", "type", "uname", "uniq", "uptime", "wc", "whereis", "which",
   "whoami", "xargs", "xxd",
@@ -15,12 +15,17 @@ allowed_commands = [
 
 [[bash.rules]]
 command = "cargo"
-args = "/(fmt|build|test)( .*)?/"
+args = "{fmt,build,test}{, **}"
+decision = "allow"
+
+[[bash.rules]]
+command = "git"
+args = "{status,diff,log,show,branch,tag,remote,fetch,blame,shortlog,describe,rev-parse,ls-files,ls-tree,cat-file,reflog,stash list,stash show,add}{, **}"
 decision = "allow"
 
 [[bash.rules]]
 command = "rm"
-args = "-rf *"
+args = "-rf **"
 decision = "deny"
 reason = "No recursive force deletes"
 
@@ -40,18 +45,23 @@ decision = "deny"
 reason = "Use pnpm instead of npm."
 
 [[bash.rules]]
+command = "npx"
+decision = "deny"
+reason = "Use pnpm dlx instead of npx."
+
+[[bash.rules]]
 command = "pnpm"
-args = "/(run )?(validate|lint).*/"
+args = "{validate,lint,run validate,run lint}{, **}"
 decision = "allow"
 
 [[bash.rules]]
 command = "pnpm"
-args = "/(ls|why|info|view) .*/"
+args = "{ls,why,info,view}{, **}"
 decision = "allow"
 
 [[bash.rules]]
 command = "docker"
-args = "/logs .*/"
+args = "logs{, **}"
 decision = "allow"
 
 # allow to fetch any URL without a query parameter
