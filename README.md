@@ -32,7 +32,9 @@ Then point your Claude Code hook at the binary in `~/.claude/settings.json` or `
 
 ## Configuration
 
-Config lives at `~/.config/lord-kali/config.toml`.
+All `*.toml` files in `~/.config/lord-kali/` are loaded in lexicographic order and merged. This lets you split config into files like `00-base.toml`, `10-bash.toml`, `20-groups.toml`. If no `.toml` files are found, a default config is used (everything passes through).
+
+Within each file, rules are ordered: top-level rules first, then group rules in definition order. When files are merged, each file's rules are appended after the previous file's. The combined result is evaluated first-match-wins, so rules from earlier files have higher priority. For bash rules sharing the same command key, both files' rules are concatenated (earlier file first). For `[log]`, the last file with a `[log]` section wins.
 
 ```toml
 # Optional - omit or set enabled=false to disable
@@ -123,6 +125,48 @@ Rules are defined as `[[web-fetch.rules]]` entries. Each rule has:
 - **`reason`** (optional): message shown to the user. Defaults to `"ok"`.
 
 Rules are evaluated in config file order - the first matching rule wins.
+
+### Per-rule project scoping
+
+Any rule (bash or web-fetch) can have an optional `projects` array to restrict it to specific directories. A rule with `projects` only applies when the hook's `cwd` is inside one of the listed directories. Rules without `projects` are global (match all cwds). `~` is expanded in project paths.
+
+```toml
+[[bash.rules]]
+command = "cargo"
+args = "publish{, **}"
+decision = "deny"
+projects = ["~/projects/my-rust-project"]
+```
+
+### Groups
+
+Groups set shared `projects` for all rules within them. If a rule inside a group also has `projects`, they merge (union).
+
+```toml
+[[group]]
+projects = ["~/projects/my-rust-project", "~/projects/other"]
+
+[group.bash]
+allowed_commands = ["rustup"]
+
+[[group.bash.rules]]
+command = "cargo"
+args = "publish{, **}"
+decision = "deny"
+reason = "Do not publish from these projects"
+
+[[group.bash.rules]]
+command = "make"
+decision = "allow"
+projects = ["~/projects/third"]
+# effective projects = group's + ["~/projects/third"]
+
+[[group.web-fetch.rules]]
+url = "https://internal.example.com/**"
+decision = "allow"
+```
+
+Multiple `[[group]]` sections can be defined. Group rules are appended after top-level rules (first-match-wins, definition order). Group `bash` and `web-fetch` sections use the same format as the top-level sections.
 
 ### Patterns
 

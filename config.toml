@@ -1,3 +1,7 @@
+# All *.toml files in ~/.config/lord-kali/ are loaded in lexicographic order.
+# Rules from earlier files match first (first-match-wins priority).
+# Split configs like 00-base.toml, 10-bash.toml, 20-groups.toml are supported.
+
 [log]
 enabled = true
 path = "~/.local/state/lord-kali/hook.jsonl"
@@ -68,3 +72,36 @@ decision = "allow"
 [[web-fetch.rules]]
 url = "/[^?]*/"
 decision = "allow"
+
+# Per-rule project scoping: restrict a rule to specific directories
+#
+# [[bash.rules]]
+# command = "cargo"
+# args = "publish{, **}"
+# decision = "deny"
+# projects = ["~/projects/my-rust-project"]
+
+# Group-scoped overrides: all rules in a group inherit its projects.
+# Rules within a group can add extra projects (union with group's).
+#
+# [[group]]
+# projects = ["~/projects/my-rust-project", "~/projects/other"]
+#
+# [group.bash]
+# allowed_commands = ["rustup"]
+#
+# [[group.bash.rules]]
+# command = "cargo"
+# args = "publish{, **}"
+# decision = "deny"
+# reason = "Do not publish from these projects"
+#
+# [[group.bash.rules]]
+# command = "make"
+# decision = "allow"
+# projects = ["~/projects/third"]
+# # effective projects = group's + ["~/projects/third"]
+#
+# [[group.web-fetch.rules]]
+# url = "https://internal.example.com/**"
+# decision = "allow"
