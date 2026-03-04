@@ -32,7 +32,18 @@ Then point your Claude Code hook at the binary in `~/.claude/settings.json` or `
 
 ## Configuration
 
+### Project-local configuration
+
+You can commit a `.claude/lord-kali.toml` file inside your project repository. This file is discovered by walking up from `cwd` until a `.git` directory is found. `cwd` is the working directory that Claude Code passes in the hook's JSON input, reflecting the project directory Claude Code is operating in (not the process working directory of lord-kali itself). Project-local rules have the highest priority and are evaluated before any global rules.
+
+### Global configuration
+
 All `*.toml` files in `~/.config/lord-kali/` are loaded in lexicographic order and merged. This lets you split config into files like `00-base.toml`, `10-bash.toml`, `20-groups.toml`. If no `.toml` files are found, a default config is used (everything passes through).
+
+Config loading order (highest priority first):
+
+1. `.claude/lord-kali.toml` (project-local, found by walking up from `cwd`)
+2. `~/.config/lord-kali/*.toml` (global, in lexicographic order)
 
 Within each file, rules are ordered: top-level rules first, then group rules in definition order. When files are merged, each file's rules are appended after the previous file's. The combined result is evaluated first-match-wins, so rules from earlier files have higher priority. For bash rules sharing the same command key, both files' rules are concatenated (earlier file first). For `[log]`, the last file with a `[log]` section wins.
 

@@ -2,7 +2,7 @@ use regex::Regex;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Default)]
 struct Config {
@@ -249,22 +249,21 @@ enum Decision {
 }
 
 fn main() {
-    let config = load_config();
-
     let mut input = String::new();
     std::io::stdin()
         .read_to_string(&mut input)
         .expect("Failed to read stdin");
 
     let hook_input: HookInput = serde_json::from_str(&input).expect("Failed to parse hook input");
+    let cwd = hook_input.cwd.as_deref();
+
+    let config = load_config(cwd);
 
     if let Some(log) = &config.log {
         if log.enabled {
             log_invocation(log, &input);
         }
     }
-
-    let cwd = hook_input.cwd.as_deref();
 
     if hook_input.tool_name == "Bash" {
         if let Some(command) = &hook_input.tool_input.command {
@@ -312,7 +311,34 @@ fn handle_web_fetch(
     None
 }
 
-fn load_config() -> Config {
+fn find_project_config(cwd: &str) -> Option<PathBuf> {
+    let mut dir = Path::new(cwd);
+    loop {
+        let candidate = dir.join(".claude/lord-kali.toml");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        if dir.join(".git").exists() {
+            return None;
+        }
+        dir = dir.parent()?;
+    }
+}
+
+fn parse_config_file(path: &Path) -> Config {
+    let content = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("Failed to read config at {}: {}", path.display(), e));
+    let raw: RawConfig = toml::from_str(&content)
+        .unwrap_or_else(|e| panic!("Failed to parse config at {}: {}", path.display(), e));
+    Config::from(raw)
+}
+
+fn load_config(cwd: Option<&str>) -> Config {
+    let initial = cwd
+        .and_then(find_project_config)
+        .map(|p| parse_config_file(&p))
+        .unwrap_or_default();
+
     let config_dir = dirs::config_dir()
         .expect("Could not determine config directory")
         .join("lord-kali");
@@ -334,14 +360,8 @@ fn load_config() -> Config {
 
     paths
         .into_iter()
-        .map(|path| {
-            let content = std::fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("Failed to read config at {}: {}", path.display(), e));
-            let raw: RawConfig = toml::from_str(&content)
-                .unwrap_or_else(|e| panic!("Failed to parse config at {}: {}", path.display(), e));
-            Config::from(raw)
-        })
-        .fold(Config::default(), Config::merge)
+        .map(|path| parse_config_file(&path))
+        .fold(initial, Config::merge)
 }
 
 fn handle_bash(
@@ -1948,5 +1968,87 @@ decision = "allow"
         let json = r#"{"tool_name":"Bash","tool_input":{"command":"ls"}}"#;
         let input: HookInput = serde_json::from_str(json).unwrap();
         assert_eq!(input.cwd, None);
+    }
+
+    // --- find_project_config ---
+
+    #[test]
+    fn find_project_config_in_cwd() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_dir = tmp.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        std::fs::write(claude_dir.join("lord-kali.toml"), "").unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+
+        let result = find_project_config(tmp.path().to_str().unwrap());
+        assert_eq!(result, Some(claude_dir.join("lord-kali.toml")));
+    }
+
+    #[test]
+    fn find_project_config_from_subdirectory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_dir = tmp.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        std::fs::write(claude_dir.join("lord-kali.toml"), "").unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+
+        let sub = tmp.path().join("src/deep");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let result = find_project_config(sub.to_str().unwrap());
+        assert_eq!(result, Some(claude_dir.join("lord-kali.toml")));
+    }
+
+    #[test]
+    fn find_project_config_stops_at_git_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+
+        let result = find_project_config(tmp.path().to_str().unwrap());
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn find_project_config_none_when_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = tmp.path().join("some/path");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+
+        let result = find_project_config(sub.to_str().unwrap());
+        assert_eq!(result, None);
+    }
+
+    // --- project-local config priority ---
+
+    #[test]
+    fn project_config_rules_take_priority_over_global() {
+        let project_toml = r#"
+[[bash.rules]]
+command = "rm"
+decision = "deny"
+reason = "Project denies rm"
+"#;
+        let global_toml = r#"
+[[bash.rules]]
+command = "rm"
+decision = "allow"
+reason = "Global allows rm"
+"#;
+        let project_config = {
+            let raw: RawConfig = toml::from_str(project_toml).unwrap();
+            Config::from(raw)
+        };
+        let global_config = {
+            let raw: RawConfig = toml::from_str(global_toml).unwrap();
+            Config::from(raw)
+        };
+
+        let merged = project_config.merge(global_config);
+        let result = handle_bash(&merged.bash, None, "rm foo");
+        assert_eq!(
+            result.map(|(d, r)| (d, r)),
+            Some((Decision::Deny, "Project denies rm".into()))
+        );
     }
 }
