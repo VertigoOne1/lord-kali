@@ -1,8 +1,8 @@
 # lord-kali
 
-A Claude Code [PreToolUse hook](https://docs.anthropic.com/en/docs/claude-code/hooks) that filters Bash and WebFetch tool calls with a more powerful matching system than Claude Code supports natively.
+A Claude Code [PreToolUse hook](https://docs.anthropic.com/en/docs/claude-code/hooks) that filters Bash and WebFetch tool calls with a more powerful matching system than Claude Code supports natively, and protects worktrees from accidental parent-directory file operations.
 
-Bash commands are parsed with [tree-sitter-bash](https://github.com/tree-sitter/tree-sitter-bash), correctly handling pipelines, `&&`, `||`, `;` chains, subshells, command substitutions (`$(...)`), and `xargs`-wrapped commands. WebFetch URLs are matched against configurable glob/regex patterns.
+Bash commands are parsed with [tree-sitter-bash](https://github.com/tree-sitter/tree-sitter-bash), correctly handling pipelines, `&&`, `||`, `;` chains, subshells, command substitutions (`$(...)`), and `xargs`-wrapped commands. WebFetch URLs are matched against configurable glob/regex patterns. Worktree protection automatically denies file reads/writes targeting the parent project when Claude is operating inside a `.claude/worktrees/<name>` directory.
 
 ## Install
 
@@ -52,6 +52,11 @@ Within each file, rules are ordered: top-level rules first, then group rules in 
 [log]
 enabled = true
 path = "~/.local/state/lord-kali/hook.jsonl"
+
+# Worktree protection is enabled by default.
+# Uncomment to disable:
+# [worktree-protection]
+# enabled = false
 
 ### Bash tool filtering
 
@@ -178,6 +183,21 @@ decision = "allow"
 ```
 
 Multiple `[[group]]` sections can be defined. Group rules are appended after top-level rules (first-match-wins, definition order). Group `bash` and `web-fetch` sections use the same format as the top-level sections.
+
+### Worktree protection
+
+When Claude Code uses [worktrees](https://docs.anthropic.com/en/docs/claude-code/worktrees), the working directory is inside `.claude/worktrees/<name>` within the parent project. Claude sometimes attempts to read or write files in the parent project instead of the worktree, which can cause unintended changes to the wrong checkout.
+
+Worktree protection detects when `cwd` matches `<parent>/.claude/worktrees/<name>` and denies file-related tool calls (`Read`, `Write`, `Edit`, `Glob`, `Grep`, `NotebookEdit`, `MultiEdit`) that target the parent project at `<parent>/...` instead of the worktree. The deny reason includes the full corrected worktree path so Claude can retry with the right location.
+
+This is enabled by default. To disable it:
+
+```toml
+[worktree-protection]
+enabled = false
+```
+
+If any config file (project-local or global) sets `enabled = false`, worktree protection is disabled.
 
 ### Patterns
 

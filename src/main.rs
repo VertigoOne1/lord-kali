@@ -9,6 +9,7 @@ struct Config {
     bash: BashConfig,
     web_fetch: WebFetchConfig,
     log: Option<LogConfig>,
+    worktree_protection: WorktreeProtectionConfig,
 }
 
 impl Config {
@@ -20,6 +21,7 @@ impl Config {
         if other.log.is_some() {
             self.log = other.log;
         }
+        self.worktree_protection = other.worktree_protection.merge(self.worktree_protection);
         self
     }
 }
@@ -148,6 +150,8 @@ struct RawConfig {
     #[serde(default, rename = "web-fetch")]
     web_fetch: RawWebFetchConfig,
     log: Option<LogConfig>,
+    #[serde(default, rename = "worktree-protection")]
+    worktree_protection: RawWorktreeProtectionConfig,
     #[serde(default)]
     group: Vec<RawGroupConfig>,
 }
@@ -181,6 +185,9 @@ impl From<RawConfig> for Config {
             bash,
             web_fetch,
             log: raw.log,
+            worktree_protection: WorktreeProtectionConfig {
+                enabled: raw.worktree_protection.enabled,
+            },
         }
     }
 }
@@ -228,6 +235,42 @@ struct LogConfig {
     path: Option<String>,
 }
 
+struct WorktreeProtectionConfig {
+    enabled: bool,
+}
+
+impl Default for WorktreeProtectionConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+impl WorktreeProtectionConfig {
+    fn merge(self, other: Self) -> Self {
+        if !self.enabled || !other.enabled {
+            Self { enabled: false }
+        } else {
+            Self { enabled: true }
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct RawWorktreeProtectionConfig {
+    #[serde(default = "default_true")]
+    enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for RawWorktreeProtectionConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 #[derive(Deserialize)]
 struct HookInput {
     tool_name: String,
@@ -239,6 +282,8 @@ struct HookInput {
 struct ToolInput {
     command: Option<String>,
     url: Option<String>,
+    file_path: Option<String>,
+    path: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -262,6 +307,17 @@ fn main() {
     if let Some(log) = &config.log {
         if log.enabled {
             log_invocation(log, &input);
+        }
+    }
+
+    if config.worktree_protection.enabled {
+        if let Some(cwd) = cwd {
+            if let Some((decision, reason)) =
+                check_worktree_protection(cwd, &hook_input.tool_name, &hook_input.tool_input)
+            {
+                print_decision(decision, &reason);
+                return;
+            }
         }
     }
 
@@ -597,6 +653,64 @@ fn log_invocation(log_config: &LogConfig, input: &str) {
 
     writeln!(file, "{}", input.trim())
         .unwrap_or_else(|e| panic!("Failed to write to log file: {}", e));
+}
+
+const WORKTREE_SEGMENT: &str = "/.claude/worktrees/";
+
+fn detect_worktree(cwd: &str) -> Option<(&str, &str)> {
+    let idx = cwd.find(WORKTREE_SEGMENT)?;
+    let parent_root = &cwd[..idx];
+    let after = &cwd[idx + WORKTREE_SEGMENT.len()..];
+    if after.is_empty() || after.ends_with('/') {
+        return None;
+    }
+    Some((parent_root, cwd))
+}
+
+const FILE_TOOLS: &[&str] = &[
+    "Read",
+    "Write",
+    "Edit",
+    "Glob",
+    "Grep",
+    "NotebookEdit",
+    "MultiEdit",
+];
+
+fn check_worktree_protection(
+    cwd: &str,
+    tool_name: &str,
+    tool_input: &ToolInput,
+) -> Option<(Decision, String)> {
+    if !FILE_TOOLS.contains(&tool_name) {
+        return None;
+    }
+
+    let (parent_root, worktree_root) = detect_worktree(cwd)?;
+
+    let file_path = tool_input
+        .file_path
+        .as_deref()
+        .or(tool_input.path.as_deref())?;
+
+    if file_path.starts_with(worktree_root) {
+        return None;
+    }
+
+    if !file_path.starts_with(parent_root) {
+        return None;
+    }
+
+    let relative = &file_path[parent_root.len()..];
+    let corrected = format!("{worktree_root}{relative}");
+
+    Some((
+        Decision::Deny,
+        format!(
+            "You are in a worktree. Do not read/write the parent project at {parent_root}. \
+             Use the worktree path instead: {corrected}"
+        ),
+    ))
 }
 
 fn print_decision(decision: Decision, reason: &str) {
@@ -1504,6 +1618,7 @@ mod tests {
             bash: RawBashConfig::default(),
             web_fetch: RawWebFetchConfig::default(),
             log: None,
+            worktree_protection: RawWorktreeProtectionConfig::default(),
             group: vec![RawGroupConfig {
                 projects: vec!["/home/user/projects/test".into()],
                 bash: RawBashConfig {
@@ -1547,6 +1662,7 @@ mod tests {
             bash: RawBashConfig::default(),
             web_fetch: RawWebFetchConfig::default(),
             log: None,
+            worktree_protection: RawWorktreeProtectionConfig::default(),
             group: vec![RawGroupConfig {
                 projects: vec!["/home/user/projects/a".into()],
                 bash: RawBashConfig {
@@ -1587,6 +1703,7 @@ mod tests {
             bash: RawBashConfig::default(),
             web_fetch: RawWebFetchConfig::default(),
             log: None,
+            worktree_protection: RawWorktreeProtectionConfig::default(),
             group: vec![RawGroupConfig {
                 projects: vec!["/home/user/projects/test".into()],
                 bash: RawBashConfig {
@@ -1624,6 +1741,7 @@ mod tests {
             bash: RawBashConfig::default(),
             web_fetch: RawWebFetchConfig::default(),
             log: None,
+            worktree_protection: RawWorktreeProtectionConfig::default(),
             group: vec![RawGroupConfig {
                 projects: vec!["/home/user/projects/test".into()],
                 bash: RawBashConfig::default(),
@@ -1674,6 +1792,7 @@ mod tests {
             },
             web_fetch: RawWebFetchConfig::default(),
             log: None,
+            worktree_protection: RawWorktreeProtectionConfig::default(),
             group: vec![RawGroupConfig {
                 projects: vec!["/home/user/projects/test".into()],
                 bash: RawBashConfig {
@@ -2050,5 +2169,157 @@ reason = "Global allows rm"
             result.map(|(d, r)| (d, r)),
             Some((Decision::Deny, "Project denies rm".into()))
         );
+    }
+
+    // --- detect_worktree ---
+
+    #[test]
+    fn detect_worktree_valid() {
+        let (parent, worktree) =
+            detect_worktree("/home/user/projects/myapp/.claude/worktrees/feature-x").unwrap();
+        assert_eq!(parent, "/home/user/projects/myapp");
+        assert_eq!(
+            worktree,
+            "/home/user/projects/myapp/.claude/worktrees/feature-x"
+        );
+    }
+
+    #[test]
+    fn detect_worktree_not_a_worktree() {
+        assert!(detect_worktree("/home/user/projects/myapp").is_none());
+    }
+
+    #[test]
+    fn detect_worktree_trailing_slash_in_worktrees_dir() {
+        assert!(detect_worktree("/home/user/projects/myapp/.claude/worktrees/").is_none());
+    }
+
+    #[test]
+    fn detect_worktree_multi_segment_name() {
+        let (parent, worktree) =
+            detect_worktree("/home/user/projects/myapp/.claude/worktrees/fix/PJ-1234").unwrap();
+        assert_eq!(parent, "/home/user/projects/myapp");
+        assert_eq!(
+            worktree,
+            "/home/user/projects/myapp/.claude/worktrees/fix/PJ-1234"
+        );
+    }
+
+    // --- check_worktree_protection ---
+
+    fn worktree_tool_input(file_path: Option<&str>, path: Option<&str>) -> ToolInput {
+        ToolInput {
+            command: None,
+            url: None,
+            file_path: file_path.map(String::from),
+            path: path.map(String::from),
+        }
+    }
+
+    #[test]
+    fn worktree_denies_read_from_parent() {
+        let cwd = "/home/user/project/.claude/worktrees/feat";
+        let input = worktree_tool_input(Some("/home/user/project/src/main.rs"), None);
+        let result = check_worktree_protection(cwd, "Read", &input);
+        assert!(result.is_some());
+        let (decision, reason) = result.unwrap();
+        assert_eq!(decision, Decision::Deny);
+        assert!(reason.contains("/home/user/project/.claude/worktrees/feat/src/main.rs"));
+    }
+
+    #[test]
+    fn worktree_denies_write_from_parent() {
+        let cwd = "/home/user/project/.claude/worktrees/feat";
+        let input = worktree_tool_input(Some("/home/user/project/Cargo.toml"), None);
+        let result = check_worktree_protection(cwd, "Write", &input);
+        assert!(result.is_some());
+        let (decision, reason) = result.unwrap();
+        assert_eq!(decision, Decision::Deny);
+        assert!(reason.contains("/home/user/project/.claude/worktrees/feat/Cargo.toml"));
+    }
+
+    #[test]
+    fn worktree_denies_edit_from_parent() {
+        let cwd = "/home/user/project/.claude/worktrees/feat";
+        let input = worktree_tool_input(Some("/home/user/project/src/lib.rs"), None);
+        let result = check_worktree_protection(cwd, "Edit", &input);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn worktree_denies_grep_path_from_parent() {
+        let cwd = "/home/user/project/.claude/worktrees/feat";
+        let input = worktree_tool_input(None, Some("/home/user/project/src"));
+        let result = check_worktree_protection(cwd, "Grep", &input);
+        assert!(result.is_some());
+        let (_, reason) = result.unwrap();
+        assert!(reason.contains("/home/user/project/.claude/worktrees/feat/src"));
+    }
+
+    #[test]
+    fn worktree_allows_file_within_worktree() {
+        let cwd = "/home/user/project/.claude/worktrees/feat";
+        let input = worktree_tool_input(
+            Some("/home/user/project/.claude/worktrees/feat/src/main.rs"),
+            None,
+        );
+        let result = check_worktree_protection(cwd, "Read", &input);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn worktree_allows_file_outside_parent() {
+        let cwd = "/home/user/project/.claude/worktrees/feat";
+        let input = worktree_tool_input(Some("/tmp/something.txt"), None);
+        let result = check_worktree_protection(cwd, "Read", &input);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn worktree_ignores_non_file_tools() {
+        let cwd = "/home/user/project/.claude/worktrees/feat";
+        let input = worktree_tool_input(Some("/home/user/project/src/main.rs"), None);
+        assert!(check_worktree_protection(cwd, "Bash", &input).is_none());
+        assert!(check_worktree_protection(cwd, "WebFetch", &input).is_none());
+    }
+
+    #[test]
+    fn worktree_no_file_path_passthrough() {
+        let cwd = "/home/user/project/.claude/worktrees/feat";
+        let input = worktree_tool_input(None, None);
+        assert!(check_worktree_protection(cwd, "Read", &input).is_none());
+    }
+
+    #[test]
+    fn worktree_protection_disabled_via_config() {
+        let toml_str = r#"
+[worktree-protection]
+enabled = false
+"#;
+        let raw: RawConfig = toml::from_str(toml_str).unwrap();
+        let config = Config::from(raw);
+        assert!(!config.worktree_protection.enabled);
+    }
+
+    #[test]
+    fn worktree_protection_enabled_by_default() {
+        let toml_str = "";
+        let raw: RawConfig = toml::from_str(toml_str).unwrap();
+        let config = Config::from(raw);
+        assert!(config.worktree_protection.enabled);
+    }
+
+    #[test]
+    fn worktree_protection_merge_disabled_wins() {
+        let a = Config {
+            worktree_protection: WorktreeProtectionConfig { enabled: true },
+            ..Config::default()
+        };
+        let b = Config {
+            worktree_protection: WorktreeProtectionConfig { enabled: false },
+            ..Config::default()
+        };
+        let merged = a.merge(b);
+        assert!(!merged.worktree_protection.enabled);
     }
 }
