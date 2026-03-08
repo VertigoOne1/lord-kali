@@ -7,6 +7,12 @@ Bash commands are parsed with [tree-sitter-bash](https://github.com/tree-sitter/
 ## Install
 
 ```sh
+curl -fsSL https://raw.githubusercontent.com/insidewhy/lord-kali/main/scripts/install.sh | bash
+```
+
+Or clone and build manually:
+
+```sh
 make install   # builds and copies to ~/.local/bin/
 ```
 
