@@ -725,40 +725,6 @@ fn strip_surrounding_quotes(token: &str) -> &str {
     token
 }
 
-fn split_top_level_segments(source: &str) -> Vec<String> {
-    let mut segments = Vec::new();
-    let mut current = String::new();
-    let mut quote: Option<char> = None;
-    let mut chars = source.chars().peekable();
-
-    while let Some(c) = chars.next() {
-        if let Some(q) = quote {
-            current.push(c);
-            if c == q {
-                quote = None;
-            }
-            continue;
-        }
-
-        match c {
-            '\'' | '"' => {
-                quote = Some(c);
-                current.push(c);
-            }
-            '|' | '&' if chars.peek() == Some(&c) => {
-                chars.next();
-                segments.push(std::mem::take(&mut current));
-            }
-            '|' | ';' | '\n' => {
-                segments.push(std::mem::take(&mut current));
-            }
-            _ => current.push(c),
-        }
-    }
-    segments.push(current);
-    segments
-}
-
 fn quote_aware_tokens(segment: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
@@ -798,41 +764,77 @@ fn quote_aware_tokens(segment: &str) -> Vec<String> {
     tokens
 }
 
-// Grammar-free Phase 1 extractor: no alias resolution, no $()/@() recursion,
-// no scriptblock {} descent, no splatting, backtick is treated as a literal char.
 fn extract_commands_powershell(source: &str) -> Vec<(String, String)> {
-    let assignment = Regex::new(r"^\s*\$\w+\s*=\s*").expect("Invalid assignment pattern");
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_powershell::LANGUAGE.into())
+        .expect("Failed to set powershell language");
+
+    let tree = parser
+        .parse(source, None)
+        .expect("Failed to parse powershell command");
+
     let mut commands = Vec::new();
+    let mut cursor = tree.root_node().walk();
+    walk_powershell_node(&mut cursor, source.as_bytes(), &mut commands);
+    commands
+}
 
-    for segment in split_top_level_segments(source) {
-        let trimmed = segment.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
+fn powershell_command_name(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let mut cursor = node.walk();
+    let name_node = node
+        .children(&mut cursor)
+        .find(|c| c.kind() == "command_name" || c.kind() == "command_name_expr")?;
+    let raw = name_node.utf8_text(source).ok()?;
+    let unquoted = strip_surrounding_quotes(raw);
+    let basename = unquoted.rsplit(['/', '\\']).next().unwrap_or(unquoted);
+    if basename.is_empty() {
+        None
+    } else {
+        Some(basename.to_string())
+    }
+}
+
+fn powershell_command_args(node: &tree_sitter::Node, source: &[u8]) -> String {
+    let mut cursor = node.walk();
+    let Some(elements) = node
+        .children(&mut cursor)
+        .find(|c| c.kind() == "command_elements")
+    else {
+        return String::new();
+    };
+
+    let mut arg_cursor = elements.walk();
+    elements
+        .children(&mut arg_cursor)
+        .filter(|c| c.kind() != "command_argument_sep")
+        .filter_map(|c| c.utf8_text(source).ok())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn walk_powershell_node(
+    cursor: &mut tree_sitter::TreeCursor,
+    source: &[u8],
+    commands: &mut Vec<(String, String)>,
+) {
+    let node = cursor.node();
+
+    if node.kind() == "command" {
+        if let Some(name) = powershell_command_name(&node, source) {
+            commands.push((name, powershell_command_args(&node, source)));
         }
-
-        let trimmed = trimmed
-            .strip_prefix('&')
-            .map(str::trim_start)
-            .unwrap_or(trimmed);
-        let trimmed = assignment.replace(trimmed, "");
-        let trimmed = trimmed.trim();
-
-        let tokens = quote_aware_tokens(trimmed);
-        let Some(first) = tokens.first() else {
-            continue;
-        };
-
-        let unquoted = strip_surrounding_quotes(first);
-        let basename = unquoted.rsplit(['/', '\\']).next().unwrap_or(unquoted);
-        if basename.is_empty() {
-            continue;
-        }
-
-        let args = trimmed[first.len()..].trim().to_string();
-        commands.push((basename.to_string(), args));
     }
 
-    commands
+    if cursor.goto_first_child() {
+        loop {
+            walk_powershell_node(cursor, source, commands);
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+        cursor.goto_parent();
+    }
 }
 
 const POWERSHELL_EXECUTABLES: &[&str] = &["pwsh", "pwsh.exe", "powershell", "powershell.exe"];
@@ -2676,6 +2678,38 @@ enabled = false
         );
     }
 
+    #[test]
+    fn ps_extract_script_block() {
+        assert_eq!(
+            ps_command_names("Get-ChildItem | Where-Object { Remove-Item foo }"),
+            vec!["Get-ChildItem", "Where-Object", "Remove-Item"]
+        );
+    }
+
+    #[test]
+    fn ps_extract_command_substitution() {
+        assert_eq!(
+            ps_command_names("Invoke-Something $(Remove-Item bar)"),
+            vec!["Invoke-Something", "Remove-Item"]
+        );
+    }
+
+    #[test]
+    fn ps_extract_assignment_literal_no_command() {
+        assert_eq!(
+            ps_command_names("$env:NODE_ENV='production'; npm run build"),
+            vec!["npm"]
+        );
+    }
+
+    #[test]
+    fn ps_extract_path_args_preserved() {
+        assert_eq!(
+            extract_commands_powershell("Get-ChildItem -Path C:\\temp"),
+            vec![("Get-ChildItem".into(), "-Path C:\\temp".into())]
+        );
+    }
+
     // --- inner_powershell_script ---
 
     #[test]
@@ -2759,6 +2793,19 @@ enabled = false
         assert_eq!(
             handle_powershell(&test_powershell_config(), None, "Get-Date").map(|(d, _)| d),
             None
+        );
+    }
+
+    #[test]
+    fn handle_powershell_deny_inside_script_block() {
+        assert_eq!(
+            handle_powershell(
+                &test_powershell_config(),
+                None,
+                "Get-Process | Where-Object { Remove-Item -Recurse C:\\ }"
+            )
+            .map(|(d, _)| d),
+            Some(Decision::Deny)
         );
     }
 
