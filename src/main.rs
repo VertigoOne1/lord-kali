@@ -1151,9 +1151,9 @@ fn inner_powershell_script(name: &str, args: &str) -> Option<String> {
     Some(strip_surrounding_quotes(&joined).to_string())
 }
 
-// Logging is best-effort observability: any failure here is swallowed so the gate
-// decision already printed to Claude Code is never blocked or altered.
-fn log_invocation(log_config: &LogConfig, input: &str, trace: &InvocationTrace) {
+// Best-effort observability: any failure here is swallowed so a gate decision already
+// printed to Claude Code is never blocked or altered by a logging problem.
+fn append_log_line(log_config: &LogConfig, line: String) {
     let default_path = "~/.local/state/lord-kali/hook.jsonl";
     let path_str = log_config.path.as_deref().unwrap_or(default_path);
     let expanded = expand_tilde(path_str);
@@ -1173,49 +1173,48 @@ fn log_invocation(log_config: &LogConfig, input: &str, trace: &InvocationTrace) 
         return;
     };
 
-    let _ = writeln!(file, "{}", timestamped_log_line(input, trace));
+    let _ = writeln!(file, "{}", line);
+}
+
+fn log_invocation(log_config: &LogConfig, input: &str, trace: &InvocationTrace) {
+    append_log_line(log_config, timestamped_log_line(input, trace));
 }
 
 // PostToolUse fires only after a tool actually executed (auto-allowed or user-approved
-// at the prompt). It cannot gate, so this path logs and returns with no decision and no
-// stdout. Best-effort: any failure here is swallowed.
+// at the prompt). It cannot gate, so this path only logs, with no decision and no stdout.
 fn log_post_tool_use(log_config: &LogConfig, input: &str) {
-    let default_path = "~/.local/state/lord-kali/hook.jsonl";
-    let path_str = log_config.path.as_deref().unwrap_or(default_path);
-    let expanded = expand_tilde(path_str);
-
-    if let Some(parent) = expanded.parent() {
-        if std::fs::create_dir_all(parent).is_err() {
-            return;
-        }
-    }
-
-    use std::io::Write;
-    let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&expanded)
-    else {
-        return;
-    };
-
-    let _ = writeln!(file, "{}", post_tool_use_log_line(input));
+    append_log_line(log_config, post_tool_use_log_line(input));
 }
 
-fn post_tool_use_log_line(input: &str) -> String {
-    let ts_ms = std::time::SystemTime::now()
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+        .unwrap_or(0)
+}
+
+// Parse the hook input into an object, stamp ts_ms + lk_event, then let the caller add
+// event-specific fields. Non-object input is passed through trimmed.
+fn shape_log_line(
+    input: &str,
+    event: &str,
+    add_fields: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+) -> String {
     match serde_json::from_str::<serde_json::Value>(input) {
         Ok(serde_json::Value::Object(mut map)) => {
-            map.insert("ts_ms".to_string(), serde_json::json!(ts_ms));
-            map.insert("lk_event".to_string(), serde_json::json!("post_tool_use"));
-            map.remove("tool_response");
+            map.insert("ts_ms".to_string(), serde_json::json!(now_ms()));
+            map.insert("lk_event".to_string(), serde_json::json!(event));
+            add_fields(&mut map);
             serde_json::Value::Object(map).to_string()
         }
         _ => input.trim().to_string(),
     }
+}
+
+fn post_tool_use_log_line(input: &str) -> String {
+    shape_log_line(input, "post_tool_use", |map| {
+        map.remove("tool_response");
+    })
 }
 
 fn decision_breakdown(trace: &InvocationTrace) -> serde_json::Value {
@@ -1241,19 +1240,9 @@ fn decision_breakdown(trace: &InvocationTrace) -> serde_json::Value {
 }
 
 fn timestamped_log_line(input: &str, trace: &InvocationTrace) -> String {
-    let ts_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    match serde_json::from_str::<serde_json::Value>(input) {
-        Ok(serde_json::Value::Object(mut map)) => {
-            map.insert("ts_ms".to_string(), serde_json::json!(ts_ms));
-            map.insert("lk_event".to_string(), serde_json::json!("pre_tool_use"));
-            map.insert("lk_decision".to_string(), decision_breakdown(trace));
-            serde_json::Value::Object(map).to_string()
-        }
-        _ => input.trim().to_string(),
-    }
+    shape_log_line(input, "pre_tool_use", |map| {
+        map.insert("lk_decision".to_string(), decision_breakdown(trace));
+    })
 }
 
 const WORKTREE_SEGMENT: &str = "/.claude/worktrees/";
