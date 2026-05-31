@@ -253,10 +253,12 @@ lord-kali watch                # uses the [log] path, or the default
 lord-kali watch /path/to.jsonl # or an explicit path
 ```
 
+Each line is also annotated with the command nodes that matched **no rule**, shown as `(no rule: <cmd>, …)`. These are your gap candidates for the allow/deny lists — the commands lord-kali currently has no opinion on. An `allow` verdict never shows this (every node matched by definition); a `passthrough` shows the unknown node(s), and a chain like `pwd && gh ...` flags only `gh` while the already-allowed `pwd` stays quiet. Running real commands and watching what gets flagged is a quick way to discover what to add to your config.
+
 It also correlates each `pre_tool_use` with its `post_tool_use`:
 
 - A `passthrough` or `ask` that is followed by execution prints `approved & ran` — a high-confidence record that the call *ran*. Note this covers both "you approved it at a prompt" and "Claude Code's own `permissions.allow` rules auto-allowed it"; the log cannot tell the two apart, so a future auto-tuner should cross-reference Claude Code's allow-list before treating one of these as a manual approval worth promoting.
-- A `passthrough` or `ask` with no execution within 60s prints `no execution — rejected or abandoned?`. This is the one negative signal available: a rejection writes nothing to the log, so its only trace is the *absence* of a matching `post_tool_use`, and that absence is noisy (it also covers abandoned or still-pending calls). Treat it as a weak hint, not a fact.
+- A `passthrough` or `ask` with no execution within 60s prints `no execution — rejected or abandoned?`. This is the one negative signal available: a rejection writes nothing to the log, so its only trace is the *absence* of a matching `post_tool_use`, and that absence is noisy (it also covers abandoned or still-pending calls). Treat it as a weak hint, not a fact. For an `ask`, the line also names the rule node that triggered the prompt (`ask triggered by: <node> — <reason>`).
 
 `allow` calls always run, so their `post_tool_use` is not restated. Color is disabled automatically when stdout is not a terminal or when `NO_COLOR` is set.
 

@@ -1355,6 +1355,9 @@ struct PendingPre {
     final_decision: String,
     tool: String,
     target: String,
+    // For an `ask`, the node in the chain that drove the verdict (`command args — reason`).
+    // None for `passthrough` (nothing matched, so nothing "triggered" the rejection).
+    deciding: Option<String>,
 }
 
 fn resolve_log_path(explicit: Option<&str>) -> PathBuf {
@@ -1383,6 +1386,46 @@ fn event_target(v: &serde_json::Value) -> String {
 fn correlation_key(v: &serde_json::Value, tool: &str, target: &str) -> String {
     let session = v["session_id"].as_str().unwrap_or("");
     format!("{session}\u{1}{tool}\u{1}{target}")
+}
+
+// The specific command node that set the verdict, as `command args — reason`, read from
+// lk_decision.deciding. Returns None when nothing matched (deciding is null/absent).
+fn format_deciding(lk_decision: &serde_json::Value) -> Option<String> {
+    let d = lk_decision.get("deciding")?;
+    if d.is_null() {
+        return None;
+    }
+    let cmd = d.get("command").and_then(|x| x.as_str()).unwrap_or("");
+    let args = d.get("args").and_then(|x| x.as_str()).unwrap_or("");
+    let mut node = cmd.to_string();
+    if !args.is_empty() {
+        node.push(' ');
+        node.push_str(args);
+    }
+    if let Some(r) = d.get("reason").and_then(|x| x.as_str()) {
+        node.push_str(&format!("  — {r}"));
+    }
+    Some(node)
+}
+
+// Command nodes in the chain that matched no rule (`matched: false`) — the gap candidates
+// for the allow/deny lists. Empty for an `allow` verdict (every node matched by definition);
+// can be non-empty under passthrough/ask/deny. Deduplicated, order preserved.
+fn unmatched_nodes(lk_decision: &serde_json::Value) -> Vec<String> {
+    let Some(nodes) = lk_decision.get("nodes").and_then(|n| n.as_array()) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for n in nodes {
+        if n.get("matched").and_then(|m| m.as_bool()) == Some(false) {
+            if let Some(cmd) = n.get("command").and_then(|c| c.as_str()) {
+                if !cmd.is_empty() && !out.iter().any(|e| e == cmd) {
+                    out.push(cmd.to_string());
+                }
+            }
+        }
+    }
+    out
 }
 
 fn render_pre(p: &Palette, tool: &str, target: &str, final_: &str, reason: Option<&str>) -> String {
@@ -1418,8 +1461,14 @@ fn handle_line(p: &Palette, line: &str, pending: &mut HashMap<String, PendingPre
                 .unwrap_or("?")
                 .to_string();
             let reason = v["lk_decision"]["reason"].as_str();
-            println!("{}", render_pre(p, &tool, &target, &final_, reason));
+            let mut out = render_pre(p, &tool, &target, &final_, reason);
+            let gaps = unmatched_nodes(&v["lk_decision"]);
+            if !gaps.is_empty() {
+                out.push_str(&p.paint("36", &format!("   (no rule: {})", gaps.join(", "))));
+            }
+            println!("{out}");
             let ts_ms = v["ts_ms"].as_u64().unwrap_or_else(now_ms);
+            let deciding = format_deciding(&v["lk_decision"]);
             pending.insert(
                 key,
                 PendingPre {
@@ -1427,6 +1476,7 @@ fn handle_line(p: &Palette, line: &str, pending: &mut HashMap<String, PendingPre
                     final_decision: final_,
                     tool,
                     target,
+                    deciding,
                 },
             );
         }
@@ -1462,18 +1512,19 @@ fn sweep_pending(p: &Palette, pending: &mut HashMap<String, PendingPre>) {
     for k in expired {
         let pre = pending.remove(&k).unwrap();
         if pre.final_decision == "passthrough" || pre.final_decision == "ask" {
-            println!(
-                "{}",
-                p.paint(
-                    "35",
-                    &format!(
-                        "       └ no execution in {}s — rejected or abandoned?  {}: {}",
-                        PENDING_TIMEOUT_MS / 1000,
-                        pre.tool,
-                        pre.target
-                    )
-                )
+            let mut msg = format!(
+                "       └ no execution in {}s — rejected or abandoned?  {}: {}",
+                PENDING_TIMEOUT_MS / 1000,
+                pre.tool,
+                pre.target
             );
+            if let Some(node) = &pre.deciding {
+                msg.push_str(&format!(
+                    "   ({} triggered by: {})",
+                    pre.final_decision, node
+                ));
+            }
+            println!("{}", p.paint("35", &msg));
         }
     }
 }
@@ -3496,5 +3547,48 @@ enabled = false
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(v["lk_event"], serde_json::json!("pre_tool_use"));
         assert!(v.get("lk_decision").is_some());
+    }
+
+    // --- watcher node helpers ---
+
+    #[test]
+    fn unmatched_nodes_lists_dedup_in_order() {
+        let d = serde_json::json!({
+            "nodes": [
+                {"command": "ls", "matched": true},
+                {"command": "cargo", "matched": false},
+                {"command": "frob", "matched": false},
+                {"command": "cargo", "matched": false},
+            ]
+        });
+        assert_eq!(unmatched_nodes(&d), vec!["cargo", "frob"]);
+    }
+
+    #[test]
+    fn unmatched_nodes_empty_when_all_matched() {
+        let d = serde_json::json!({
+            "nodes": [
+                {"command": "ls", "matched": true},
+                {"command": "cat", "matched": true},
+            ]
+        });
+        assert!(unmatched_nodes(&d).is_empty());
+    }
+
+    #[test]
+    fn format_deciding_renders_node_and_reason() {
+        let d = serde_json::json!({
+            "deciding": {"command": "rm", "args": "-rf foo", "reason": "Recursive/force delete — confirm."}
+        });
+        assert_eq!(
+            format_deciding(&d).as_deref(),
+            Some("rm -rf foo  — Recursive/force delete — confirm.")
+        );
+    }
+
+    #[test]
+    fn format_deciding_null_is_none() {
+        let d = serde_json::json!({ "deciding": serde_json::Value::Null });
+        assert_eq!(format_deciding(&d), None);
     }
 }
