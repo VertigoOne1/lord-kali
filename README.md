@@ -244,6 +244,22 @@ Logging is best-effort: if the log file cannot be created or written, the failur
 - **`deciding`**: the node that set the final verdict — the first deny, else the first ask, else the first matched allow — or `null` if nothing matched
 - **`nodes`**: every command (or URL) extracted from the call. Each node records its `shell`, `command`, `args`, resolved `decision`, and whether it `matched` a rule. When a rule matched, the node also carries that rule's `reason`, `rule_kind` (`explicit` or `allowed_commands`), `rule_command`, `rule_args`, and `source_file` so you can trace which rule in which config file made the call.
 
+### Watching live
+
+`lord-kali watch` tails the log and prints a colored line per gate decision, so you can see in real time what is being allowed, denied, asked, or passed through to approval:
+
+```sh
+lord-kali watch                # uses the [log] path, or the default
+lord-kali watch /path/to.jsonl # or an explicit path
+```
+
+It also correlates each `pre_tool_use` with its `post_tool_use`:
+
+- A `passthrough` or `ask` that is followed by execution prints `approved & ran` — a high-confidence record that you approved the call.
+- A `passthrough` or `ask` with no execution within 60s prints `no execution — rejected or abandoned?`. This is the one negative signal available: a rejection writes nothing to the log, so its only trace is the *absence* of a matching `post_tool_use`, and that absence is noisy (it also covers abandoned or still-pending calls). Treat it as a weak hint, not a fact.
+
+`allow` calls always run, so their `post_tool_use` is not restated. Color is disabled automatically when stdout is not a terminal or when `NO_COLOR` is set.
+
 ## Decision priority
 
 ### Bash

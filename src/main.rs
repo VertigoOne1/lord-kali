@@ -1,7 +1,7 @@
 use regex::Regex;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -425,6 +425,15 @@ impl NodeTrace {
 }
 
 fn main() {
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() == Some("watch") {
+        watch(args.next().as_deref());
+        return;
+    }
+    run_hook();
+}
+
+fn run_hook() {
     let mut input = String::new();
     std::io::stdin()
         .read_to_string(&mut input)
@@ -1154,8 +1163,7 @@ fn inner_powershell_script(name: &str, args: &str) -> Option<String> {
 // Best-effort observability: any failure here is swallowed so a gate decision already
 // printed to Claude Code is never blocked or altered by a logging problem.
 fn append_log_line(log_config: &LogConfig, line: String) {
-    let default_path = "~/.local/state/lord-kali/hook.jsonl";
-    let path_str = log_config.path.as_deref().unwrap_or(default_path);
+    let path_str = log_config.path.as_deref().unwrap_or(DEFAULT_LOG_PATH);
     let expanded = expand_tilde(path_str);
 
     if let Some(parent) = expanded.parent() {
@@ -1320,6 +1328,200 @@ fn print_decision(decision: Decision, reason: &str) {
             }
         })
     );
+}
+
+const DEFAULT_LOG_PATH: &str = "~/.local/state/lord-kali/hook.jsonl";
+const WATCH_POLL_MS: u64 = 200;
+const PENDING_TIMEOUT_MS: u64 = 60_000;
+
+struct Palette {
+    color: bool,
+}
+
+impl Palette {
+    fn paint(&self, code: &str, s: &str) -> String {
+        if self.color {
+            format!("\x1b[{}m{}\x1b[0m", code, s)
+        } else {
+            s.to_string()
+        }
+    }
+}
+
+// A PreToolUse decision awaiting its matching PostToolUse. The absence of that match past
+// the timeout is the only (noisy) trace a rejection leaves, so we surface it explicitly.
+struct PendingPre {
+    ts_ms: u64,
+    final_decision: String,
+    tool: String,
+    target: String,
+}
+
+fn resolve_log_path(explicit: Option<&str>) -> PathBuf {
+    if let Some(p) = explicit {
+        return expand_tilde(p);
+    }
+    let config = load_config(None);
+    let path_str = config
+        .log
+        .as_ref()
+        .and_then(|l| l.path.as_deref())
+        .unwrap_or(DEFAULT_LOG_PATH);
+    expand_tilde(path_str)
+}
+
+fn event_target(v: &serde_json::Value) -> String {
+    let ti = &v["tool_input"];
+    for key in ["command", "url", "file_path", "path"] {
+        if let Some(s) = ti.get(key).and_then(|x| x.as_str()) {
+            return s.to_string();
+        }
+    }
+    String::new()
+}
+
+fn correlation_key(v: &serde_json::Value, tool: &str, target: &str) -> String {
+    let session = v["session_id"].as_str().unwrap_or("");
+    format!("{session}\u{1}{tool}\u{1}{target}")
+}
+
+fn render_pre(p: &Palette, tool: &str, target: &str, final_: &str, reason: Option<&str>) -> String {
+    let (code, label) = match final_ {
+        "allow" => ("32", "ALLOW"),
+        "deny" => ("31", "DENY"),
+        "ask" => ("33", "ASK"),
+        "passthrough" => ("36", "PASS"),
+        other => ("0", other),
+    };
+    let badge = p.paint(code, &format!("{label:<5}"));
+    let mut line = format!("{badge}  {tool}: {target}");
+    if matches!(final_, "deny" | "ask") {
+        if let Some(r) = reason {
+            line.push_str(&p.paint("2", &format!("  — {r}")));
+        }
+    }
+    line
+}
+
+fn handle_line(p: &Palette, line: &str, pending: &mut HashMap<String, PendingPre>) {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+        return;
+    };
+    let tool = v["tool_name"].as_str().unwrap_or("?").to_string();
+    let target = event_target(&v);
+    let key = correlation_key(&v, &tool, &target);
+
+    match v["lk_event"].as_str().unwrap_or("") {
+        "pre_tool_use" => {
+            let final_ = v["lk_decision"]["final"]
+                .as_str()
+                .unwrap_or("?")
+                .to_string();
+            let reason = v["lk_decision"]["reason"].as_str();
+            println!("{}", render_pre(p, &tool, &target, &final_, reason));
+            let ts_ms = v["ts_ms"].as_u64().unwrap_or_else(now_ms);
+            pending.insert(
+                key,
+                PendingPre {
+                    ts_ms,
+                    final_decision: final_,
+                    tool,
+                    target,
+                },
+            );
+        }
+        "post_tool_use" => match pending.remove(&key) {
+            // A passthrough/ask that ran is the high-confidence "you approved this" signal.
+            Some(pre) if pre.final_decision == "passthrough" || pre.final_decision == "ask" => {
+                println!(
+                    "{}",
+                    p.paint(
+                        "32;1",
+                        &format!("       └ approved & ran  {tool}: {target}")
+                    )
+                );
+            }
+            // An allow always runs; no need to restate it. Drop silently.
+            Some(_) => {}
+            None => println!(
+                "{}",
+                p.paint("2", &format!("       · ran  {tool}: {target}"))
+            ),
+        },
+        _ => {}
+    }
+}
+
+fn sweep_pending(p: &Palette, pending: &mut HashMap<String, PendingPre>) {
+    let now = now_ms();
+    let expired: Vec<String> = pending
+        .iter()
+        .filter(|(_, pre)| now.saturating_sub(pre.ts_ms) > PENDING_TIMEOUT_MS)
+        .map(|(k, _)| k.clone())
+        .collect();
+    for k in expired {
+        let pre = pending.remove(&k).unwrap();
+        if pre.final_decision == "passthrough" || pre.final_decision == "ask" {
+            println!(
+                "{}",
+                p.paint(
+                    "35",
+                    &format!(
+                        "       └ no execution in {}s — rejected or abandoned?  {}: {}",
+                        PENDING_TIMEOUT_MS / 1000,
+                        pre.tool,
+                        pre.target
+                    )
+                )
+            );
+        }
+    }
+}
+
+fn watch(explicit_path: Option<&str>) {
+    use std::io::{Seek, SeekFrom};
+
+    let path = resolve_log_path(explicit_path);
+    let palette = Palette {
+        color: std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none(),
+    };
+
+    eprintln!("lord-kali watch — tailing {}", path.display());
+    eprintln!(
+        "PASS/ASK go to approval; an indented line shows whether they ran. Ctrl-C to stop.\n"
+    );
+
+    let mut offset = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    let mut carry = String::new();
+    let mut pending: HashMap<String, PendingPre> = HashMap::new();
+
+    loop {
+        let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        if len < offset {
+            offset = 0;
+            carry.clear();
+        }
+        if len > offset {
+            if let Ok(mut f) = std::fs::File::open(&path) {
+                if f.seek(SeekFrom::Start(offset)).is_ok() {
+                    let mut buf = String::new();
+                    if let Ok(n) = f.read_to_string(&mut buf) {
+                        offset += n as u64;
+                        carry.push_str(&buf);
+                        while let Some(idx) = carry.find('\n') {
+                            let line: String = carry.drain(..=idx).collect();
+                            let trimmed = line.trim_end();
+                            if !trimmed.is_empty() {
+                                handle_line(&palette, trimmed, &mut pending);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        sweep_pending(&palette, &mut pending);
+        std::thread::sleep(std::time::Duration::from_millis(WATCH_POLL_MS));
+    }
 }
 
 #[cfg(test)]
