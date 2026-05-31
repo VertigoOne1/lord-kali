@@ -422,8 +422,11 @@ fn load_config(cwd: Option<&str>) -> Config {
         .expect("Could not determine config directory")
         .join("lord-kali");
 
-    let entries = std::fs::read_dir(&config_dir)
-        .unwrap_or_else(|e| panic!("Failed to read config dir {}: {}", config_dir.display(), e));
+    let entries = match std::fs::read_dir(&config_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return initial,
+        Err(e) => panic!("Failed to read config dir {}: {}", config_dir.display(), e),
+    };
 
     let mut paths: Vec<PathBuf> = entries
         .filter_map(|entry| {
@@ -607,6 +610,21 @@ fn extract_args(node: &tree_sitter::Node, source: &[u8]) -> String {
     parts.join(" ")
 }
 
+fn command_basename(name: &str) -> &str {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    match base.len().checked_sub(4) {
+        Some(cut)
+            if cut > 0
+                && base
+                    .get(cut..)
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case(".exe")) =>
+        {
+            &base[..cut]
+        }
+        _ => base,
+    }
+}
+
 fn walk_node(
     cursor: &mut tree_sitter::TreeCursor,
     source: &[u8],
@@ -617,7 +635,7 @@ fn walk_node(
     if node.kind() == "command" {
         if let Some(name_node) = node.child_by_field_name("name") {
             if let Ok(name) = name_node.utf8_text(source) {
-                let basename = name.rsplit('/').next().unwrap_or(name);
+                let basename = command_basename(name);
                 if !basename.is_empty() {
                     let args = extract_args(&node, source);
                     commands.push((basename.to_string(), args));
@@ -693,7 +711,7 @@ fn extract_xargs_subcommand(node: &tree_sitter::Node, source: &[u8]) -> Option<(
             continue;
         }
 
-        let basename = text.rsplit('/').next().unwrap_or(text);
+        let basename = command_basename(text);
         if !basename.is_empty() {
             let mut sub_args = Vec::new();
             while cursor.goto_next_sibling() {
@@ -787,7 +805,7 @@ fn powershell_command_name(node: &tree_sitter::Node, source: &[u8]) -> Option<St
         .find(|c| c.kind() == "command_name" || c.kind() == "command_name_expr")?;
     let raw = name_node.utf8_text(source).ok()?;
     let unquoted = strip_surrounding_quotes(raw);
-    let basename = unquoted.rsplit(['/', '\\']).next().unwrap_or(unquoted);
+    let basename = command_basename(unquoted);
     if basename.is_empty() {
         None
     } else {
@@ -2637,7 +2655,7 @@ enabled = false
     fn ps_extract_call_operator_quoted_path() {
         assert_eq!(
             extract_commands_powershell("& 'C:\\Program Files\\app.exe' --flag"),
-            vec![("app.exe".into(), "--flag".into())]
+            vec![("app".into(), "--flag".into())]
         );
     }
 
@@ -2653,7 +2671,7 @@ enabled = false
     fn ps_extract_forward_slash_path() {
         assert_eq!(
             extract_commands_powershell("C:/tools/foo.exe bar"),
-            vec![("foo.exe".into(), "bar".into())]
+            vec![("foo".into(), "bar".into())]
         );
     }
 
@@ -2708,6 +2726,17 @@ enabled = false
             extract_commands_powershell("Get-ChildItem -Path C:\\temp"),
             vec![("Get-ChildItem".into(), "-Path C:\\temp".into())]
         );
+    }
+
+    #[test]
+    fn command_basename_normalizes_separators_and_exe() {
+        assert_eq!(command_basename("rm"), "rm");
+        assert_eq!(command_basename("/usr/bin/rm"), "rm");
+        assert_eq!(command_basename(r"C:\tools\rm.exe"), "rm");
+        assert_eq!(command_basename("git.exe"), "git");
+        assert_eq!(command_basename("FOO.EXE"), "FOO");
+        assert_eq!(command_basename("Get-ChildItem"), "Get-ChildItem");
+        assert_eq!(command_basename(".exe"), ".exe");
     }
 
     // --- inner_powershell_script ---
