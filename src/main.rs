@@ -895,8 +895,22 @@ fn log_invocation(log_config: &LogConfig, input: &str) {
         .open(&expanded)
         .unwrap_or_else(|e| panic!("Failed to open log file at {}: {}", expanded.display(), e));
 
-    writeln!(file, "{}", input.trim())
+    writeln!(file, "{}", timestamped_log_line(input))
         .unwrap_or_else(|e| panic!("Failed to write to log file: {}", e));
+}
+
+fn timestamped_log_line(input: &str) -> String {
+    let ts_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    match serde_json::from_str::<serde_json::Value>(input) {
+        Ok(serde_json::Value::Object(mut map)) => {
+            map.insert("ts_ms".to_string(), serde_json::json!(ts_ms));
+            serde_json::Value::Object(map).to_string()
+        }
+        _ => input.trim().to_string(),
+    }
 }
 
 const WORKTREE_SEGMENT: &str = "/.claude/worktrees/";
@@ -2737,6 +2751,23 @@ enabled = false
         assert_eq!(command_basename("FOO.EXE"), "FOO");
         assert_eq!(command_basename("Get-ChildItem"), "Get-ChildItem");
         assert_eq!(command_basename(".exe"), ".exe");
+    }
+
+    #[test]
+    fn timestamped_log_line_injects_ts_and_preserves_fields() {
+        let line = timestamped_log_line(
+            r#"{"tool_name":"Bash","tool_input":{"command":"ls"},"cwd":"/x"}"#,
+        );
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["tool_name"], "Bash");
+        assert_eq!(v["tool_input"]["command"], "ls");
+        assert_eq!(v["cwd"], "/x");
+        assert!(v["ts_ms"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn timestamped_log_line_passes_through_non_object() {
+        assert_eq!(timestamped_log_line("not json"), "not json");
     }
 
     // --- inner_powershell_script ---
