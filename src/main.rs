@@ -3,6 +3,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[derive(Default)]
 struct Config {
@@ -36,7 +37,7 @@ struct CommandRules {
 }
 
 impl CommandRules {
-    fn from_raw(raw: RawCommandConfig, group_projects: &[String]) -> Self {
+    fn from_raw(raw: RawCommandConfig, group_projects: &[String], source: Source) -> Self {
         let mut rules: HashMap<String, Vec<CommandRule>> = HashMap::new();
 
         for r in raw.rules {
@@ -47,21 +48,36 @@ impl CommandRules {
                 other => panic!("Invalid decision '{}' for command '{}'", other, r.command),
             };
             let projects = merge_and_expand_projects(group_projects, &r.projects);
-            rules.entry(r.command).or_default().push(CommandRule {
+            let command = r.command;
+            let meta = RuleMeta {
+                source_file: source.clone(),
+                rule_kind: RuleKind::Explicit,
+                rule_command: Some(command.clone()),
+                rule_args: r.args.clone(),
+            };
+            rules.entry(command).or_default().push(CommandRule {
                 decision,
                 args: r.args.map(|a| compile_pattern(&a)),
                 reason: r.reason.unwrap_or_else(|| "ok".into()),
                 projects,
+                meta,
             });
         }
 
         for cmd in raw.allowed_commands {
             let projects = group_projects.iter().map(|p| expand_tilde(p)).collect();
+            let meta = RuleMeta {
+                source_file: source.clone(),
+                rule_kind: RuleKind::AllowedCommands,
+                rule_command: Some(cmd.clone()),
+                rule_args: None,
+            };
             rules.entry(cmd).or_default().push(CommandRule {
                 decision: Decision::Allow,
                 args: None,
                 reason: "ok".into(),
                 projects,
+                meta,
             });
         }
 
@@ -69,11 +85,38 @@ impl CommandRules {
     }
 }
 
+type Source = Option<Arc<str>>;
+
+#[derive(Clone, Copy, Default, PartialEq)]
+enum RuleKind {
+    #[default]
+    Explicit,
+    AllowedCommands,
+}
+
+impl RuleKind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            RuleKind::Explicit => "explicit",
+            RuleKind::AllowedCommands => "allowed_commands",
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct RuleMeta {
+    source_file: Source,
+    rule_kind: RuleKind,
+    rule_command: Option<String>,
+    rule_args: Option<String>,
+}
+
 struct CommandRule {
     decision: Decision,
     args: Option<Pattern>,
     reason: String,
     projects: Vec<PathBuf>,
+    meta: RuleMeta,
 }
 
 #[derive(Default, Deserialize)]
@@ -100,7 +143,7 @@ struct WebFetchConfig {
 }
 
 impl WebFetchConfig {
-    fn from_raw(raw: RawWebFetchConfig, group_projects: &[String]) -> Self {
+    fn from_raw(raw: RawWebFetchConfig, group_projects: &[String], source: Source) -> Self {
         WebFetchConfig {
             rules: raw
                 .rules
@@ -113,11 +156,18 @@ impl WebFetchConfig {
                         other => panic!("Invalid decision '{}' for url '{}'", other, r.url),
                     };
                     let projects = merge_and_expand_projects(group_projects, &r.projects);
+                    let meta = RuleMeta {
+                        source_file: source.clone(),
+                        rule_kind: RuleKind::Explicit,
+                        rule_command: Some(r.url.clone()),
+                        rule_args: Some(r.url.clone()),
+                    };
                     WebFetchRule {
                         decision,
                         pattern: compile_pattern(&r.url),
                         reason: r.reason.unwrap_or_else(|| "ok".into()),
                         projects,
+                        meta,
                     }
                 })
                 .collect(),
@@ -130,6 +180,7 @@ struct WebFetchRule {
     pattern: Pattern,
     reason: String,
     projects: Vec<PathBuf>,
+    meta: RuleMeta,
 }
 
 #[derive(Default, Deserialize)]
@@ -176,22 +227,30 @@ struct RawGroupConfig {
 
 impl From<RawConfig> for Config {
     fn from(raw: RawConfig) -> Self {
-        let mut bash = CommandRules::from_raw(raw.bash, &[]);
-        let mut powershell = CommandRules::from_raw(raw.powershell, &[]);
-        let mut web_fetch = WebFetchConfig::from_raw(raw.web_fetch, &[]);
+        Config::from_raw(raw, None)
+    }
+}
+
+impl Config {
+    fn from_raw(raw: RawConfig, source: Source) -> Self {
+        let mut bash = CommandRules::from_raw(raw.bash, &[], source.clone());
+        let mut powershell = CommandRules::from_raw(raw.powershell, &[], source.clone());
+        let mut web_fetch = WebFetchConfig::from_raw(raw.web_fetch, &[], source.clone());
 
         for group in raw.group {
-            let group_bash = CommandRules::from_raw(group.bash, &group.projects);
+            let group_bash = CommandRules::from_raw(group.bash, &group.projects, source.clone());
             for (cmd, rules) in group_bash.rules {
                 bash.rules.entry(cmd).or_default().extend(rules);
             }
 
-            let group_powershell = CommandRules::from_raw(group.powershell, &group.projects);
+            let group_powershell =
+                CommandRules::from_raw(group.powershell, &group.projects, source.clone());
             for (cmd, rules) in group_powershell.rules {
                 powershell.rules.entry(cmd).or_default().extend(rules);
             }
 
-            let group_web_fetch = WebFetchConfig::from_raw(group.web_fetch, &group.projects);
+            let group_web_fetch =
+                WebFetchConfig::from_raw(group.web_fetch, &group.projects, source.clone());
             web_fetch.rules.extend(group_web_fetch.rules);
         }
 
@@ -291,6 +350,8 @@ struct HookInput {
     tool_name: String,
     tool_input: ToolInput,
     cwd: Option<String>,
+    #[serde(default)]
+    hook_event_name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -308,6 +369,61 @@ enum Decision {
     Ask,
 }
 
+impl Decision {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Decision::Allow => "allow",
+            Decision::Deny => "deny",
+            Decision::Ask => "ask",
+        }
+    }
+}
+
+// Per-command-node trace, built alongside the gating decision (never affects it).
+struct NodeTrace {
+    shell: &'static str,
+    command: String,
+    args: String,
+    matched: Option<(Decision, String, RuleMeta)>,
+}
+
+impl NodeTrace {
+    fn decision_str(&self) -> &'static str {
+        match &self.matched {
+            Some((d, _, _)) => d.as_str(),
+            None => "passthrough",
+        }
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        let mut obj = serde_json::Map::new();
+        obj.insert("shell".into(), serde_json::json!(self.shell));
+        obj.insert("command".into(), serde_json::json!(self.command));
+        obj.insert("args".into(), serde_json::json!(self.args));
+        obj.insert("decision".into(), serde_json::json!(self.decision_str()));
+        match &self.matched {
+            Some((_, reason, meta)) => {
+                obj.insert("matched".into(), serde_json::json!(true));
+                obj.insert("reason".into(), serde_json::json!(reason));
+                obj.insert(
+                    "rule_kind".into(),
+                    serde_json::json!(meta.rule_kind.as_str()),
+                );
+                obj.insert("rule_command".into(), serde_json::json!(meta.rule_command));
+                obj.insert("rule_args".into(), serde_json::json!(meta.rule_args));
+                obj.insert(
+                    "source_file".into(),
+                    serde_json::json!(meta.source_file.as_deref()),
+                );
+            }
+            None => {
+                obj.insert("matched".into(), serde_json::json!(false));
+            }
+        }
+        serde_json::Value::Object(obj)
+    }
+}
+
 fn main() {
     let mut input = String::new();
     std::io::stdin()
@@ -319,43 +435,97 @@ fn main() {
 
     let config = load_config(cwd);
 
-    if let Some(log) = &config.log {
-        if log.enabled {
-            log_invocation(log, &input);
+    if hook_input.hook_event_name.as_deref() == Some("PostToolUse") {
+        if let Some(log) = &config.log {
+            if log.enabled {
+                log_post_tool_use(log, &input);
+            }
         }
+        return;
     }
 
+    let trace = dispatch(&config, &hook_input, cwd);
+
+    if let Some((decision, reason)) = &trace.final_decision {
+        print_decision(decision.clone(), reason);
+    }
+
+    if let Some(log) = &config.log {
+        if log.enabled {
+            log_invocation(log, &input, &trace);
+        }
+    }
+}
+
+// Holds everything the gate decided this invocation, for logging only. The
+// final_decision drives what is printed to Claude Code; nodes/kind are observability.
+struct InvocationTrace {
+    final_decision: Option<(Decision, String)>,
+    kind: &'static str,
+    nodes: Vec<NodeTrace>,
+}
+
+// Purpose: compute the gate decision and a parallel per-node trace for one tool call.
+// Requires: config loaded; hook_input parsed.
+// Guarantees: returned final_decision is byte-identical to the legacy handlers; nodes
+//             mirror the same extraction used for the decision.
+fn dispatch(config: &Config, hook_input: &HookInput, cwd: Option<&str>) -> InvocationTrace {
     if config.worktree_protection.enabled {
         if let Some(cwd) = cwd {
             if let Some((decision, reason)) =
                 check_worktree_protection(cwd, &hook_input.tool_name, &hook_input.tool_input)
             {
-                print_decision(decision, &reason);
-                return;
+                return InvocationTrace {
+                    final_decision: Some((decision, reason)),
+                    kind: "worktree_protection",
+                    nodes: Vec::new(),
+                };
             }
         }
     }
 
-    if hook_input.tool_name == "Bash" {
-        if let Some(command) = &hook_input.tool_input.command {
-            if let Some((decision, reason)) =
-                handle_bash_tool(&config.bash, &config.powershell, cwd, command)
-            {
-                print_decision(decision, &reason);
+    match hook_input.tool_name.as_str() {
+        "Bash" => match &hook_input.tool_input.command {
+            Some(command) => {
+                let nodes = trace_bash_tool(&config.bash, &config.powershell, cwd, command);
+                InvocationTrace {
+                    final_decision: handle_bash_tool(
+                        &config.bash,
+                        &config.powershell,
+                        cwd,
+                        command,
+                    ),
+                    kind: "command_chain",
+                    nodes,
+                }
             }
-        }
-    } else if hook_input.tool_name == "PowerShell" {
-        if let Some(command) = &hook_input.tool_input.command {
-            if let Some((decision, reason)) = handle_powershell(&config.powershell, cwd, command) {
-                print_decision(decision, &reason);
-            }
-        }
-    } else if hook_input.tool_name == "WebFetch" {
-        if let Some(url) = &hook_input.tool_input.url {
-            if let Some((decision, reason)) = handle_web_fetch(&config.web_fetch, cwd, url) {
-                print_decision(decision, &reason);
-            }
-        }
+            None => empty_trace("command_chain"),
+        },
+        "PowerShell" => match &hook_input.tool_input.command {
+            Some(command) => InvocationTrace {
+                final_decision: handle_powershell(&config.powershell, cwd, command),
+                kind: "command_chain",
+                nodes: trace_powershell(&config.powershell, cwd, command),
+            },
+            None => empty_trace("command_chain"),
+        },
+        "WebFetch" => match &hook_input.tool_input.url {
+            Some(url) => InvocationTrace {
+                final_decision: handle_web_fetch(&config.web_fetch, cwd, url),
+                kind: "web_fetch",
+                nodes: vec![trace_web_fetch(&config.web_fetch, cwd, url)],
+            },
+            None => empty_trace("web_fetch"),
+        },
+        _ => empty_trace("unknown"),
+    }
+}
+
+fn empty_trace(kind: &'static str) -> InvocationTrace {
+    InvocationTrace {
+        final_decision: None,
+        kind,
+        nodes: Vec::new(),
     }
 }
 
@@ -390,6 +560,26 @@ fn handle_web_fetch(
     None
 }
 
+fn trace_web_fetch(config: &WebFetchConfig, cwd: Option<&str>, url: &str) -> NodeTrace {
+    let matched = config
+        .rules
+        .iter()
+        .find(|rule| rule_matches_cwd(&rule.projects, cwd) && rule.pattern.is_match(url))
+        .map(|rule| {
+            (
+                rule.decision.clone(),
+                rule.reason.clone(),
+                rule.meta.clone(),
+            )
+        });
+    NodeTrace {
+        shell: "web-fetch",
+        command: url.to_string(),
+        args: String::new(),
+        matched,
+    }
+}
+
 fn find_project_config(cwd: &str) -> Option<PathBuf> {
     let mut dir = Path::new(cwd);
     loop {
@@ -409,7 +599,7 @@ fn parse_config_file(path: &Path) -> Config {
         .unwrap_or_else(|e| panic!("Failed to read config at {}: {}", path.display(), e));
     let raw: RawConfig = toml::from_str(&content)
         .unwrap_or_else(|e| panic!("Failed to parse config at {}: {}", path.display(), e));
-    Config::from(raw)
+    Config::from_raw(raw, Some(Arc::from(path.display().to_string().as_str())))
 }
 
 fn load_config(cwd: Option<&str>) -> Config {
@@ -499,6 +689,60 @@ fn combine(resolved: Vec<Option<(Decision, String)>>) -> Option<(Decision, Strin
     }
 }
 
+fn resolve_command_traced(
+    rules: &[&CommandRule],
+    args: &str,
+    cwd: Option<&str>,
+) -> Option<(Decision, String, RuleMeta)> {
+    for rule in rules {
+        if rule_matches_cwd(&rule.projects, cwd) && matches_args(&rule.args, args) {
+            return Some((
+                rule.decision.clone(),
+                rule.reason.clone(),
+                rule.meta.clone(),
+            ));
+        }
+    }
+    None
+}
+
+fn trace_in(
+    rules: &CommandRules,
+    cwd: Option<&str>,
+    commands: &[(String, String)],
+    shell: &'static str,
+) -> Vec<NodeTrace> {
+    commands
+        .iter()
+        .map(|(name, args)| {
+            let rs: Vec<&CommandRule> = rules
+                .rules
+                .get(name.as_str())
+                .map(|r| r.iter().collect())
+                .unwrap_or_default();
+            NodeTrace {
+                shell,
+                command: name.clone(),
+                args: args.clone(),
+                matched: resolve_command_traced(&rs, args, cwd),
+            }
+        })
+        .collect()
+}
+
+// Identifies the node whose decision set the final verdict: the first deny if any
+// denied, else the first ask, else the first matched allow.
+fn deciding_index(nodes: &[NodeTrace]) -> Option<usize> {
+    let pick = |want: &Decision| {
+        nodes
+            .iter()
+            .position(|n| n.matched.as_ref().is_some_and(|(d, _, _)| d == want))
+    };
+    pick(&Decision::Deny)
+        .or_else(|| pick(&Decision::Ask))
+        .or_else(|| pick(&Decision::Allow))
+}
+
 // Pure bash resolution, retained for the bash regression tests; production dispatch
 // goes through handle_bash_tool, which also escalates inner pwsh -Command scripts.
 fn handle_powershell(
@@ -530,6 +774,34 @@ fn handle_bash_tool(
     }
 
     combine(resolved)
+}
+
+fn trace_bash_tool(
+    bash: &CommandRules,
+    powershell: &CommandRules,
+    cwd: Option<&str>,
+    command: &str,
+) -> Vec<NodeTrace> {
+    let bash_cmds = extract_commands(command);
+    let mut nodes = trace_in(bash, cwd, &bash_cmds, "bash");
+
+    for (name, args) in &bash_cmds {
+        if let Some(script) = inner_powershell_script(name, args) {
+            let inner = extract_commands_powershell(&script);
+            nodes.extend(trace_in(powershell, cwd, &inner, "powershell"));
+        }
+    }
+
+    nodes
+}
+
+fn trace_powershell(rules: &CommandRules, cwd: Option<&str>, command: &str) -> Vec<NodeTrace> {
+    trace_in(
+        rules,
+        cwd,
+        &extract_commands_powershell(command),
+        "powershell",
+    )
 }
 
 #[cfg(test)]
@@ -879,27 +1151,58 @@ fn inner_powershell_script(name: &str, args: &str) -> Option<String> {
     Some(strip_surrounding_quotes(&joined).to_string())
 }
 
-fn log_invocation(log_config: &LogConfig, input: &str) {
+// Logging is best-effort observability: any failure here is swallowed so the gate
+// decision already printed to Claude Code is never blocked or altered.
+fn log_invocation(log_config: &LogConfig, input: &str, trace: &InvocationTrace) {
     let default_path = "~/.local/state/lord-kali/hook.jsonl";
     let path_str = log_config.path.as_deref().unwrap_or(default_path);
     let expanded = expand_tilde(path_str);
 
     if let Some(parent) = expanded.parent() {
-        std::fs::create_dir_all(parent).expect("Failed to create log directory");
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
     }
 
     use std::io::Write;
-    let mut file = std::fs::OpenOptions::new()
+    let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&expanded)
-        .unwrap_or_else(|e| panic!("Failed to open log file at {}: {}", expanded.display(), e));
+    else {
+        return;
+    };
 
-    writeln!(file, "{}", timestamped_log_line(input))
-        .unwrap_or_else(|e| panic!("Failed to write to log file: {}", e));
+    let _ = writeln!(file, "{}", timestamped_log_line(input, trace));
 }
 
-fn timestamped_log_line(input: &str) -> String {
+// PostToolUse fires only after a tool actually executed (auto-allowed or user-approved
+// at the prompt). It cannot gate, so this path logs and returns with no decision and no
+// stdout. Best-effort: any failure here is swallowed.
+fn log_post_tool_use(log_config: &LogConfig, input: &str) {
+    let default_path = "~/.local/state/lord-kali/hook.jsonl";
+    let path_str = log_config.path.as_deref().unwrap_or(default_path);
+    let expanded = expand_tilde(path_str);
+
+    if let Some(parent) = expanded.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+
+    use std::io::Write;
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&expanded)
+    else {
+        return;
+    };
+
+    let _ = writeln!(file, "{}", post_tool_use_log_line(input));
+}
+
+fn post_tool_use_log_line(input: &str) -> String {
     let ts_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -907,6 +1210,46 @@ fn timestamped_log_line(input: &str) -> String {
     match serde_json::from_str::<serde_json::Value>(input) {
         Ok(serde_json::Value::Object(mut map)) => {
             map.insert("ts_ms".to_string(), serde_json::json!(ts_ms));
+            map.insert("lk_event".to_string(), serde_json::json!("post_tool_use"));
+            map.remove("tool_response");
+            serde_json::Value::Object(map).to_string()
+        }
+        _ => input.trim().to_string(),
+    }
+}
+
+fn decision_breakdown(trace: &InvocationTrace) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    let final_str = match &trace.final_decision {
+        Some((d, _)) => d.as_str(),
+        None => "passthrough",
+    };
+    obj.insert("final".into(), serde_json::json!(final_str));
+    obj.insert("kind".into(), serde_json::json!(trace.kind));
+    if let Some((_, reason)) = &trace.final_decision {
+        obj.insert("reason".into(), serde_json::json!(reason));
+    }
+
+    match deciding_index(&trace.nodes) {
+        Some(i) => obj.insert("deciding".into(), trace.nodes[i].to_json()),
+        None => obj.insert("deciding".into(), serde_json::Value::Null),
+    };
+
+    let nodes: Vec<serde_json::Value> = trace.nodes.iter().map(NodeTrace::to_json).collect();
+    obj.insert("nodes".into(), serde_json::Value::Array(nodes));
+    serde_json::Value::Object(obj)
+}
+
+fn timestamped_log_line(input: &str, trace: &InvocationTrace) -> String {
+    let ts_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    match serde_json::from_str::<serde_json::Value>(input) {
+        Ok(serde_json::Value::Object(mut map)) => {
+            map.insert("ts_ms".to_string(), serde_json::json!(ts_ms));
+            map.insert("lk_event".to_string(), serde_json::json!("pre_tool_use"));
+            map.insert("lk_decision".to_string(), decision_breakdown(trace));
             serde_json::Value::Object(map).to_string()
         }
         _ => input.trim().to_string(),
@@ -1003,6 +1346,7 @@ mod tests {
                 args: None,
                 reason: "ok".into(),
                 projects: vec![],
+                meta: RuleMeta::default(),
             });
         }
 
@@ -1014,6 +1358,7 @@ mod tests {
                 args: None,
                 reason: "Use pnpm instead of npm.".into(),
                 projects: vec![],
+                meta: RuleMeta::default(),
             });
 
         rules
@@ -1024,6 +1369,7 @@ mod tests {
                 args: None,
                 reason: "rm can be dangerous, please ask.".into(),
                 projects: vec![],
+                meta: RuleMeta::default(),
             });
 
         rules
@@ -1034,6 +1380,7 @@ mod tests {
                 args: None,
                 reason: "rmdir can be dangerous, please ask.".into(),
                 projects: vec![],
+                meta: RuleMeta::default(),
             });
 
         CommandRules { rules }
@@ -1349,6 +1696,7 @@ mod tests {
                 args: Some(compile_pattern("-rf **")),
                 reason: "No recursive force deletes".into(),
                 projects: vec![],
+                meta: RuleMeta::default(),
             });
         rules
             .entry("rm".to_string())
@@ -1358,6 +1706,7 @@ mod tests {
                 args: None,
                 reason: "rm can be dangerous".into(),
                 projects: vec![],
+                meta: RuleMeta::default(),
             });
         let config = CommandRules { rules };
 
@@ -1378,6 +1727,7 @@ mod tests {
                 args: Some(compile_pattern("-rf **")),
                 reason: "No recursive force deletes".into(),
                 projects: vec![],
+                meta: RuleMeta::default(),
             });
         rules
             .entry("rm".to_string())
@@ -1387,6 +1737,7 @@ mod tests {
                 args: None,
                 reason: "rm can be dangerous".into(),
                 projects: vec![],
+                meta: RuleMeta::default(),
             });
         let config = CommandRules { rules };
 
@@ -1407,6 +1758,7 @@ mod tests {
                 args: Some(compile_pattern("status")),
                 reason: "ok".into(),
                 projects: vec![],
+                meta: RuleMeta::default(),
             });
         let config = CommandRules { rules };
 
@@ -1427,6 +1779,7 @@ mod tests {
                 args: Some(compile_pattern("status")),
                 reason: "ok".into(),
                 projects: vec![],
+                meta: RuleMeta::default(),
             });
         let config = CommandRules { rules };
 
@@ -1444,6 +1797,7 @@ mod tests {
                 args: Some(compile_pattern("log *")),
                 reason: "ok".into(),
                 projects: vec![],
+                meta: RuleMeta::default(),
             });
         let config = CommandRules { rules };
 
@@ -1464,6 +1818,7 @@ mod tests {
                 args: Some(compile_pattern("/^(status|diff|log)$/")),
                 reason: "ok".into(),
                 projects: vec![],
+                meta: RuleMeta::default(),
             });
         let config = CommandRules { rules };
 
@@ -1488,7 +1843,7 @@ mod tests {
                 projects: vec![],
             }],
         };
-        let config = CommandRules::from_raw(raw, &[]);
+        let config = CommandRules::from_raw(raw, &[], None);
 
         assert_eq!(
             handle_bash(&config, None, "rm foo").map(|(d, _)| d),
@@ -1508,7 +1863,7 @@ mod tests {
                 projects: vec![],
             }],
         };
-        let config = CommandRules::from_raw(raw, &[]);
+        let config = CommandRules::from_raw(raw, &[], None);
 
         assert_eq!(
             handle_bash(&config, None, "git push origin main").map(|(d, _)| d),
@@ -1639,24 +1994,28 @@ mod tests {
                     pattern: compile_pattern("https://evil.com/**"),
                     reason: "Blocked domain".into(),
                     projects: vec![],
+                    meta: RuleMeta::default(),
                 },
                 WebFetchRule {
                     decision: Decision::Ask,
                     pattern: compile_pattern("/.*\\.internal\\..*/"),
                     reason: "Internal URL, please confirm".into(),
                     projects: vec![],
+                    meta: RuleMeta::default(),
                 },
                 WebFetchRule {
                     decision: Decision::Allow,
                     pattern: compile_pattern("https://docs.rs/**"),
                     reason: "ok".into(),
                     projects: vec![],
+                    meta: RuleMeta::default(),
                 },
                 WebFetchRule {
                     decision: Decision::Allow,
                     pattern: compile_pattern("https://crates.io/**"),
                     reason: "ok".into(),
                     projects: vec![],
+                    meta: RuleMeta::default(),
                 },
             ],
         }
@@ -1704,12 +2063,14 @@ mod tests {
                     pattern: compile_pattern("https://bad.internal.corp/**"),
                     reason: "Denied".into(),
                     projects: vec![],
+                    meta: RuleMeta::default(),
                 },
                 WebFetchRule {
                     decision: Decision::Ask,
                     pattern: compile_pattern("/.*\\.internal\\..*/"),
                     reason: "Ask".into(),
                     projects: vec![],
+                    meta: RuleMeta::default(),
                 },
             ],
         };
@@ -1790,6 +2151,7 @@ mod tests {
                 args: Some(compile_pattern("publish{, **}")),
                 reason: "No publishing from this project".into(),
                 projects: vec![PathBuf::from("/home/user/projects/test")],
+                meta: RuleMeta::default(),
             });
         rules
             .entry("cargo".to_string())
@@ -1799,6 +2161,7 @@ mod tests {
                 args: None,
                 reason: "ok".into(),
                 projects: vec![],
+                meta: RuleMeta::default(),
             });
         let config = CommandRules { rules };
 
@@ -1819,6 +2182,7 @@ mod tests {
                 args: Some(compile_pattern("publish{, **}")),
                 reason: "No publishing from this project".into(),
                 projects: vec![PathBuf::from("/home/user/projects/test")],
+                meta: RuleMeta::default(),
             });
         rules
             .entry("cargo".to_string())
@@ -1828,6 +2192,7 @@ mod tests {
                 args: None,
                 reason: "ok".into(),
                 projects: vec![],
+                meta: RuleMeta::default(),
             });
         let config = CommandRules { rules };
 
@@ -1847,12 +2212,14 @@ mod tests {
                     pattern: compile_pattern("https://internal.example.com/**"),
                     reason: "Blocked for this project".into(),
                     projects: vec![PathBuf::from("/home/user/projects/test")],
+                    meta: RuleMeta::default(),
                 },
                 WebFetchRule {
                     decision: Decision::Allow,
                     pattern: compile_pattern("https://internal.example.com/**"),
                     reason: "ok".into(),
                     projects: vec![],
+                    meta: RuleMeta::default(),
                 },
             ],
         };
@@ -1877,12 +2244,14 @@ mod tests {
                     pattern: compile_pattern("https://internal.example.com/**"),
                     reason: "Blocked for this project".into(),
                     projects: vec![PathBuf::from("/home/user/projects/test")],
+                    meta: RuleMeta::default(),
                 },
                 WebFetchRule {
                     decision: Decision::Allow,
                     pattern: compile_pattern("https://internal.example.com/**"),
                     reason: "ok".into(),
                     projects: vec![],
+                    meta: RuleMeta::default(),
                 },
             ],
         };
@@ -2132,6 +2501,7 @@ mod tests {
                 args: Some(compile_pattern("status")),
                 reason: "ok".into(),
                 projects: vec![],
+                meta: RuleMeta::default(),
             });
         let a = Config {
             bash: CommandRules { rules: rules_a },
@@ -2147,6 +2517,7 @@ mod tests {
                 args: Some(compile_pattern("push{, **}")),
                 reason: "no pushing".into(),
                 projects: vec![],
+                meta: RuleMeta::default(),
             });
         rules_b
             .entry("cargo".to_string())
@@ -2156,6 +2527,7 @@ mod tests {
                 args: None,
                 reason: "ok".into(),
                 projects: vec![],
+                meta: RuleMeta::default(),
             });
         let b = Config {
             bash: CommandRules { rules: rules_b },
@@ -2179,6 +2551,7 @@ mod tests {
                     pattern: compile_pattern("https://evil.com/**"),
                     reason: "blocked".into(),
                     projects: vec![],
+                    meta: RuleMeta::default(),
                 }],
             },
             ..Config::default()
@@ -2190,6 +2563,7 @@ mod tests {
                     pattern: compile_pattern("https://docs.rs/**"),
                     reason: "ok".into(),
                     projects: vec![],
+                    meta: RuleMeta::default(),
                 }],
             },
             ..Config::default()
@@ -2753,21 +3127,34 @@ enabled = false
         assert_eq!(command_basename(".exe"), ".exe");
     }
 
+    fn empty_invocation_trace() -> InvocationTrace {
+        InvocationTrace {
+            final_decision: None,
+            kind: "command_chain",
+            nodes: Vec::new(),
+        }
+    }
+
     #[test]
     fn timestamped_log_line_injects_ts_and_preserves_fields() {
         let line = timestamped_log_line(
             r#"{"tool_name":"Bash","tool_input":{"command":"ls"},"cwd":"/x"}"#,
+            &empty_invocation_trace(),
         );
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(v["tool_name"], "Bash");
         assert_eq!(v["tool_input"]["command"], "ls");
         assert_eq!(v["cwd"], "/x");
         assert!(v["ts_ms"].as_u64().unwrap() > 0);
+        assert_eq!(v["lk_decision"]["final"], "passthrough");
     }
 
     #[test]
     fn timestamped_log_line_passes_through_non_object() {
-        assert_eq!(timestamped_log_line("not json"), "not json");
+        assert_eq!(
+            timestamped_log_line("not json", &empty_invocation_trace()),
+            "not json"
+        );
     }
 
     // --- inner_powershell_script ---
@@ -2818,6 +3205,7 @@ enabled = false
                 args: None,
                 reason: "Remove-Item is dangerous.".into(),
                 projects: vec![],
+                meta: RuleMeta::default(),
             });
         rules
             .entry("Get-ChildItem".to_string())
@@ -2827,6 +3215,7 @@ enabled = false
                 args: None,
                 reason: "ok".into(),
                 projects: vec![],
+                meta: RuleMeta::default(),
             });
         CommandRules { rules }
     }
@@ -2890,5 +3279,31 @@ enabled = false
             handle_bash_tool(&bash, &powershell, None, "pwsh -File x.ps1").map(|(d, _)| d),
             None
         );
+    }
+
+    // --- PostToolUse log shaping ---
+
+    #[test]
+    fn post_tool_use_line_marks_event_and_strips_response() {
+        let input = r#"{"hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{"command":"ls"},"cwd":"/x","session_id":"s1","tool_response":{"stdout":"a","stderr":""}}"#;
+        let line = post_tool_use_log_line(input);
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["lk_event"], serde_json::json!("post_tool_use"));
+        assert_eq!(v["tool_name"], serde_json::json!("Bash"));
+        assert_eq!(v["tool_input"]["command"], serde_json::json!("ls"));
+        assert_eq!(v["session_id"], serde_json::json!("s1"));
+        assert!(v.get("tool_response").is_none());
+        assert!(v.get("ts_ms").is_some());
+        assert!(v.get("lk_decision").is_none());
+    }
+
+    #[test]
+    fn pre_tool_use_line_marks_event() {
+        let input = r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"ls"},"cwd":"/x"}"#;
+        let trace = empty_trace("command_chain");
+        let line = timestamped_log_line(input, &trace);
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["lk_event"], serde_json::json!("pre_tool_use"));
+        assert!(v.get("lk_decision").is_some());
     }
 }
