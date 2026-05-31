@@ -658,13 +658,15 @@ fn log_invocation(log_config: &LogConfig, input: &str) {
 const WORKTREE_SEGMENT: &str = "/.claude/worktrees/";
 
 fn detect_worktree(cwd: &str) -> Option<(&str, &str)> {
-    let idx = cwd.find(WORKTREE_SEGMENT)?;
-    let parent_root = &cwd[..idx];
-    let after = &cwd[idx + WORKTREE_SEGMENT.len()..];
+    // Match the segment regardless of separator (Windows cwds use `\`). Replacing
+    // `\` with `/` preserves byte offsets, so indices stay valid against `cwd`.
+    let normalized = cwd.replace('\\', "/");
+    let idx = normalized.find(WORKTREE_SEGMENT)?;
+    let after = &normalized[idx + WORKTREE_SEGMENT.len()..];
     if after.is_empty() || after.ends_with('/') {
         return None;
     }
-    Some((parent_root, cwd))
+    Some((&cwd[..idx], cwd))
 }
 
 const FILE_TOOLS: &[&str] = &[
@@ -693,11 +695,15 @@ fn check_worktree_protection(
         .as_deref()
         .or(tool_input.path.as_deref())?;
 
-    if file_path.starts_with(worktree_root) {
+    // Compare with separators normalized so a `\`-vs-`/` mismatch between cwd and
+    // the tool's path can't defeat the check. Normalization preserves byte length,
+    // so `parent_root.len()` stays a valid offset into the original `file_path`.
+    let file_norm = file_path.replace('\\', "/");
+    if file_norm.starts_with(&worktree_root.replace('\\', "/")) {
         return None;
     }
 
-    if !file_path.starts_with(parent_root) {
+    if !file_norm.starts_with(&parent_root.replace('\\', "/")) {
         return None;
     }
 
@@ -2203,6 +2209,46 @@ reason = "Global allows rm"
             worktree,
             "/home/user/projects/myapp/.claude/worktrees/fix/PJ-1234"
         );
+    }
+
+    #[test]
+    fn detect_worktree_windows_separators() {
+        let (parent, worktree) =
+            detect_worktree(r"C:\Users\me\proj\.claude\worktrees\feature-x").unwrap();
+        assert_eq!(parent, r"C:\Users\me\proj");
+        assert_eq!(worktree, r"C:\Users\me\proj\.claude\worktrees\feature-x");
+    }
+
+    #[test]
+    fn detect_worktree_windows_trailing_separator() {
+        assert!(detect_worktree(r"C:\Users\me\proj\.claude\worktrees\").is_none());
+    }
+
+    #[test]
+    fn worktree_denies_parent_path_windows() {
+        let input = worktree_tool_input(Some(r"C:\Users\me\proj\src\main.rs"), None);
+        let result =
+            check_worktree_protection(r"C:\Users\me\proj\.claude\worktrees\feat", "Read", &input);
+        assert!(matches!(result, Some((Decision::Deny, _))));
+    }
+
+    #[test]
+    fn worktree_allows_worktree_path_windows() {
+        let input = worktree_tool_input(
+            Some(r"C:\Users\me\proj\.claude\worktrees\feat\src\main.rs"),
+            None,
+        );
+        let result =
+            check_worktree_protection(r"C:\Users\me\proj\.claude\worktrees\feat", "Read", &input);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn worktree_denies_parent_path_mixed_separators() {
+        let input = worktree_tool_input(Some("C:/Users/me/proj/src/main.rs"), None);
+        let result =
+            check_worktree_protection(r"C:\Users\me\proj\.claude\worktrees\feat", "Edit", &input);
+        assert!(matches!(result, Some((Decision::Deny, _))));
     }
 
     // --- check_worktree_protection ---
