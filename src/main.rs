@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 
 #[derive(Default)]
 struct Config {
-    bash: BashConfig,
+    bash: CommandRules,
+    powershell: CommandRules,
     web_fetch: WebFetchConfig,
     log: Option<LogConfig>,
     worktree_protection: WorktreeProtectionConfig,
@@ -16,6 +17,9 @@ impl Config {
     fn merge(mut self, other: Config) -> Config {
         for (cmd, rules) in other.bash.rules {
             self.bash.rules.entry(cmd).or_default().extend(rules);
+        }
+        for (cmd, rules) in other.powershell.rules {
+            self.powershell.rules.entry(cmd).or_default().extend(rules);
         }
         self.web_fetch.rules.extend(other.web_fetch.rules);
         if other.log.is_some() {
@@ -27,13 +31,13 @@ impl Config {
 }
 
 #[derive(Default)]
-struct BashConfig {
-    rules: HashMap<String, Vec<BashRule>>,
+struct CommandRules {
+    rules: HashMap<String, Vec<CommandRule>>,
 }
 
-impl BashConfig {
-    fn from_raw(raw: RawBashConfig, group_projects: &[String]) -> Self {
-        let mut rules: HashMap<String, Vec<BashRule>> = HashMap::new();
+impl CommandRules {
+    fn from_raw(raw: RawCommandConfig, group_projects: &[String]) -> Self {
+        let mut rules: HashMap<String, Vec<CommandRule>> = HashMap::new();
 
         for r in raw.rules {
             let decision = match r.decision.as_str() {
@@ -43,7 +47,7 @@ impl BashConfig {
                 other => panic!("Invalid decision '{}' for command '{}'", other, r.command),
             };
             let projects = merge_and_expand_projects(group_projects, &r.projects);
-            rules.entry(r.command).or_default().push(BashRule {
+            rules.entry(r.command).or_default().push(CommandRule {
                 decision,
                 args: r.args.map(|a| compile_pattern(&a)),
                 reason: r.reason.unwrap_or_else(|| "ok".into()),
@@ -53,7 +57,7 @@ impl BashConfig {
 
         for cmd in raw.allowed_commands {
             let projects = group_projects.iter().map(|p| expand_tilde(p)).collect();
-            rules.entry(cmd).or_default().push(BashRule {
+            rules.entry(cmd).or_default().push(CommandRule {
                 decision: Decision::Allow,
                 args: None,
                 reason: "ok".into(),
@@ -61,11 +65,11 @@ impl BashConfig {
             });
         }
 
-        BashConfig { rules }
+        CommandRules { rules }
     }
 }
 
-struct BashRule {
+struct CommandRule {
     decision: Decision,
     args: Option<Pattern>,
     reason: String,
@@ -73,15 +77,15 @@ struct BashRule {
 }
 
 #[derive(Default, Deserialize)]
-struct RawBashConfig {
+struct RawCommandConfig {
     #[serde(default)]
     allowed_commands: Vec<String>,
     #[serde(default)]
-    rules: Vec<RawBashRule>,
+    rules: Vec<RawCommandRule>,
 }
 
 #[derive(Deserialize)]
-struct RawBashRule {
+struct RawCommandRule {
     command: String,
     args: Option<String>,
     decision: String,
@@ -146,7 +150,9 @@ struct RawWebFetchRule {
 #[derive(Default, Deserialize)]
 struct RawConfig {
     #[serde(default)]
-    bash: RawBashConfig,
+    bash: RawCommandConfig,
+    #[serde(default)]
+    powershell: RawCommandConfig,
     #[serde(default, rename = "web-fetch")]
     web_fetch: RawWebFetchConfig,
     log: Option<LogConfig>,
@@ -161,20 +167,28 @@ struct RawGroupConfig {
     #[serde(default)]
     projects: Vec<String>,
     #[serde(default)]
-    bash: RawBashConfig,
+    bash: RawCommandConfig,
+    #[serde(default)]
+    powershell: RawCommandConfig,
     #[serde(default, rename = "web-fetch")]
     web_fetch: RawWebFetchConfig,
 }
 
 impl From<RawConfig> for Config {
     fn from(raw: RawConfig) -> Self {
-        let mut bash = BashConfig::from_raw(raw.bash, &[]);
+        let mut bash = CommandRules::from_raw(raw.bash, &[]);
+        let mut powershell = CommandRules::from_raw(raw.powershell, &[]);
         let mut web_fetch = WebFetchConfig::from_raw(raw.web_fetch, &[]);
 
         for group in raw.group {
-            let group_bash = BashConfig::from_raw(group.bash, &group.projects);
+            let group_bash = CommandRules::from_raw(group.bash, &group.projects);
             for (cmd, rules) in group_bash.rules {
                 bash.rules.entry(cmd).or_default().extend(rules);
+            }
+
+            let group_powershell = CommandRules::from_raw(group.powershell, &group.projects);
+            for (cmd, rules) in group_powershell.rules {
+                powershell.rules.entry(cmd).or_default().extend(rules);
             }
 
             let group_web_fetch = WebFetchConfig::from_raw(group.web_fetch, &group.projects);
@@ -183,6 +197,7 @@ impl From<RawConfig> for Config {
 
         Config {
             bash,
+            powershell,
             web_fetch,
             log: raw.log,
             worktree_protection: WorktreeProtectionConfig {
@@ -323,7 +338,15 @@ fn main() {
 
     if hook_input.tool_name == "Bash" {
         if let Some(command) = &hook_input.tool_input.command {
-            if let Some((decision, reason)) = handle_bash(&config.bash, cwd, command) {
+            if let Some((decision, reason)) =
+                handle_bash_tool(&config.bash, &config.powershell, cwd, command)
+            {
+                print_decision(decision, &reason);
+            }
+        }
+    } else if hook_input.tool_name == "PowerShell" {
+        if let Some(command) = &hook_input.tool_input.command {
+            if let Some((decision, reason)) = handle_powershell(&config.powershell, cwd, command) {
                 print_decision(decision, &reason);
             }
         }
@@ -420,14 +443,26 @@ fn load_config(cwd: Option<&str>) -> Config {
         .fold(initial, Config::merge)
 }
 
-fn handle_bash(
-    config: &BashConfig,
+fn resolve_in(
+    rules: &CommandRules,
     cwd: Option<&str>,
-    command: &str,
-) -> Option<(Decision, String)> {
-    let commands = extract_commands(command);
+    commands: &[(String, String)],
+) -> Vec<Option<(Decision, String)>> {
+    commands
+        .iter()
+        .map(|(name, args)| {
+            let rs: Vec<&CommandRule> = rules
+                .rules
+                .get(name.as_str())
+                .map(|r| r.iter().collect())
+                .unwrap_or_default();
+            resolve_command(&rs, args, cwd)
+        })
+        .collect()
+}
 
-    if commands.is_empty() {
+fn combine(resolved: Vec<Option<(Decision, String)>>) -> Option<(Decision, String)> {
+    if resolved.is_empty() {
         return None;
     }
 
@@ -435,14 +470,8 @@ fn handle_bash(
     let mut ask_reason: Option<String> = None;
     let mut all_allowed = true;
 
-    for (name, args) in &commands {
-        let rules: Vec<&BashRule> = config
-            .rules
-            .get(name.as_str())
-            .map(|r| r.iter().collect())
-            .unwrap_or_default();
-
-        match resolve_command(&rules, args, cwd) {
+    for r in resolved {
+        match r {
             Some((Decision::Deny, reason)) => {
                 deny_reason.get_or_insert(reason);
             }
@@ -467,8 +496,57 @@ fn handle_bash(
     }
 }
 
+// Pure bash resolution, retained for the bash regression tests; production dispatch
+// goes through handle_bash_tool, which also escalates inner pwsh -Command scripts.
+fn handle_powershell(
+    rules: &CommandRules,
+    cwd: Option<&str>,
+    command: &str,
+) -> Option<(Decision, String)> {
+    combine(resolve_in(
+        rules,
+        cwd,
+        &extract_commands_powershell(command),
+    ))
+}
+
+fn handle_bash_tool(
+    bash: &CommandRules,
+    powershell: &CommandRules,
+    cwd: Option<&str>,
+    command: &str,
+) -> Option<(Decision, String)> {
+    let bash_cmds = extract_commands(command);
+    let mut resolved = resolve_in(bash, cwd, &bash_cmds);
+
+    for (name, args) in &bash_cmds {
+        if let Some(script) = inner_powershell_script(name, args) {
+            let inner = extract_commands_powershell(&script);
+            resolved.extend(resolve_in(powershell, cwd, &inner));
+        }
+    }
+
+    combine(resolved)
+}
+
+#[cfg(test)]
+fn handle_bash(
+    rules: &CommandRules,
+    cwd: Option<&str>,
+    command: &str,
+) -> Option<(Decision, String)> {
+    handle_bash_tool(
+        rules,
+        &CommandRules {
+            rules: HashMap::new(),
+        },
+        cwd,
+        command,
+    )
+}
+
 fn resolve_command(
-    rules: &[&BashRule],
+    rules: &[&CommandRule],
     args: &str,
     cwd: Option<&str>,
 ) -> Option<(Decision, String)> {
@@ -635,6 +713,152 @@ fn extract_xargs_subcommand(node: &tree_sitter::Node, source: &[u8]) -> Option<(
     None
 }
 
+fn strip_surrounding_quotes(token: &str) -> &str {
+    let bytes = token.as_bytes();
+    if bytes.len() >= 2 {
+        let first = bytes[0];
+        let last = bytes[bytes.len() - 1];
+        if (first == b'\'' || first == b'"') && first == last {
+            return &token[1..token.len() - 1];
+        }
+    }
+    token
+}
+
+fn split_top_level_segments(source: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut chars = source.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if let Some(q) = quote {
+            current.push(c);
+            if c == q {
+                quote = None;
+            }
+            continue;
+        }
+
+        match c {
+            '\'' | '"' => {
+                quote = Some(c);
+                current.push(c);
+            }
+            '|' | '&' if chars.peek() == Some(&c) => {
+                chars.next();
+                segments.push(std::mem::take(&mut current));
+            }
+            '|' | ';' | '\n' => {
+                segments.push(std::mem::take(&mut current));
+            }
+            _ => current.push(c),
+        }
+    }
+    segments.push(current);
+    segments
+}
+
+fn quote_aware_tokens(segment: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut started = false;
+
+    for c in segment.chars() {
+        if let Some(q) = quote {
+            current.push(c);
+            if c == q {
+                quote = None;
+            }
+            continue;
+        }
+
+        match c {
+            '\'' | '"' => {
+                quote = Some(c);
+                current.push(c);
+                started = true;
+            }
+            c if c.is_whitespace() => {
+                if started {
+                    tokens.push(std::mem::take(&mut current));
+                    started = false;
+                }
+            }
+            _ => {
+                current.push(c);
+                started = true;
+            }
+        }
+    }
+    if started {
+        tokens.push(current);
+    }
+    tokens
+}
+
+// Grammar-free Phase 1 extractor: no alias resolution, no $()/@() recursion,
+// no scriptblock {} descent, no splatting, backtick is treated as a literal char.
+fn extract_commands_powershell(source: &str) -> Vec<(String, String)> {
+    let assignment = Regex::new(r"^\s*\$\w+\s*=\s*").expect("Invalid assignment pattern");
+    let mut commands = Vec::new();
+
+    for segment in split_top_level_segments(source) {
+        let trimmed = segment.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        let trimmed = trimmed
+            .strip_prefix('&')
+            .map(str::trim_start)
+            .unwrap_or(trimmed);
+        let trimmed = assignment.replace(trimmed, "");
+        let trimmed = trimmed.trim();
+
+        let tokens = quote_aware_tokens(trimmed);
+        let Some(first) = tokens.first() else {
+            continue;
+        };
+
+        let unquoted = strip_surrounding_quotes(first);
+        let basename = unquoted.rsplit(['/', '\\']).next().unwrap_or(unquoted);
+        if basename.is_empty() {
+            continue;
+        }
+
+        let args = trimmed[first.len()..].trim().to_string();
+        commands.push((basename.to_string(), args));
+    }
+
+    commands
+}
+
+const POWERSHELL_EXECUTABLES: &[&str] = &["pwsh", "pwsh.exe", "powershell", "powershell.exe"];
+
+fn inner_powershell_script(name: &str, args: &str) -> Option<String> {
+    if !POWERSHELL_EXECUTABLES
+        .iter()
+        .any(|e| e.eq_ignore_ascii_case(name))
+    {
+        return None;
+    }
+
+    let tokens = quote_aware_tokens(args);
+    let idx = tokens
+        .iter()
+        .position(|t| t.eq_ignore_ascii_case("-command") || t.eq_ignore_ascii_case("-c"))?;
+
+    let rest = &tokens[idx + 1..];
+    if rest.is_empty() {
+        return None;
+    }
+
+    let joined = rest.join(" ");
+    Some(strip_surrounding_quotes(&joined).to_string())
+}
+
 fn log_invocation(log_config: &LogConfig, input: &str) {
     let default_path = "~/.local/state/lord-kali/hook.jsonl";
     let path_str = log_config.path.as_deref().unwrap_or(default_path);
@@ -736,11 +960,11 @@ fn print_decision(decision: Decision, reason: &str) {
 mod tests {
     use super::*;
 
-    fn test_bash_config() -> BashConfig {
-        let mut rules: HashMap<String, Vec<BashRule>> = HashMap::new();
+    fn test_bash_config() -> CommandRules {
+        let mut rules: HashMap<String, Vec<CommandRule>> = HashMap::new();
 
         for cmd in ["tail", "grep", "ls", "find", "cat", "head", "wc"] {
-            rules.entry(cmd.to_string()).or_default().push(BashRule {
+            rules.entry(cmd.to_string()).or_default().push(CommandRule {
                 decision: Decision::Allow,
                 args: None,
                 reason: "ok".into(),
@@ -748,31 +972,37 @@ mod tests {
             });
         }
 
-        rules.entry("npm".to_string()).or_default().push(BashRule {
-            decision: Decision::Deny,
-            args: None,
-            reason: "Use pnpm instead of npm.".into(),
-            projects: vec![],
-        });
+        rules
+            .entry("npm".to_string())
+            .or_default()
+            .push(CommandRule {
+                decision: Decision::Deny,
+                args: None,
+                reason: "Use pnpm instead of npm.".into(),
+                projects: vec![],
+            });
 
-        rules.entry("rm".to_string()).or_default().push(BashRule {
-            decision: Decision::Ask,
-            args: None,
-            reason: "rm can be dangerous, please ask.".into(),
-            projects: vec![],
-        });
+        rules
+            .entry("rm".to_string())
+            .or_default()
+            .push(CommandRule {
+                decision: Decision::Ask,
+                args: None,
+                reason: "rm can be dangerous, please ask.".into(),
+                projects: vec![],
+            });
 
         rules
             .entry("rmdir".to_string())
             .or_default()
-            .push(BashRule {
+            .push(CommandRule {
                 decision: Decision::Ask,
                 args: None,
                 reason: "rmdir can be dangerous, please ask.".into(),
                 projects: vec![],
             });
 
-        BashConfig { rules }
+        CommandRules { rules }
     }
 
     fn decision_of(cmd: &str) -> Option<Decision> {
@@ -1076,20 +1306,26 @@ mod tests {
 
     #[test]
     fn deny_with_args_match() {
-        let mut rules: HashMap<String, Vec<BashRule>> = HashMap::new();
-        rules.entry("rm".to_string()).or_default().push(BashRule {
-            decision: Decision::Deny,
-            args: Some(compile_pattern("-rf **")),
-            reason: "No recursive force deletes".into(),
-            projects: vec![],
-        });
-        rules.entry("rm".to_string()).or_default().push(BashRule {
-            decision: Decision::Ask,
-            args: None,
-            reason: "rm can be dangerous".into(),
-            projects: vec![],
-        });
-        let config = BashConfig { rules };
+        let mut rules: HashMap<String, Vec<CommandRule>> = HashMap::new();
+        rules
+            .entry("rm".to_string())
+            .or_default()
+            .push(CommandRule {
+                decision: Decision::Deny,
+                args: Some(compile_pattern("-rf **")),
+                reason: "No recursive force deletes".into(),
+                projects: vec![],
+            });
+        rules
+            .entry("rm".to_string())
+            .or_default()
+            .push(CommandRule {
+                decision: Decision::Ask,
+                args: None,
+                reason: "rm can be dangerous".into(),
+                projects: vec![],
+            });
+        let config = CommandRules { rules };
 
         assert_eq!(
             handle_bash(&config, None, "rm -rf /").map(|(d, _)| d),
@@ -1099,20 +1335,26 @@ mod tests {
 
     #[test]
     fn ask_fallback_when_args_dont_match_deny() {
-        let mut rules: HashMap<String, Vec<BashRule>> = HashMap::new();
-        rules.entry("rm".to_string()).or_default().push(BashRule {
-            decision: Decision::Deny,
-            args: Some(compile_pattern("-rf **")),
-            reason: "No recursive force deletes".into(),
-            projects: vec![],
-        });
-        rules.entry("rm".to_string()).or_default().push(BashRule {
-            decision: Decision::Ask,
-            args: None,
-            reason: "rm can be dangerous".into(),
-            projects: vec![],
-        });
-        let config = BashConfig { rules };
+        let mut rules: HashMap<String, Vec<CommandRule>> = HashMap::new();
+        rules
+            .entry("rm".to_string())
+            .or_default()
+            .push(CommandRule {
+                decision: Decision::Deny,
+                args: Some(compile_pattern("-rf **")),
+                reason: "No recursive force deletes".into(),
+                projects: vec![],
+            });
+        rules
+            .entry("rm".to_string())
+            .or_default()
+            .push(CommandRule {
+                decision: Decision::Ask,
+                args: None,
+                reason: "rm can be dangerous".into(),
+                projects: vec![],
+            });
+        let config = CommandRules { rules };
 
         assert_eq!(
             handle_bash(&config, None, "rm foo.txt").map(|(d, _)| d),
@@ -1122,14 +1364,17 @@ mod tests {
 
     #[test]
     fn allow_with_args_match() {
-        let mut rules: HashMap<String, Vec<BashRule>> = HashMap::new();
-        rules.entry("git".to_string()).or_default().push(BashRule {
-            decision: Decision::Allow,
-            args: Some(compile_pattern("status")),
-            reason: "ok".into(),
-            projects: vec![],
-        });
-        let config = BashConfig { rules };
+        let mut rules: HashMap<String, Vec<CommandRule>> = HashMap::new();
+        rules
+            .entry("git".to_string())
+            .or_default()
+            .push(CommandRule {
+                decision: Decision::Allow,
+                args: Some(compile_pattern("status")),
+                reason: "ok".into(),
+                projects: vec![],
+            });
+        let config = CommandRules { rules };
 
         assert_eq!(
             handle_bash(&config, None, "git status").map(|(d, _)| d),
@@ -1139,28 +1384,34 @@ mod tests {
 
     #[test]
     fn args_no_match_falls_through() {
-        let mut rules: HashMap<String, Vec<BashRule>> = HashMap::new();
-        rules.entry("git".to_string()).or_default().push(BashRule {
-            decision: Decision::Allow,
-            args: Some(compile_pattern("status")),
-            reason: "ok".into(),
-            projects: vec![],
-        });
-        let config = BashConfig { rules };
+        let mut rules: HashMap<String, Vec<CommandRule>> = HashMap::new();
+        rules
+            .entry("git".to_string())
+            .or_default()
+            .push(CommandRule {
+                decision: Decision::Allow,
+                args: Some(compile_pattern("status")),
+                reason: "ok".into(),
+                projects: vec![],
+            });
+        let config = CommandRules { rules };
 
         assert_eq!(handle_bash(&config, None, "git push").map(|(d, _)| d), None);
     }
 
     #[test]
     fn glob_args_pattern() {
-        let mut rules: HashMap<String, Vec<BashRule>> = HashMap::new();
-        rules.entry("git".to_string()).or_default().push(BashRule {
-            decision: Decision::Allow,
-            args: Some(compile_pattern("log *")),
-            reason: "ok".into(),
-            projects: vec![],
-        });
-        let config = BashConfig { rules };
+        let mut rules: HashMap<String, Vec<CommandRule>> = HashMap::new();
+        rules
+            .entry("git".to_string())
+            .or_default()
+            .push(CommandRule {
+                decision: Decision::Allow,
+                args: Some(compile_pattern("log *")),
+                reason: "ok".into(),
+                projects: vec![],
+            });
+        let config = CommandRules { rules };
 
         assert_eq!(
             handle_bash(&config, None, "git log --oneline").map(|(d, _)| d),
@@ -1170,14 +1421,17 @@ mod tests {
 
     #[test]
     fn regex_args_pattern() {
-        let mut rules: HashMap<String, Vec<BashRule>> = HashMap::new();
-        rules.entry("git".to_string()).or_default().push(BashRule {
-            decision: Decision::Allow,
-            args: Some(compile_pattern("/^(status|diff|log)$/")),
-            reason: "ok".into(),
-            projects: vec![],
-        });
-        let config = BashConfig { rules };
+        let mut rules: HashMap<String, Vec<CommandRule>> = HashMap::new();
+        rules
+            .entry("git".to_string())
+            .or_default()
+            .push(CommandRule {
+                decision: Decision::Allow,
+                args: Some(compile_pattern("/^(status|diff|log)$/")),
+                reason: "ok".into(),
+                projects: vec![],
+            });
+        let config = CommandRules { rules };
 
         assert_eq!(
             handle_bash(&config, None, "git diff").map(|(d, _)| d),
@@ -1190,9 +1444,9 @@ mod tests {
 
     #[test]
     fn rules_take_priority_over_allowed_commands() {
-        let raw = RawBashConfig {
+        let raw = RawCommandConfig {
             allowed_commands: vec!["rm".into()],
-            rules: vec![RawBashRule {
+            rules: vec![RawCommandRule {
                 command: "rm".into(),
                 args: None,
                 decision: "ask".into(),
@@ -1200,7 +1454,7 @@ mod tests {
                 projects: vec![],
             }],
         };
-        let config = BashConfig::from_raw(raw, &[]);
+        let config = CommandRules::from_raw(raw, &[]);
 
         assert_eq!(
             handle_bash(&config, None, "rm foo").map(|(d, _)| d),
@@ -1210,9 +1464,9 @@ mod tests {
 
     #[test]
     fn allowed_commands_used_when_no_rule_matches() {
-        let raw = RawBashConfig {
+        let raw = RawCommandConfig {
             allowed_commands: vec!["git".into()],
-            rules: vec![RawBashRule {
+            rules: vec![RawCommandRule {
                 command: "git".into(),
                 args: Some("push *".into()),
                 decision: "deny".into(),
@@ -1220,7 +1474,7 @@ mod tests {
                 projects: vec![],
             }],
         };
-        let config = BashConfig::from_raw(raw, &[]);
+        let config = CommandRules::from_raw(raw, &[]);
 
         assert_eq!(
             handle_bash(&config, None, "git push origin main").map(|(d, _)| d),
@@ -1493,11 +1747,11 @@ mod tests {
 
     #[test]
     fn bash_rule_with_projects_matches_when_cwd_inside() {
-        let mut rules: HashMap<String, Vec<BashRule>> = HashMap::new();
+        let mut rules: HashMap<String, Vec<CommandRule>> = HashMap::new();
         rules
             .entry("cargo".to_string())
             .or_default()
-            .push(BashRule {
+            .push(CommandRule {
                 decision: Decision::Deny,
                 args: Some(compile_pattern("publish{, **}")),
                 reason: "No publishing from this project".into(),
@@ -1506,13 +1760,13 @@ mod tests {
         rules
             .entry("cargo".to_string())
             .or_default()
-            .push(BashRule {
+            .push(CommandRule {
                 decision: Decision::Allow,
                 args: None,
                 reason: "ok".into(),
                 projects: vec![],
             });
-        let config = BashConfig { rules };
+        let config = CommandRules { rules };
 
         assert_eq!(
             handle_bash(&config, Some("/home/user/projects/test"), "cargo publish").map(|(d, _)| d),
@@ -1522,11 +1776,11 @@ mod tests {
 
     #[test]
     fn bash_rule_with_projects_skipped_when_cwd_outside() {
-        let mut rules: HashMap<String, Vec<BashRule>> = HashMap::new();
+        let mut rules: HashMap<String, Vec<CommandRule>> = HashMap::new();
         rules
             .entry("cargo".to_string())
             .or_default()
-            .push(BashRule {
+            .push(CommandRule {
                 decision: Decision::Deny,
                 args: Some(compile_pattern("publish{, **}")),
                 reason: "No publishing from this project".into(),
@@ -1535,13 +1789,13 @@ mod tests {
         rules
             .entry("cargo".to_string())
             .or_default()
-            .push(BashRule {
+            .push(CommandRule {
                 decision: Decision::Allow,
                 args: None,
                 reason: "ok".into(),
                 projects: vec![],
             });
-        let config = BashConfig { rules };
+        let config = CommandRules { rules };
 
         assert_eq!(
             handle_bash(&config, Some("/home/user/projects/other"), "cargo publish")
@@ -1615,15 +1869,16 @@ mod tests {
     #[test]
     fn group_projects_applied_to_rules() {
         let raw = RawConfig {
-            bash: RawBashConfig::default(),
+            bash: RawCommandConfig::default(),
+            powershell: RawCommandConfig::default(),
             web_fetch: RawWebFetchConfig::default(),
             log: None,
             worktree_protection: RawWorktreeProtectionConfig::default(),
             group: vec![RawGroupConfig {
                 projects: vec!["/home/user/projects/test".into()],
-                bash: RawBashConfig {
+                bash: RawCommandConfig {
                     allowed_commands: vec![],
-                    rules: vec![RawBashRule {
+                    rules: vec![RawCommandRule {
                         command: "cargo".into(),
                         args: Some("publish{, **}".into()),
                         decision: "deny".into(),
@@ -1631,6 +1886,7 @@ mod tests {
                         projects: vec![],
                     }],
                 },
+                powershell: RawCommandConfig::default(),
                 web_fetch: RawWebFetchConfig::default(),
             }],
         };
@@ -1659,15 +1915,16 @@ mod tests {
     #[test]
     fn group_projects_union_with_rule_projects() {
         let raw = RawConfig {
-            bash: RawBashConfig::default(),
+            bash: RawCommandConfig::default(),
+            powershell: RawCommandConfig::default(),
             web_fetch: RawWebFetchConfig::default(),
             log: None,
             worktree_protection: RawWorktreeProtectionConfig::default(),
             group: vec![RawGroupConfig {
                 projects: vec!["/home/user/projects/a".into()],
-                bash: RawBashConfig {
+                bash: RawCommandConfig {
                     allowed_commands: vec![],
-                    rules: vec![RawBashRule {
+                    rules: vec![RawCommandRule {
                         command: "cargo".into(),
                         args: Some("publish{, **}".into()),
                         decision: "deny".into(),
@@ -1675,6 +1932,7 @@ mod tests {
                         projects: vec!["/home/user/projects/b".into()],
                     }],
                 },
+                powershell: RawCommandConfig::default(),
                 web_fetch: RawWebFetchConfig::default(),
             }],
         };
@@ -1700,16 +1958,18 @@ mod tests {
     #[test]
     fn group_allowed_commands_get_group_projects() {
         let raw = RawConfig {
-            bash: RawBashConfig::default(),
+            bash: RawCommandConfig::default(),
+            powershell: RawCommandConfig::default(),
             web_fetch: RawWebFetchConfig::default(),
             log: None,
             worktree_protection: RawWorktreeProtectionConfig::default(),
             group: vec![RawGroupConfig {
                 projects: vec!["/home/user/projects/test".into()],
-                bash: RawBashConfig {
+                bash: RawCommandConfig {
                     allowed_commands: vec!["rustup".into()],
                     rules: vec![],
                 },
+                powershell: RawCommandConfig::default(),
                 web_fetch: RawWebFetchConfig::default(),
             }],
         };
@@ -1738,13 +1998,15 @@ mod tests {
     #[test]
     fn group_web_fetch_rules_get_group_projects() {
         let raw = RawConfig {
-            bash: RawBashConfig::default(),
+            bash: RawCommandConfig::default(),
+            powershell: RawCommandConfig::default(),
             web_fetch: RawWebFetchConfig::default(),
             log: None,
             worktree_protection: RawWorktreeProtectionConfig::default(),
             group: vec![RawGroupConfig {
                 projects: vec!["/home/user/projects/test".into()],
-                bash: RawBashConfig::default(),
+                bash: RawCommandConfig::default(),
+                powershell: RawCommandConfig::default(),
                 web_fetch: RawWebFetchConfig {
                     rules: vec![RawWebFetchRule {
                         url: "https://internal.example.com/**".into(),
@@ -1780,9 +2042,9 @@ mod tests {
     #[test]
     fn top_level_rules_before_group_rules() {
         let raw = RawConfig {
-            bash: RawBashConfig {
+            bash: RawCommandConfig {
                 allowed_commands: vec![],
-                rules: vec![RawBashRule {
+                rules: vec![RawCommandRule {
                     command: "cargo".into(),
                     args: Some("publish{, **}".into()),
                     decision: "deny".into(),
@@ -1790,14 +2052,15 @@ mod tests {
                     projects: vec![],
                 }],
             },
+            powershell: RawCommandConfig::default(),
             web_fetch: RawWebFetchConfig::default(),
             log: None,
             worktree_protection: RawWorktreeProtectionConfig::default(),
             group: vec![RawGroupConfig {
                 projects: vec!["/home/user/projects/test".into()],
-                bash: RawBashConfig {
+                bash: RawCommandConfig {
                     allowed_commands: vec![],
-                    rules: vec![RawBashRule {
+                    rules: vec![RawCommandRule {
                         command: "cargo".into(),
                         args: Some("publish{, **}".into()),
                         decision: "allow".into(),
@@ -1805,6 +2068,7 @@ mod tests {
                         projects: vec![],
                     }],
                 },
+                powershell: RawCommandConfig::default(),
                 web_fetch: RawWebFetchConfig::default(),
             }],
         };
@@ -1825,26 +2089,26 @@ mod tests {
 
     #[test]
     fn merge_bash_rules() {
-        let mut rules_a: HashMap<String, Vec<BashRule>> = HashMap::new();
+        let mut rules_a: HashMap<String, Vec<CommandRule>> = HashMap::new();
         rules_a
             .entry("git".to_string())
             .or_default()
-            .push(BashRule {
+            .push(CommandRule {
                 decision: Decision::Allow,
                 args: Some(compile_pattern("status")),
                 reason: "ok".into(),
                 projects: vec![],
             });
         let a = Config {
-            bash: BashConfig { rules: rules_a },
+            bash: CommandRules { rules: rules_a },
             ..Config::default()
         };
 
-        let mut rules_b: HashMap<String, Vec<BashRule>> = HashMap::new();
+        let mut rules_b: HashMap<String, Vec<CommandRule>> = HashMap::new();
         rules_b
             .entry("git".to_string())
             .or_default()
-            .push(BashRule {
+            .push(CommandRule {
                 decision: Decision::Deny,
                 args: Some(compile_pattern("push{, **}")),
                 reason: "no pushing".into(),
@@ -1853,14 +2117,14 @@ mod tests {
         rules_b
             .entry("cargo".to_string())
             .or_default()
-            .push(BashRule {
+            .push(CommandRule {
                 decision: Decision::Allow,
                 args: None,
                 reason: "ok".into(),
                 projects: vec![],
             });
         let b = Config {
-            bash: BashConfig { rules: rules_b },
+            bash: CommandRules { rules: rules_b },
             ..Config::default()
         };
 
@@ -2321,5 +2585,203 @@ enabled = false
         };
         let merged = a.merge(b);
         assert!(!merged.worktree_protection.enabled);
+    }
+
+    // --- extract_commands_powershell ---
+
+    fn ps_command_names(cmd: &str) -> Vec<String> {
+        extract_commands_powershell(cmd)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect()
+    }
+
+    #[test]
+    fn ps_extract_simple() {
+        assert_eq!(
+            extract_commands_powershell("Get-ChildItem"),
+            vec![("Get-ChildItem".into(), "".into())]
+        );
+    }
+
+    #[test]
+    fn ps_extract_pipeline() {
+        assert_eq!(
+            ps_command_names("Get-Process | Stop-Process"),
+            vec!["Get-Process", "Stop-Process"]
+        );
+    }
+
+    #[test]
+    fn ps_extract_semicolon() {
+        assert_eq!(
+            ps_command_names("Get-Foo; Remove-Item x"),
+            vec!["Get-Foo", "Remove-Item"]
+        );
+    }
+
+    #[test]
+    fn ps_extract_and_chain() {
+        assert_eq!(
+            extract_commands_powershell("git status && git push"),
+            vec![
+                ("git".into(), "status".into()),
+                ("git".into(), "push".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn ps_extract_call_operator_quoted_path() {
+        assert_eq!(
+            extract_commands_powershell("& 'C:\\Program Files\\app.exe' --flag"),
+            vec![("app.exe".into(), "--flag".into())]
+        );
+    }
+
+    #[test]
+    fn ps_extract_assignment() {
+        assert_eq!(
+            extract_commands_powershell("$x = Get-Date"),
+            vec![("Get-Date".into(), "".into())]
+        );
+    }
+
+    #[test]
+    fn ps_extract_forward_slash_path() {
+        assert_eq!(
+            extract_commands_powershell("C:/tools/foo.exe bar"),
+            vec![("foo.exe".into(), "bar".into())]
+        );
+    }
+
+    #[test]
+    fn ps_extract_comment() {
+        assert_eq!(extract_commands_powershell("# comment"), vec![]);
+    }
+
+    #[test]
+    fn ps_extract_no_split_inside_quotes() {
+        assert_eq!(
+            ps_command_names("Write-Output 'a | b'"),
+            vec!["Write-Output"]
+        );
+    }
+
+    #[test]
+    fn ps_extract_newline_split() {
+        assert_eq!(
+            ps_command_names("Get-ChildItem\nRemove-Item x"),
+            vec!["Get-ChildItem", "Remove-Item"]
+        );
+    }
+
+    // --- inner_powershell_script ---
+
+    #[test]
+    fn inner_ps_command_with_flags() {
+        assert_eq!(
+            inner_powershell_script("pwsh", "-NoProfile -Command \"Remove-Item x\""),
+            Some("Remove-Item x".into())
+        );
+    }
+
+    #[test]
+    fn inner_ps_short_command_flag() {
+        assert_eq!(
+            inner_powershell_script("powershell", "-c Get-Process"),
+            Some("Get-Process".into())
+        );
+    }
+
+    #[test]
+    fn inner_ps_file_returns_none() {
+        assert_eq!(inner_powershell_script("pwsh", "-File scripts/x.ps1"), None);
+    }
+
+    #[test]
+    fn inner_ps_non_powershell_returns_none() {
+        assert_eq!(inner_powershell_script("npm", "-Command x"), None);
+    }
+
+    #[test]
+    fn inner_ps_encoded_command_returns_none() {
+        assert_eq!(
+            inner_powershell_script("pwsh", "-EncodedCommand UmVtb3ZlLUl0ZW0="),
+            None
+        );
+    }
+
+    // --- handle_powershell ---
+
+    fn test_powershell_config() -> CommandRules {
+        let mut rules: HashMap<String, Vec<CommandRule>> = HashMap::new();
+        rules
+            .entry("Remove-Item".to_string())
+            .or_default()
+            .push(CommandRule {
+                decision: Decision::Deny,
+                args: None,
+                reason: "Remove-Item is dangerous.".into(),
+                projects: vec![],
+            });
+        rules
+            .entry("Get-ChildItem".to_string())
+            .or_default()
+            .push(CommandRule {
+                decision: Decision::Allow,
+                args: None,
+                reason: "ok".into(),
+                projects: vec![],
+            });
+        CommandRules { rules }
+    }
+
+    #[test]
+    fn handle_powershell_deny() {
+        assert_eq!(
+            handle_powershell(&test_powershell_config(), None, "Remove-Item -Recurse x")
+                .map(|(d, _)| d),
+            Some(Decision::Deny)
+        );
+    }
+
+    #[test]
+    fn handle_powershell_allow() {
+        assert_eq!(
+            handle_powershell(&test_powershell_config(), None, "Get-ChildItem").map(|(d, _)| d),
+            Some(Decision::Allow)
+        );
+    }
+
+    #[test]
+    fn handle_powershell_passthrough() {
+        assert_eq!(
+            handle_powershell(&test_powershell_config(), None, "Get-Date").map(|(d, _)| d),
+            None
+        );
+    }
+
+    // --- handle_bash_tool inner PowerShell ---
+
+    #[test]
+    fn bash_tool_inner_powershell_escalates_to_deny() {
+        let bash = CommandRules::default();
+        let powershell = test_powershell_config();
+        assert_eq!(
+            handle_bash_tool(&bash, &powershell, None, "pwsh -Command \"Remove-Item x\"")
+                .map(|(d, _)| d),
+            Some(Decision::Deny)
+        );
+    }
+
+    #[test]
+    fn bash_tool_powershell_file_unaffected_by_ps_rules() {
+        let bash = CommandRules::default();
+        let powershell = test_powershell_config();
+        assert_eq!(
+            handle_bash_tool(&bash, &powershell, None, "pwsh -File x.ps1").map(|(d, _)| d),
+            None
+        );
     }
 }
