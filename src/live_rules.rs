@@ -1,7 +1,7 @@
 // Persists "always" decisions made in the approval TUI to a live ruleset file under
 // ~/.config/lord-kali/ (default 99-live.toml, sorted last so it never shadows explicit
-// user rules). Each entry is an ordinary [[bash/powershell/web-fetch.rules]] table with no
-// args, so it reuses the existing config format and matches the command for any arguments.
+// user rules). Each entry is an ordinary [[bash/powershell/web-fetch.rules]] table, scoped
+// to the node's subcommand via an args pattern (command-wide only when the node had none).
 
 use crate::config::{lord_kali_config_dir, ApprovalConfig};
 use crate::queue::write_atomic;
