@@ -1,6 +1,6 @@
 # lord-kali
 
-A Claude Code [PreToolUse hook](https://docs.anthropic.com/en/docs/claude-code/hooks) that filters Bash and WebFetch tool calls with a more powerful matching system than Claude Code supports natively, and protects worktrees from accidental parent-directory file operations.
+A Claude Code [PreToolUse hook](https://docs.anthropic.com/en/docs/claude-code/hooks) that filters Bash, PowerShell, and WebFetch tool calls with a more powerful matching system than Claude Code supports natively, and protects worktrees from accidental parent-directory file operations. It can also route everything it would otherwise leave to Claude Code's per-terminal prompt into one central [approval TUI](#central-approval-tui) shared across all your Claude instances.
 
 Bash commands are parsed with [tree-sitter-bash](https://github.com/tree-sitter/tree-sitter-bash), correctly handling pipelines, `&&`, `||`, `;` chains, subshells, command substitutions (`$(...)`), and `xargs`-wrapped commands. WebFetch URLs are matched against configurable glob/regex patterns. Worktree protection automatically denies file reads/writes targeting the parent project when Claude is operating inside a `.claude/worktrees/<name>` directory.
 
@@ -246,12 +246,14 @@ Logging is best-effort: if the log file cannot be created or written, the failur
 
 ### Watching live
 
-`lord-kali watch` tails the log and prints a colored line per gate decision, so you can see in real time what is being allowed, denied, asked, or passed through to approval:
+`lord-kali watch --tail` tails the log and prints a colored line per gate decision, so you can see in real time what is being allowed, denied, asked, or passed through to approval:
 
 ```sh
-lord-kali watch                # uses the [log] path, or the default
-lord-kali watch /path/to.jsonl # or an explicit path
+lord-kali watch --tail                # uses the [log] path, or the default
+lord-kali watch --tail /path/to.jsonl # or an explicit path
 ```
+
+(Plain `lord-kali watch` opens the interactive [approval TUI](#central-approval-tui) instead; add `--tail` for the non-interactive view described here.)
 
 Each line is also annotated with the command nodes that matched **no rule**, shown as `(no rule: <cmd>, …)`. These are your gap candidates for the allow/deny lists — the commands lord-kali currently has no opinion on. An `allow` verdict never shows this (every node matched by definition); a `passthrough` shows the unknown node(s), and a chain like `pwd && gh ...` flags only `gh` while the already-allowed `pwd` stays quiet. Running real commands and watching what gets flagged is a quick way to discover what to add to your config.
 
@@ -261,6 +263,49 @@ It also correlates each `pre_tool_use` with its `post_tool_use`:
 - A `passthrough` or `ask` with no execution within 60s prints `no execution — rejected or abandoned?`. This is the one negative signal available: a rejection writes nothing to the log, so its only trace is the *absence* of a matching `post_tool_use`, and that absence is noisy (it also covers abandoned or still-pending calls). Treat it as a weak hint, not a fact. For an `ask`, the line also names the rule node that triggered the prompt (`ask triggered by: <node> — <reason>`).
 
 `allow` calls always run, so their `post_tool_use` is not restated. Color is disabled automatically when stdout is not a terminal or when `NO_COLOR` is set.
+
+## Central approval TUI
+
+By default, an `ask` rule or a pass-through (no rule matched) defers to Claude Code's own permission prompt, which appears in whichever terminal that Claude instance owns. With several Claude instances running, there is no single place to triage approvals.
+
+The **approval TUI** gives you one. When you opt in and run `lord-kali watch`, every `ask`/pass-through call from every Claude instance is routed to that one TUI instead of prompting per-terminal. It is designed for intensive "new territory" sessions — e.g. bringing up a new toolchain — where you want to whitelist a burst of unfamiliar commands quickly while you work.
+
+```toml
+# in any ~/.config/lord-kali/*.toml — opt in (default off)
+[approval]
+enabled = true
+# live_rules = "99-live.toml"            # file the TUI appends allow/deny-always rules to
+# state_dir  = "~/.local/state/lord-kali" # queue + heartbeat live here
+```
+
+```sh
+lord-kali watch   # opens the TUI; keep it running while you work
+```
+
+The TUI has three regions: a scrolling decision **stream** on top, the **approval zone** in the middle, and a help line locked to the bottom row. Each pending call expands to its **actionable command nodes** — the ones that matched no rule or matched an `ask` rule (a chain like `pwd && gh ... | jq ...` lists only `gh` and `jq`). The approval zone is three lanes — **ALLOW · ASK · DENY**; every node starts in ALLOW, and you sort each into a lane before committing:
+
+| key | action |
+| --- | --- |
+| `←` / `→` | step the focused node one lane toward ALLOW / DENY (ASK is the middle) |
+| `space` | cycle the focused node ALLOW → ASK → DENY |
+| `↑` / `↓` | move between nodes |
+| `⇥` (Tab) | switch between pending calls |
+| `a` | **apply-always** — resolve the call by lane and persist a rule for each allowed/denied node |
+| `o` | **apply-once** — same, but for this call only (nothing persisted) |
+| `s` | **skip** — pass the whole call through to Claude Code's prompt, untouched (nothing persisted) |
+| `q` | quit the TUI |
+
+One commit resolves the whole call from the lanes: any node in **DENY** denies the call; a node in **ASK** defers the call to Claude Code's own prompt (a passthrough); only if every node is in **ALLOW** does the call run outright. So you can allow the parts you trust, deny the dangerous ones, and hand the uncertain ones back to the agent — in a single keystroke. `s` is the quick "I'm not deciding this here" for an entire call.
+
+**apply-always** appends an ordinary, **subcommand-scoped** rule to `~/.config/lord-kali/99-live.toml` for each node (sorted last, so it never shadows your explicit rules). The scope is the node's first argument: allowing `git push` writes `command = "git", args = "push{, **}"`, so it does **not** also bless `git commit`. Web-fetch nodes persist the exact URL. Future matching calls then resolve instantly without reaching the queue — the gap closes as you go.
+
+### Graceful degradation
+
+The TUI is strictly opt-in and never a single point of failure:
+
+- With `[approval]` disabled (the default), behavior is exactly as before — this feature is inert.
+- With it enabled but **no TUI running**, the hook detects the stale heartbeat and immediately falls back to today's behavior (existing rules still apply; `ask`/pass-through go to Claude Code's prompt). Closing the TUI mid-session reverts to defaults within a couple of seconds.
+- A blocked call self-times-out below Claude Code's hook timeout and falls back, so a slow or absent operator never stalls an agent.
 
 ## Decision priority
 
