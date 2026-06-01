@@ -237,6 +237,6 @@ headless event-injection test.
 
 - Per-node `args`-specific persistence (vs command-wide `allowed_commands`) — start
   command-wide; revisit if too loose.
-- Multi-select across *different* pending calls (batch approve) — defer.
-- The self-tuning agent noted in memory (`log-watcher-and-tuner`) could later consume
-  the verdict log to suggest rules; out of scope here.
+- Multi-select across *different* pending calls (batch approve) - not necessary
+- The self-tuning agent noted in memory (`log-watcher-and-tuner`) could later consume the verdict log to suggest rules; out of scope here.
+  - the watcher and tuner would slot into this later as possibly some agent driven haiku agent to help drive
