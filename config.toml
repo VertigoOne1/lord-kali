@@ -6,6 +6,14 @@
 enabled = true
 path = "~/.local/state/lord-kali/hook.jsonl"
 
+# Central approval TUI (opt-in; default off). When enabled AND `lord-kali watch`
+# is running, ask/pass-through calls are routed to that TUI instead of Claude
+# Code's own per-terminal prompt. With no TUI running, behavior is unchanged.
+# [approval]
+# enabled = true
+# live_rules = "99-live.toml"            # file the TUI appends allow/deny-always rules to
+# state_dir = "~/.local/state/lord-kali" # queue + heartbeat live here
+
 [bash]
 allowed_commands = [
   "awk", "basename", "cat", "cut", "date", "df", "diff", "dirname",
