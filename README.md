@@ -31,10 +31,23 @@ Then point your Claude Code hook at the binary in `~/.claude/settings.json` or `
           }
         ]
       }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.local/bin/lord-kali"
+          }
+        ]
+      }
     ]
   }
 }
 ```
+
+The `PreToolUse` entry is what does the gating. The `PostToolUse` entry is optional and only used for logging — it lets the log capture what actually ran after a call was allowed or approved (see [Logging](#logging)). Omit it if you only want the gate.
 
 ## Configuration
 
@@ -209,6 +222,45 @@ If any config file (project-local or global) sets `enabled = false`, worktree pr
 
 - **[Glob via glob-match-ultra](https://github.com/insidewhy/glob-match#syntax)** (default): `*` matches within a segment (stops at `/`), `**` matches across `/` boundaries, `?` matches a single character. Also supports `[a-z]` character classes, `{a,b}` brace expansion with empty alternatives (e.g. `{, **}` to match with or without arguments), and `!` negation.
 - **Regex**: wrap the pattern in `//` delimiters, e.g. `/(fmt|build|test)( .*)?/`. `^` and `$` anchors are added automatically - do not include them in the pattern.
+
+## Logging
+
+When `[log]` is enabled, every hook invocation appends one JSON object (one line, JSONL) to the log file. Each record is the raw hook input Claude Code sent, plus lord-kali fields:
+
+- **`ts_ms`**: epoch milliseconds when the record was written
+- **`lk_event`**: `pre_tool_use` for gate invocations, `post_tool_use` for after-execution records
+
+To capture `post_tool_use` records you must also register the binary as a `PostToolUse` hook (see [Install](#install)). PostToolUse fires only after a tool actually ran (auto-allowed or user-approved), so it never gates — it only logs, and the tool's `tool_response` is stripped to keep records compact.
+
+Logging is best-effort: if the log file cannot be created or written, the failure is swallowed so it can never block or alter a gate decision.
+
+### `lk_decision` (pre_tool_use only)
+
+`pre_tool_use` records carry an `lk_decision` object describing how the gate ruled. It is built alongside the decision and never affects it:
+
+- **`final`**: `allow`, `deny`, `ask`, or `passthrough`
+- **`kind`**: `command_chain`, `web_fetch`, `worktree_protection`, or `unknown`
+- **`reason`**: the message shown to Claude (absent when `final` is `passthrough`)
+- **`deciding`**: the node that set the final verdict — the first deny, else the first ask, else the first matched allow — or `null` if nothing matched
+- **`nodes`**: every command (or URL) extracted from the call. Each node records its `shell`, `command`, `args`, resolved `decision`, and whether it `matched` a rule. When a rule matched, the node also carries that rule's `reason`, `rule_kind` (`explicit` or `allowed_commands`), `rule_command`, `rule_args`, and `source_file` so you can trace which rule in which config file made the call.
+
+### Watching live
+
+`lord-kali watch` tails the log and prints a colored line per gate decision, so you can see in real time what is being allowed, denied, asked, or passed through to approval:
+
+```sh
+lord-kali watch                # uses the [log] path, or the default
+lord-kali watch /path/to.jsonl # or an explicit path
+```
+
+Each line is also annotated with the command nodes that matched **no rule**, shown as `(no rule: <cmd>, …)`. These are your gap candidates for the allow/deny lists — the commands lord-kali currently has no opinion on. An `allow` verdict never shows this (every node matched by definition); a `passthrough` shows the unknown node(s), and a chain like `pwd && gh ...` flags only `gh` while the already-allowed `pwd` stays quiet. Running real commands and watching what gets flagged is a quick way to discover what to add to your config.
+
+It also correlates each `pre_tool_use` with its `post_tool_use`:
+
+- A `passthrough` or `ask` that is followed by execution prints `approved & ran` — a high-confidence record that the call *ran*. Note this covers both "you approved it at a prompt" and "Claude Code's own `permissions.allow` rules auto-allowed it"; the log cannot tell the two apart, so a future auto-tuner should cross-reference Claude Code's allow-list before treating one of these as a manual approval worth promoting.
+- A `passthrough` or `ask` with no execution within 60s prints `no execution — rejected or abandoned?`. This is the one negative signal available: a rejection writes nothing to the log, so its only trace is the *absence* of a matching `post_tool_use`, and that absence is noisy (it also covers abandoned or still-pending calls). Treat it as a weak hint, not a fact. For an `ask`, the line also names the rule node that triggered the prompt (`ask triggered by: <node> — <reason>`).
+
+`allow` calls always run, so their `post_tool_use` is not restated. Color is disabled automatically when stdout is not a terminal or when `NO_COLOR` is set.
 
 ## Decision priority
 
