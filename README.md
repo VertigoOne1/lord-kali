@@ -300,6 +300,8 @@ By default, an `ask` rule or a pass-through (no rule matched) defers to Claude C
 
 The **approval TUI** gives you one. When you opt in and run `lord-kali watch`, every `ask`/pass-through call from every Claude instance is routed to that one TUI instead of prompting per-terminal. It is designed for intensive "new territory" sessions — e.g. bringing up a new toolchain — where you want to whitelist a burst of unfamiliar commands quickly while you work.
 
+![lord-kali approval TUI — a blocked command's nodes sorted across the ALLOW, ASK, and DENY lanes](media/lord-kali-tui.png)
+
 ```toml
 # in any ~/.config/lord-kali/*.toml — opt in (default off)
 [approval]
