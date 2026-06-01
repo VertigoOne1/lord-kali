@@ -1,6 +1,6 @@
 # Implementation plan: central TUI approval gate
 
-Status: proposed
+Status: accepted (2026-06-01)
 Branch: `feat/tui-approval-gate` (off `main`)
 
 ## Motivation

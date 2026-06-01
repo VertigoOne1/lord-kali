@@ -16,6 +16,7 @@ pub(crate) struct Config {
     pub(crate) web_fetch: WebFetchConfig,
     pub(crate) log: Option<LogConfig>,
     pub(crate) worktree_protection: WorktreeProtectionConfig,
+    pub(crate) approval: ApprovalConfig,
 }
 
 impl Config {
@@ -31,6 +32,7 @@ impl Config {
             self.log = other.log;
         }
         self.worktree_protection = other.worktree_protection.merge(self.worktree_protection);
+        self.approval = self.approval.merge(other.approval);
         self
     }
 }
@@ -222,6 +224,8 @@ pub(crate) struct RawConfig {
     #[serde(default, rename = "worktree-protection")]
     pub(crate) worktree_protection: RawWorktreeProtectionConfig,
     #[serde(default)]
+    pub(crate) approval: RawApprovalConfig,
+    #[serde(default)]
     pub(crate) group: Vec<RawGroupConfig>,
 }
 
@@ -273,6 +277,11 @@ impl Config {
             log: raw.log,
             worktree_protection: WorktreeProtectionConfig {
                 enabled: raw.worktree_protection.enabled,
+            },
+            approval: ApprovalConfig {
+                enabled: raw.approval.enabled,
+                live_rules: raw.approval.live_rules,
+                state_dir: raw.approval.state_dir,
             },
         }
     }
@@ -355,6 +364,39 @@ impl Default for RawWorktreeProtectionConfig {
     fn default() -> Self {
         Self { enabled: true }
     }
+}
+
+// Opt-in central approval. Disabled by default so installing this version never changes
+// an existing user's gate behavior. When enabled and a live TUI is present, ask/pass-through
+// calls are routed to the TUI queue instead of Claude Code's own prompt.
+#[derive(Default)]
+pub(crate) struct ApprovalConfig {
+    pub(crate) enabled: bool,
+    pub(crate) live_rules: Option<String>,
+    pub(crate) state_dir: Option<String>,
+}
+
+impl ApprovalConfig {
+    // enabling anywhere enables; an explicit file/dir from a later config overrides.
+    fn merge(self, other: Self) -> Self {
+        Self {
+            enabled: self.enabled || other.enabled,
+            live_rules: other.live_rules.or(self.live_rules),
+            state_dir: other.state_dir.or(self.state_dir),
+        }
+    }
+
+    pub(crate) fn live_rules_file(&self) -> &str {
+        self.live_rules.as_deref().unwrap_or("99-live.toml")
+    }
+}
+
+#[derive(Default, Deserialize)]
+pub(crate) struct RawApprovalConfig {
+    #[serde(default)]
+    pub(crate) enabled: bool,
+    pub(crate) live_rules: Option<String>,
+    pub(crate) state_dir: Option<String>,
 }
 
 pub(crate) fn expand_tilde(path: &str) -> PathBuf {
@@ -547,6 +589,7 @@ mod tests {
             web_fetch: RawWebFetchConfig::default(),
             log: None,
             worktree_protection: RawWorktreeProtectionConfig::default(),
+            approval: RawApprovalConfig::default(),
             group: vec![RawGroupConfig {
                 projects: vec!["/home/user/projects/test".into()],
                 bash: RawCommandConfig {
@@ -593,6 +636,7 @@ mod tests {
             web_fetch: RawWebFetchConfig::default(),
             log: None,
             worktree_protection: RawWorktreeProtectionConfig::default(),
+            approval: RawApprovalConfig::default(),
             group: vec![RawGroupConfig {
                 projects: vec!["/home/user/projects/a".into()],
                 bash: RawCommandConfig {
@@ -636,6 +680,7 @@ mod tests {
             web_fetch: RawWebFetchConfig::default(),
             log: None,
             worktree_protection: RawWorktreeProtectionConfig::default(),
+            approval: RawApprovalConfig::default(),
             group: vec![RawGroupConfig {
                 projects: vec!["/home/user/projects/test".into()],
                 bash: RawCommandConfig {
@@ -676,6 +721,7 @@ mod tests {
             web_fetch: RawWebFetchConfig::default(),
             log: None,
             worktree_protection: RawWorktreeProtectionConfig::default(),
+            approval: RawApprovalConfig::default(),
             group: vec![RawGroupConfig {
                 projects: vec!["/home/user/projects/test".into()],
                 bash: RawCommandConfig::default(),
@@ -729,6 +775,7 @@ mod tests {
             web_fetch: RawWebFetchConfig::default(),
             log: None,
             worktree_protection: RawWorktreeProtectionConfig::default(),
+            approval: RawApprovalConfig::default(),
             group: vec![RawGroupConfig {
                 projects: vec!["/home/user/projects/test".into()],
                 bash: RawCommandConfig {

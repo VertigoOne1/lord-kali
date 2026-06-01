@@ -77,6 +77,32 @@ pub(crate) struct InvocationTrace {
     pub(crate) nodes: Vec<NodeTrace>,
 }
 
+impl NodeTrace {
+    // A node the operator must rule on: it matched no rule (passthrough) or matched an
+    // ask rule. Deny/allow nodes are already resolved and never reach the queue.
+    fn is_actionable(&self) -> bool {
+        matches!(self.matched, None | Some((Decision::Ask, _, _)))
+    }
+}
+
+impl InvocationTrace {
+    pub(crate) fn actionable_nodes(&self) -> Vec<crate::queue::QueueNode> {
+        self.nodes
+            .iter()
+            .filter(|n| n.is_actionable())
+            .map(|n| crate::queue::QueueNode {
+                shell: n.shell.to_string(),
+                command: n.command.clone(),
+                args: n.args.clone(),
+                decision: match &n.matched {
+                    Some((Decision::Ask, _, _)) => "ask".to_string(),
+                    _ => "passthrough".to_string(),
+                },
+            })
+            .collect()
+    }
+}
+
 // Purpose: compute the gate decision and a parallel per-node trace for one tool call.
 // Requires: config loaded; hook_input parsed.
 // Guarantees: returned final_decision is byte-identical to the legacy handlers; nodes
