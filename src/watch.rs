@@ -302,7 +302,7 @@ mod tui {
     use crate::queue::{
         self, write_atomic, write_heartbeat_in, Action, QueueRequest, Verdict, VerdictNode,
     };
-    use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+    use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
     use ratatui::layout::{Constraint, Layout, Rect};
     use ratatui::style::{Color, Modifier, Style};
     use ratatui::text::{Line, Span};
@@ -414,6 +414,9 @@ mod tui {
         pending: Vec<Pending>,
         focus: usize,
         should_quit: bool,
+        // Armed by a first Ctrl-C; a second one quits (consistent with Claude Code). Any
+        // other key disarms it.
+        ctrl_c_armed: bool,
     }
 
     impl App {
@@ -423,6 +426,7 @@ mod tui {
                 pending: Vec::new(),
                 focus: 0,
                 should_quit: false,
+                ctrl_c_armed: false,
             }
         }
 
@@ -614,6 +618,15 @@ mod tui {
                     if k.kind != KeyEventKind::Press {
                         continue;
                     }
+                    // Ctrl-C-C quits (consistent with Claude Code); first arms, second fires.
+                    if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
+                        if app.ctrl_c_armed {
+                            return Ok(());
+                        }
+                        app.ctrl_c_armed = true;
+                        continue;
+                    }
+                    app.ctrl_c_armed = false;
                     if let Some((verdict, live)) = apply_key(app, map_key(k.code)) {
                         let vpath = qdir.join(format!("{}.verdict.json", verdict.id));
                         if let Ok(j) = serde_json::to_string(&verdict) {
@@ -793,6 +806,16 @@ mod tui {
     }
 
     fn render_help(f: &mut Frame, area: Rect, app: &App) {
+        if app.ctrl_c_armed {
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "press Ctrl-C again to quit",
+                    Style::new().fg(Color::Yellow),
+                ))),
+                area,
+            );
+            return;
+        }
         let text = if app.pending.is_empty() {
             "q quit · waiting for approvals…"
         } else {
