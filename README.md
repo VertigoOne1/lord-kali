@@ -282,20 +282,21 @@ enabled = true
 lord-kali watch   # opens the TUI; keep it running while you work
 ```
 
-The TUI has two panes: a scrolling decision **stream** on top, and a **pending-approval** pane below. Each pending call expands to its **actionable command nodes** — the ones that matched no rule or matched an `ask` rule (a chain like `pwd && gh ... | jq ...` lists only `gh` and `jq`). You rule on them as a checklist:
+The TUI has three regions: a scrolling decision **stream** on top, the **approval zone** in the middle, and a help line locked to the bottom row. Each pending call expands to its **actionable command nodes** — the ones that matched no rule or matched an `ask` rule (a chain like `pwd && gh ... | jq ...` lists only `gh` and `jq`). The approval zone is two columns, **ALLOW** (left) and **DENY** (right); every node starts in ALLOW, and you sort them before committing:
 
 | key | action |
 | --- | --- |
-| `space` | toggle the selected node (all selected by default) |
-| `↑`/`↓` | move between nodes; `←`/`→` switch between pending calls |
-| `a` | **allow-always** selected — and append a rule to the live ruleset |
-| `o` | **allow-once** selected — this call only, nothing persisted |
-| `d` / `x` | **deny-always** / **deny-once** selected |
+| `space` | flip the focused node between the ALLOW and DENY columns |
+| `←` / `→` | send the focused node to ALLOW / DENY directly |
+| `↑` / `↓` | move between nodes |
+| `⇥` (Tab) | switch between pending calls |
+| `a` | **apply-always** — allow the ALLOW column, deny the DENY column, and persist a rule for each |
+| `o` | **apply-once** — same, but for this call only (nothing persisted) |
 | `q` | quit the TUI |
 
-The whole call is then resolved from the per-node choices: any denied node denies the call; if every node is allowed it runs; if you leave any node unselected, the call drops back to Claude Code's own terminal prompt — so you can whitelist the parts you trust and approve the rest specifically.
+One commit resolves the whole call from the columns: if any node is in DENY the call is denied; otherwise it runs. So you can allow the parts you trust and deny the rest in a single keystroke. (To instead defer a call to Claude Code's own terminal prompt, just leave it — an untouched call times out and falls through.)
 
-**allow-always**/**deny-always** append an ordinary rule to `~/.config/lord-kali/99-live.toml` (sorted last, so it never shadows your explicit rules). Future matching calls then resolve instantly without reaching the queue — the gap closes as you go.
+**apply-always** appends an ordinary, **subcommand-scoped** rule to `~/.config/lord-kali/99-live.toml` for each node (sorted last, so it never shadows your explicit rules). The scope is the node's first argument: allowing `git push` writes `command = "git", args = "push{, **}"`, so it does **not** also bless `git commit`. Web-fetch nodes persist the exact URL. Future matching calls then resolve instantly without reaching the queue — the gap closes as you go.
 
 ### Graceful degradation
 

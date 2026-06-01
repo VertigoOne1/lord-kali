@@ -317,54 +317,73 @@ mod tui {
     // A request from a crashed hook (no self-cleanup) is swept after this age.
     const REQ_MAX_AGE_MS: u64 = 120_000;
 
+    // Which column a node sits in. Every node is in exactly one; a commit resolves the
+    // whole call at once (allow the left column, deny the right). Default is Allow.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Side {
+        Allow,
+        Deny,
+    }
+
+    impl Side {
+        fn flip(self) -> Side {
+            match self {
+                Side::Allow => Side::Deny,
+                Side::Deny => Side::Allow,
+            }
+        }
+    }
+
     struct Pending {
         request: QueueRequest,
-        selected: Vec<bool>,
+        sides: Vec<Side>,
         cursor: usize,
     }
 
     impl Pending {
         fn new(request: QueueRequest) -> Self {
-            let selected = vec![true; request.nodes.len()];
+            let sides = vec![Side::Allow; request.nodes.len()];
             Pending {
                 request,
-                selected,
+                sides,
                 cursor: 0,
             }
         }
     }
 
+    // A commit applies its mode (once = this call only; always = also persist a rule) to
+    // every node, using each node's column for the allow/deny direction.
     #[derive(Clone, Copy)]
-    enum Commit {
-        AllowOnce,
-        AllowAlways,
-        DenyOnce,
-        DenyAlways,
+    enum CommitMode {
+        Once,
+        Always,
     }
 
     enum Key {
         Quit,
-        Toggle,
+        Flip,
+        SetAllow,
+        SetDeny,
         Up,
         Down,
-        Prev,
-        Next,
-        Commit(Commit),
+        PrevReq,
+        NextReq,
+        Commit(CommitMode),
         Ignore,
     }
 
     fn map_key(code: KeyCode) -> Key {
         match code {
             KeyCode::Char('q') | KeyCode::Esc => Key::Quit,
-            KeyCode::Char(' ') => Key::Toggle,
+            KeyCode::Char(' ') => Key::Flip,
+            KeyCode::Left | KeyCode::Char('h') => Key::SetAllow,
+            KeyCode::Right | KeyCode::Char('l') => Key::SetDeny,
             KeyCode::Up | KeyCode::Char('k') => Key::Up,
             KeyCode::Down | KeyCode::Char('j') => Key::Down,
-            KeyCode::Left => Key::Prev,
-            KeyCode::Right => Key::Next,
-            KeyCode::Char('a') => Key::Commit(Commit::AllowAlways),
-            KeyCode::Char('o') => Key::Commit(Commit::AllowOnce),
-            KeyCode::Char('d') => Key::Commit(Commit::DenyAlways),
-            KeyCode::Char('x') => Key::Commit(Commit::DenyOnce),
+            KeyCode::Tab => Key::NextReq,
+            KeyCode::BackTab => Key::PrevReq,
+            KeyCode::Char('a') => Key::Commit(CommitMode::Always),
+            KeyCode::Char('o') => Key::Commit(CommitMode::Once),
             _ => Key::Ignore,
         }
     }
@@ -403,24 +422,21 @@ mod tui {
         Some(format!("{first}{{, **}}"))
     }
 
-    // Selected nodes take the chosen action; unselected nodes are left as passthrough so
-    // the hook combine defers them to Claude Code. Only *_always actions persist a rule,
-    // scoped to the node's subcommand (web-fetch persists the exact URL).
-    fn build_verdict(p: &Pending, kind: Commit) -> (Verdict, Vec<LiveRule>) {
+    // Each node resolves by its column: Allow -> allow, Deny -> deny; the mode picks
+    // once vs always. *_always actions also persist a subcommand-scoped rule (web-fetch
+    // persists the exact URL). Every node is decided, so the call never defers here.
+    fn build_verdict(p: &Pending, mode: CommitMode) -> (Verdict, Vec<LiveRule>) {
         let mut nodes = Vec::new();
         let mut live = Vec::new();
         for (i, node) in p.request.nodes.iter().enumerate() {
-            let action = if p.selected[i] {
-                match kind {
-                    Commit::AllowOnce => Action::AllowOnce,
-                    Commit::AllowAlways => Action::AllowAlways,
-                    Commit::DenyOnce => Action::DenyOnce,
-                    Commit::DenyAlways => Action::DenyAlways,
-                }
-            } else {
-                Action::Passthrough
+            let allow = p.sides[i] == Side::Allow;
+            let action = match (allow, mode) {
+                (true, CommitMode::Once) => Action::AllowOnce,
+                (true, CommitMode::Always) => Action::AllowAlways,
+                (false, CommitMode::Once) => Action::DenyOnce,
+                (false, CommitMode::Always) => Action::DenyAlways,
             };
-            if matches!(action, Action::AllowAlways | Action::DenyAlways) {
+            if matches!(mode, CommitMode::Always) {
                 let args = if node.shell == "web-fetch" {
                     None
                 } else {
@@ -430,7 +446,7 @@ mod tui {
                     shell: node.shell.clone(),
                     target: node.command.clone(),
                     args,
-                    allow: matches!(action, Action::AllowAlways),
+                    allow,
                 });
             }
             nodes.push(VerdictNode {
@@ -446,6 +462,14 @@ mod tui {
             },
             live,
         )
+    }
+
+    fn set_side(app: &mut App, side: Side) {
+        if let Some(p) = app.focused_mut() {
+            if let Some(s) = p.sides.get_mut(p.cursor) {
+                *s = side;
+            }
+        }
     }
 
     fn apply_key(app: &mut App, key: Key) -> Option<(Verdict, Vec<LiveRule>)> {
@@ -468,25 +492,33 @@ mod tui {
                 }
                 None
             }
-            Key::Toggle => {
+            Key::Flip => {
                 if let Some(p) = app.focused_mut() {
-                    if let Some(s) = p.selected.get_mut(p.cursor) {
-                        *s = !*s;
+                    if let Some(s) = p.sides.get_mut(p.cursor) {
+                        *s = s.flip();
                     }
                 }
                 None
             }
-            Key::Prev => {
+            Key::SetAllow => {
+                set_side(app, Side::Allow);
+                None
+            }
+            Key::SetDeny => {
+                set_side(app, Side::Deny);
+                None
+            }
+            Key::PrevReq => {
                 app.focus = app.focus.saturating_sub(1);
                 None
             }
-            Key::Next => {
+            Key::NextReq => {
                 if app.focus + 1 < app.pending.len() {
                     app.focus += 1;
                 }
                 None
             }
-            Key::Commit(kind) => app.focused().map(|p| build_verdict(p, kind)),
+            Key::Commit(mode) => app.focused().map(|p| build_verdict(p, mode)),
             Key::Ignore => None,
         }
     }
@@ -589,16 +621,16 @@ mod tui {
         }
         found.sort_by_key(|r| r.ts_ms);
 
-        let mut prev: HashMap<String, (Vec<bool>, usize)> = HashMap::new();
+        let mut prev: HashMap<String, (Vec<Side>, usize)> = HashMap::new();
         for p in app.pending.drain(..) {
-            prev.insert(p.request.id.clone(), (p.selected, p.cursor));
+            prev.insert(p.request.id.clone(), (p.sides, p.cursor));
         }
         app.pending = found
             .into_iter()
             .map(|req| match prev.remove(&req.id) {
-                Some((sel, cur)) if sel.len() == req.nodes.len() => Pending {
+                Some((sides, cur)) if sides.len() == req.nodes.len() => Pending {
                     cursor: cur.min(req.nodes.len().saturating_sub(1)),
-                    selected: sel,
+                    sides,
                     request: req,
                 },
                 _ => Pending::new(req),
@@ -609,11 +641,20 @@ mod tui {
         }
     }
 
+    // Three stacked regions: the stream on top, the approval zone (>= half the screen
+    // while there is work), and a help line locked to its own row at the very bottom so a
+    // long node list can never push it off-screen.
     fn ui(f: &mut Frame, app: &App) {
-        let [top, bottom] =
-            Layout::vertical([Constraint::Min(3), Constraint::Length(14)]).areas(f.area());
+        let body = if app.pending.is_empty() {
+            Constraint::Length(3)
+        } else {
+            Constraint::Percentage(55)
+        };
+        let [top, mid, help] =
+            Layout::vertical([Constraint::Min(3), body, Constraint::Length(1)]).areas(f.area());
         render_stream(f, top, app);
-        render_pending(f, bottom, app);
+        render_body(f, mid, app);
+        render_help(f, help, app);
     }
 
     fn render_stream(f: &mut Frame, area: Rect, app: &App) {
@@ -626,53 +667,102 @@ mod tui {
         f.render_widget(para, area);
     }
 
-    fn render_pending(f: &mut Frame, area: Rect, app: &App) {
-        let block = Block::bordered().title(format!("pending approvals ({})", app.pending.len()));
+    fn render_body(f: &mut Frame, area: Rect, app: &App) {
         let Some(p) = app.focused() else {
             let para = Paragraph::new(
-                "No pending approvals. The TUI is live; ask/pass-through calls will appear here.\n\nq quit",
+                "No pending approvals. ask/pass-through calls appear here while this TUI runs.",
             )
-            .block(block);
+            .block(Block::bordered().title("pending approvals (0)"));
             f.render_widget(para, area);
             return;
         };
 
-        let mut lines: Vec<Line> = Vec::new();
-        lines.push(Line::from(vec![
+        let [header, cols] =
+            Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).areas(area);
+
+        let mut head = vec![Line::from(vec![
             Span::styled(
                 format!("{}: ", p.request.tool),
-                Style::new().fg(Color::Cyan),
+                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             ),
             Span::raw(p.request.target.clone()),
-        ]));
-        if let Some(cwd) = &p.request.cwd {
-            lines.push(Line::from(Span::styled(
-                format!("  cwd {cwd}"),
+            Span::styled(
+                format!("   [call {}/{}]", app.focus + 1, app.pending.len()),
                 Style::new().fg(Color::DarkGray),
-            )));
-        }
-        lines.push(Line::raw(""));
+            ),
+        ])];
+        head.push(Line::from(Span::styled(
+            p.request
+                .cwd
+                .as_deref()
+                .map(|c| format!("cwd {c}"))
+                .unwrap_or_default(),
+            Style::new().fg(Color::DarkGray),
+        )));
+        f.render_widget(Paragraph::new(head), header);
+
+        let [left, right] =
+            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .areas(cols);
+        let mut allow_lines: Vec<Line> = Vec::new();
+        let mut deny_lines: Vec<Line> = Vec::new();
         for (i, node) in p.request.nodes.iter().enumerate() {
-            let mark = if p.selected[i] { "[x]" } else { "[ ]" };
-            let text = format!("{mark} {} {}  ({})", node.command, node.args, node.decision);
-            let mut style = Style::new();
+            let base = match p.sides[i] {
+                Side::Allow => Color::Green,
+                Side::Deny => Color::Red,
+            };
+            let mut style = Style::new().fg(base);
             if i == p.cursor {
                 style = style.add_modifier(Modifier::REVERSED);
             }
-            if !p.selected[i] {
-                style = style.fg(Color::DarkGray);
+            let line = Line::from(Span::styled(
+                format!("{} {}", node.command, node.args),
+                style,
+            ));
+            match p.sides[i] {
+                Side::Allow => allow_lines.push(line),
+                Side::Deny => deny_lines.push(line),
             }
-            lines.push(Line::from(Span::styled(text, style)));
         }
-        lines.push(Line::raw(""));
-        lines.push(Line::from(Span::styled(
-            "space toggle · ↑↓ node · ←→ request · a allow-always · o allow-once · d deny-always · x deny-once · q quit",
-            Style::new().fg(Color::DarkGray),
-        )));
         f.render_widget(
-            Paragraph::new(lines)
-                .block(block)
+            Paragraph::new(allow_lines)
+                .block(
+                    Block::bordered()
+                        .title(format!(
+                            "ALLOW ({})",
+                            p.sides.iter().filter(|s| **s == Side::Allow).count()
+                        ))
+                        .border_style(Style::new().fg(Color::Green)),
+                )
                 .wrap(Wrap { trim: false }),
+            left,
+        );
+        f.render_widget(
+            Paragraph::new(deny_lines)
+                .block(
+                    Block::bordered()
+                        .title(format!(
+                            "DENY ({})",
+                            p.sides.iter().filter(|s| **s == Side::Deny).count()
+                        ))
+                        .border_style(Style::new().fg(Color::Red)),
+                )
+                .wrap(Wrap { trim: false }),
+            right,
+        );
+    }
+
+    fn render_help(f: &mut Frame, area: Rect, app: &App) {
+        let text = if app.pending.is_empty() {
+            "q quit · waiting for approvals…"
+        } else {
+            "space flip · ← allow  → deny · ↑↓ node · ⇥ next call · a apply-always · o apply-once · q quit"
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                text,
+                Style::new().fg(Color::DarkGray),
+            ))),
             area,
         );
     }
@@ -744,32 +834,37 @@ mod tui {
             }
         }
 
+        // Flip node 0 (gh) to the deny column, leave node 1 (jq) in allow, commit-always:
+        // the call denies, and both columns persist subcommand-scoped rules.
         #[test]
-        fn deselect_then_allow_always_maps_per_node() {
+        fn mixed_columns_commit_always_resolves_both() {
             let mut app = App::new();
             app.pending.push(Pending::new(req()));
-            // cursor starts at node 0 (gh); toggle it off, move to node 1 (jq), allow-always.
-            assert!(apply_key(&mut app, Key::Toggle).is_none());
-            assert!(apply_key(&mut app, Key::Down).is_none());
+            assert!(apply_key(&mut app, Key::SetDeny).is_none()); // cursor at gh -> deny
             let (verdict, live) =
-                apply_key(&mut app, Key::Commit(Commit::AllowAlways)).expect("commit");
-            assert_eq!(verdict.nodes[0].action, Action::Passthrough);
+                apply_key(&mut app, Key::Commit(CommitMode::Always)).expect("commit");
+            assert_eq!(verdict.nodes[0].action, Action::DenyAlways);
             assert_eq!(verdict.nodes[1].action, Action::AllowAlways);
-            assert_eq!(live.len(), 1);
-            assert_eq!(live[0].target, "jq");
-            // persisted rule is subcommand-scoped to the node's args, not command-wide.
-            assert_eq!(live[0].args, scope_args("."));
-            assert!(live[0].allow);
-            // a node left as passthrough means the whole call defers to the terminal.
-            assert_eq!(combine_verdict(&verdict.nodes), None);
+            // any deny makes the whole call deny
+            assert_eq!(
+                combine_verdict(&verdict.nodes).map(|(d, _)| d),
+                Some(Decision::Deny)
+            );
+            // both sides persist, subcommand-scoped
+            assert_eq!(live.len(), 2);
+            let gh = live.iter().find(|r| r.target == "gh").unwrap();
+            assert!(!gh.allow);
+            assert_eq!(gh.args, scope_args("pr list"));
+            let jq = live.iter().find(|r| r.target == "jq").unwrap();
+            assert!(jq.allow);
         }
 
         #[test]
-        fn all_selected_allow_once_allows_call_without_persisting() {
+        fn all_allow_once_allows_call_without_persisting() {
             let mut app = App::new();
             app.pending.push(Pending::new(req()));
             let (verdict, live) =
-                apply_key(&mut app, Key::Commit(Commit::AllowOnce)).expect("commit");
+                apply_key(&mut app, Key::Commit(CommitMode::Once)).expect("commit");
             assert!(live.is_empty());
             assert_eq!(
                 combine_verdict(&verdict.nodes).map(|(d, _)| d),
@@ -778,14 +873,13 @@ mod tui {
         }
 
         #[test]
-        fn deny_once_selected_denies_call() {
+        fn flip_is_reversible() {
             let mut app = App::new();
             app.pending.push(Pending::new(req()));
-            let (verdict, _) = apply_key(&mut app, Key::Commit(Commit::DenyOnce)).expect("commit");
-            assert_eq!(
-                combine_verdict(&verdict.nodes).map(|(d, _)| d),
-                Some(Decision::Deny)
-            );
+            apply_key(&mut app, Key::Flip); // gh -> deny
+            apply_key(&mut app, Key::Flip); // gh -> allow again
+            let (verdict, _) = apply_key(&mut app, Key::Commit(CommitMode::Once)).expect("commit");
+            assert_eq!(verdict.nodes[0].action, Action::AllowOnce);
         }
 
         #[test]
@@ -794,9 +888,13 @@ mod tui {
             use ratatui::Terminal;
             let mut app = App::new();
             app.pending.push(Pending::new(req()));
+            apply_key(&mut app, Key::SetDeny);
             app.stream.push(Line::raw("ALLOW  Bash: ls"));
-            let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
             terminal.draw(|f| ui(f, &app)).unwrap();
+            // also exercise the idle (no-pending) layout
+            let idle = App::new();
+            terminal.draw(|f| ui(f, &idle)).unwrap();
         }
     }
 }
