@@ -395,8 +395,17 @@ mod tui {
         }
     }
 
+    // Scope a persisted rule to the node's subcommand: the first argument token plus any
+    // trailing args (e.g. "push" -> "push{, **}"). None when the node had no args, which
+    // persists command-wide. This is why allowing `git push` does not bless `git commit`.
+    fn scope_args(args: &str) -> Option<String> {
+        let first = args.split_whitespace().next()?;
+        Some(format!("{first}{{, **}}"))
+    }
+
     // Selected nodes take the chosen action; unselected nodes are left as passthrough so
-    // the hook combine defers them to Claude Code. Only *_always actions persist a rule.
+    // the hook combine defers them to Claude Code. Only *_always actions persist a rule,
+    // scoped to the node's subcommand (web-fetch persists the exact URL).
     fn build_verdict(p: &Pending, kind: Commit) -> (Verdict, Vec<LiveRule>) {
         let mut nodes = Vec::new();
         let mut live = Vec::new();
@@ -411,18 +420,18 @@ mod tui {
             } else {
                 Action::Passthrough
             };
-            match action {
-                Action::AllowAlways => live.push(LiveRule {
+            if matches!(action, Action::AllowAlways | Action::DenyAlways) {
+                let args = if node.shell == "web-fetch" {
+                    None
+                } else {
+                    scope_args(&node.args)
+                };
+                live.push(LiveRule {
                     shell: node.shell.clone(),
                     target: node.command.clone(),
-                    allow: true,
-                }),
-                Action::DenyAlways => live.push(LiveRule {
-                    shell: node.shell.clone(),
-                    target: node.command.clone(),
-                    allow: false,
-                }),
-                _ => {}
+                    args,
+                    allow: matches!(action, Action::AllowAlways),
+                });
             }
             nodes.push(VerdictNode {
                 command: node.command.clone(),
@@ -748,6 +757,8 @@ mod tui {
             assert_eq!(verdict.nodes[1].action, Action::AllowAlways);
             assert_eq!(live.len(), 1);
             assert_eq!(live[0].target, "jq");
+            // persisted rule is subcommand-scoped to the node's args, not command-wide.
+            assert_eq!(live[0].args, scope_args("."));
             assert!(live[0].allow);
             // a node left as passthrough means the whole call defers to the terminal.
             assert_eq!(combine_verdict(&verdict.nodes), None);

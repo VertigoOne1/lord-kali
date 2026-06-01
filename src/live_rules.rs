@@ -12,6 +12,9 @@ pub(crate) struct LiveRule {
     pub(crate) shell: String,
     // command basename for bash/powershell, or the full URL for web-fetch.
     pub(crate) target: String,
+    // optional args pattern, scoping the rule to a subcommand (e.g. "push{, **}").
+    // None means command-wide (any args) — used when the node had no arguments.
+    pub(crate) args: Option<String>,
     pub(crate) allow: bool,
 }
 
@@ -27,26 +30,42 @@ fn render_rule(r: &LiveRule) -> String {
         "powershell" => ("powershell.rules", "command"),
         _ => ("bash.rules", "command"),
     };
-    format!(
-        "\n[[{table}]]\n{key} = {value}\ndecision = \"{decision}\"\nreason = \"approval-tui\"\n"
-    )
+    let mut block = format!("\n[[{table}]]\n{key} = {value}\n");
+    if let Some(args) = &r.args {
+        let av = toml::Value::String(args.clone()).to_string();
+        block.push_str(&format!("args = {av}\n"));
+    }
+    block.push_str(&format!(
+        "decision = \"{decision}\"\nreason = \"approval-tui\"\n"
+    ));
+    block
 }
 
 // Append entries to the live file (read-modify-write atomically). Existing rules are
-// preserved; we never rewrite or dedup, keeping the writer trivial and the file an
-// append-only audit of what was whitelisted.
+// preserved; an entry whose exact block is already present is skipped, so re-approving
+// the same node never piles up duplicates.
 pub(crate) fn append_rules(path: &Path, rules: &[LiveRule]) -> std::io::Result<()> {
     if rules.is_empty() {
         return Ok(());
     }
     let mut content = std::fs::read_to_string(path).unwrap_or_default();
-    if !content.is_empty() && !content.ends_with('\n') {
-        content.push('\n');
-    }
+    let mut changed = false;
     for r in rules {
-        content.push_str(&render_rule(r));
+        let block = render_rule(r);
+        if content.contains(block.trim_start()) {
+            continue;
+        }
+        if !content.is_empty() && !content.ends_with('\n') {
+            content.push('\n');
+        }
+        content.push_str(&block);
+        changed = true;
     }
-    write_atomic(path, &content)
+    if changed {
+        write_atomic(path, &content)
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -61,26 +80,20 @@ mod tests {
         Config::from(raw)
     }
 
+    fn bash(target: &str, args: Option<&str>, allow: bool) -> LiveRule {
+        LiveRule {
+            shell: "bash".into(),
+            target: target.into(),
+            args: args.map(String::from),
+            allow,
+        }
+    }
+
     #[test]
-    fn allow_and_deny_round_trip_through_loader() {
+    fn command_wide_allow_and_deny_round_trip() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("99-live.toml");
-        append_rules(
-            &path,
-            &[
-                LiveRule {
-                    shell: "bash".into(),
-                    target: "gh".into(),
-                    allow: true,
-                },
-                LiveRule {
-                    shell: "bash".into(),
-                    target: "curl".into(),
-                    allow: false,
-                },
-            ],
-        )
-        .unwrap();
+        append_rules(&path, &[bash("gh", None, true), bash("curl", None, false)]).unwrap();
 
         let config = load(&path);
         assert_eq!(
@@ -93,28 +106,32 @@ mod tests {
         );
     }
 
+    // Subcommand-scoped persistence: allowing `git push` must NOT bless other git verbs.
+    #[test]
+    fn subcommand_scoped_rule_only_matches_that_subcommand() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("99-live.toml");
+        append_rules(&path, &[bash("git", Some("push{, **}"), true)]).unwrap();
+
+        let config = load(&path);
+        assert_eq!(
+            handle_bash(&config.bash, None, "git push origin main").map(|(d, _)| d),
+            Some(Decision::Allow)
+        );
+        assert_eq!(
+            handle_bash(&config.bash, None, "git push").map(|(d, _)| d),
+            Some(Decision::Allow)
+        );
+        // a different subcommand is untouched by the push rule
+        assert_eq!(handle_bash(&config.bash, None, "git commit -m x"), None);
+    }
+
     #[test]
     fn appends_preserve_prior_rules() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("99-live.toml");
-        append_rules(
-            &path,
-            &[LiveRule {
-                shell: "bash".into(),
-                target: "gh".into(),
-                allow: true,
-            }],
-        )
-        .unwrap();
-        append_rules(
-            &path,
-            &[LiveRule {
-                shell: "bash".into(),
-                target: "jq".into(),
-                allow: true,
-            }],
-        )
-        .unwrap();
+        append_rules(&path, &[bash("gh", None, true)]).unwrap();
+        append_rules(&path, &[bash("jq", None, true)]).unwrap();
 
         let config = load(&path);
         assert_eq!(
@@ -128,6 +145,19 @@ mod tests {
     }
 
     #[test]
+    fn identical_rule_is_not_duplicated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("99-live.toml");
+        let rule = || bash("git", Some("push{, **}"), true);
+        append_rules(&path, &[rule()]).unwrap();
+        append_rules(&path, &[rule()]).unwrap();
+        append_rules(&path, &[rule()]).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content.matches("[[bash.rules]]").count(), 1);
+    }
+
+    #[test]
     fn web_fetch_persists_url() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("99-live.toml");
@@ -136,6 +166,7 @@ mod tests {
             &[LiveRule {
                 shell: "web-fetch".into(),
                 target: "https://docs.rs/tokio".into(),
+                args: None,
                 allow: true,
             }],
         )
