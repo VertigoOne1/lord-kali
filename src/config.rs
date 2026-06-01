@@ -431,15 +431,19 @@ fn parse_config_file(path: &Path) -> Config {
     Config::from_raw(raw, Some(Arc::from(path.display().to_string().as_str())))
 }
 
+pub(crate) fn lord_kali_config_dir() -> PathBuf {
+    dirs::config_dir()
+        .expect("Could not determine config directory")
+        .join("lord-kali")
+}
+
 pub(crate) fn load_config(cwd: Option<&str>) -> Config {
     let initial = cwd
         .and_then(find_project_config)
         .map(|p| parse_config_file(&p))
         .unwrap_or_default();
 
-    let config_dir = dirs::config_dir()
-        .expect("Could not determine config directory")
-        .join("lord-kali");
+    let config_dir = lord_kali_config_dir();
 
     let entries = match std::fs::read_dir(&config_dir) {
         Ok(entries) => entries,

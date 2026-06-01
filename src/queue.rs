@@ -116,9 +116,10 @@ pub(crate) fn write_heartbeat_in(dir: &Path) -> std::io::Result<()> {
 
 pub(crate) fn is_tui_live_in(dir: &Path) -> bool {
     match std::fs::read_to_string(heartbeat_in(dir)) {
-        Ok(s) => s.trim().parse::<u64>().map_or(false, |ts| {
-            now_ms().saturating_sub(ts) <= HEARTBEAT_FRESH_MS
-        }),
+        Ok(s) => s
+            .trim()
+            .parse::<u64>()
+            .is_ok_and(|ts| now_ms().saturating_sub(ts) <= HEARTBEAT_FRESH_MS),
         Err(_) => false,
     }
 }

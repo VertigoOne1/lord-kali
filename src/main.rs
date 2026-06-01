@@ -1,5 +1,6 @@
 mod config;
 mod decision;
+mod live_rules;
 mod log;
 mod parse;
 mod queue;
@@ -35,7 +36,8 @@ pub(crate) struct ToolInput {
 fn main() {
     let mut args = std::env::args().skip(1);
     if args.next().as_deref() == Some("watch") {
-        watch::watch(args.next().as_deref());
+        let rest: Vec<String> = args.collect();
+        watch::watch(&rest);
         return;
     }
     run_hook();
