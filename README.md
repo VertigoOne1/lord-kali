@@ -2,7 +2,7 @@
 
 A Claude Code [PreToolUse hook](https://docs.anthropic.com/en/docs/claude-code/hooks) that filters Bash, PowerShell, and WebFetch tool calls with a more powerful matching system than Claude Code supports natively, and protects worktrees from accidental parent-directory file operations. It can also route everything it would otherwise leave to Claude Code's per-terminal prompt into one central [approval TUI](#central-approval-tui) shared across all your Claude instances.
 
-Bash commands are parsed with [tree-sitter-bash](https://github.com/tree-sitter/tree-sitter-bash), correctly handling pipelines, `&&`, `||`, `;` chains, subshells, command substitutions (`$(...)`), and `xargs`-wrapped commands. WebFetch URLs are matched against configurable glob/regex patterns. Worktree protection automatically denies file reads/writes targeting the parent project when Claude is operating inside a `.claude/worktrees/<name>` directory.
+Bash commands are parsed with [tree-sitter-bash](https://github.com/tree-sitter/tree-sitter-bash), correctly handling pipelines, `&&`, `||`, `;` chains, subshells, command substitutions (`$(...)`), and `xargs`-wrapped commands. PowerShell commands are parsed with [tree-sitter-powershell](https://github.com/airbus-cert/tree-sitter-powershell), handling pipelines, `;`/newline-separated statements, `&&`/`||` chains, script blocks (`{ ... }`), command substitutions (`$(...)`), the call operator (`& 'C:\path\app.exe'`), and `.exe`/path normalization — and a `pwsh -Command "..."` invocation inside a Bash call is unwrapped and its inner commands matched against the PowerShell rules. WebFetch URLs are matched against configurable glob/regex patterns. Worktree protection automatically denies file reads/writes targeting the parent project when Claude is operating inside a `.claude/worktrees/<name>` directory.
 
 ## Install
 
@@ -119,6 +119,32 @@ command = "npx"
 decision = "deny"
 reason = "Use pnpm dlx instead of npx."
 
+### PowerShell tool filtering
+
+# Same shape as [bash], matched against the PowerShell tool's commands. Cmdlet
+# names match as-is (e.g. Get-ChildItem); .exe and full paths are normalized to
+# the basename. A `pwsh -Command "..."` run from the Bash tool is unwrapped and
+# its inner commands matched against these rules too.
+[powershell]
+allowed_commands = ["Get-ChildItem", "Get-Content", "Select-String", "Test-Path", "Measure-Object", "Where-Object"]
+
+[[powershell.rules]]
+command = "Remove-Item"
+# Regex (wrapped in //) over the arguments joined by spaces.
+args = '/.*-(Recurse|Force|r)\b.*/'
+decision = "deny"
+reason = "No recursive/forced Remove-Item."
+
+[[powershell.rules]]
+command = "Set-Content"
+decision = "ask"
+reason = "Writes a file — confirm the target."
+
+[[powershell.rules]]
+command = "Invoke-WebRequest"
+decision = "ask"
+reason = "Network fetch — confirm the URL."
+
 ### Web fetch filtering
 
 [[web-fetch.rules]]
@@ -150,6 +176,10 @@ Rules are defined as `[[bash.rules]]` entries. Each rule has:
 - **`reason`** (optional): message shown to the user. Defaults to `"ok"` for allow rules.
 
 Rules for the same command are evaluated in config file order - the first rule whose `args` pattern matches wins. `allowed_commands` entries are appended after all explicit rules as `allow` matching any arguments.
+
+### PowerShell rules
+
+Rules are defined as `[[powershell.rules]]` entries with the **same fields and semantics as Bash rules** above; they apply to the `PowerShell` tool. The command name is the cmdlet or executable basename (e.g. `Remove-Item`, or `app` for `& 'C:\tools\app.exe'`). The same rules also gate any PowerShell unwrapped from a `pwsh -Command "..."` / `-c` call made through the Bash tool.
 
 ### WebFetch rules
 
