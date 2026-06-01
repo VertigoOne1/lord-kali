@@ -1,59 +1,50 @@
 # CLAUDE.md
 
-Guidance for LLM agents working in this repository.
+This file provides guidance to LLM agents when working with code in this repository.
 
-## Phase: active construction
+## Core principles
 
-lord-kali is being extended from a stateless pass/deny hook into a system that also
-**takes over approvals centrally** via a long-lived TUI (see
-`docs/plans/tui-approval-gate.md`). This is a deliberate, fair departure from the
-binary's original minimalist scope. While this work is in flight, prefer momentum and
-clarity over rule-literalism.
+The implementation must strictly adhere to these non-negotiable principles, as established in previous PRDs:
 
-The strict production ruleset that previously governed this repo is preserved at
-`docs/archive/CLAUDE.md`. Its principles remain *valuable* — treat them as the bar to
-return to at stabilization, not as gates that block construction now.
+1. **DRY (don't Repeat yourself)**
 
-## Principles (guidance, not gates)
+   - Zero code duplication will be tolerated
+   - Each functionality must exist in exactly one place
+   - No duplicate files or alternative implementations allowed
 
-These still matter. Honor their intent; don't be pedantic when construction needs the
-latitude.
+2. **KISS (keep it simple, stupid)**
 
-1. **DRY** — factor shared logic (line rendering, log IO, config parse) into one place.
-   Some duplication while a design is still settling is acceptable; consolidate before
-   the feature lands.
+   - Implement the simplest solution that works
+   - No over-engineering or unnecessary complexity
+   - Straightforward, maintainable code patterns
 
-2. **Keep it simple by default** — reach for the simplest thing that works first. But
-   the central-approval feature legitimately adds complexity (file-based IPC, a
-   heartbeat, a ratatui TUI). New dependencies and new directories (`docs/plans/`,
-   `docs/archive/`) are fine when they serve the plan. Don't reject a needed tool on
-   minimalism grounds alone.
+3. **Clean file system**
 
-3. **Transparent errors — but graceful degradation is not error-hiding.** The old rule
-   forbade fallbacks; this feature is *built* on intentional fallbacks (degrade to
-   passthrough when no TUI is alive, self-timeout before Claude Code's hook timeout).
-   The distinction: a **fallback that masks a failure** is forbidden; a **documented,
-   deliberate degradation path** that keeps agents unblocked is the design. Make
-   degradation paths explicit and commented as such. Genuine errors still surface
-   loudly.
+   - All existing files must be either used or removed
+   - No orphaned, redundant, or unused files
+   - Clear, logical organization of the file structure
 
-4. **Comments earn their place** — skip comments a competent engineer would infer.
-   *Do* comment the non-obvious: why a degradation path exists, why a value must stay
-   below Claude Code's timeout, what an IPC invariant guarantees.
+4. **Transparent error handling**
 
-5. **Tidy as you go** — don't leave dead files or half-wired code in a landed commit.
-   Planning and archive artifacts under `docs/` are intentional and exempt.
+   - All errors must be properly displayed to the user; errors must be clear, actionable, and honest
+   - No error hiding: never swallow or mask a genuine failure
+   - **Deliberate graceful degradation is not error hiding.** Documented fallback paths that keep the gate safe and agents unblocked — degrading to pass-through when no approval TUI is alive, self-timing-out below Claude Code's hook timeout, and best-effort logging that never blocks a gate decision — are part of the design. Such paths must be explicit and commented as deliberate, and must never paper over a genuine error.
 
-## Safety rails (these stay firm)
+5. **No obvious comments**
 
-- **Do not replace the installed binary** at `~/.local/bin/lord-kali` until the full
-  test suite passes and disabled-mode parity is verified. Verify against the
-  repo-built binary or stdin-fed hook JSON, never the installed path.
-- **Opt-in by default** — new gating behavior must default off so existing users are
-  unaffected until they enable it.
-- **`cargo test` stays green** — the existing suite is the regression contract for the
-  unchanged hook path. Baseline before this work: 151 passing.
+   - Code comments that can easily be inferred by a reasonably competent engineer are unnecessary, they create more lines of code without aiding understanding.
 
-## Code style
+## Success Criteria
 
-- Format with `cargo fmt`.
+In accordance with the established principles and previous PRDs, the implementation will be successful if:
+
+1. **Zero Duplication**: No duplicate code or files exist in the codebase
+2. **Single Implementation**: Each feature has exactly one implementation
+3. **No Silent Masking**: No fallback hides or masks a genuine error; deliberate degradation paths are documented (see principle 4)
+4. **Transparent Errors**: All errors are properly displayed to users
+5. **Modular Architecture**: Responsibilities are split into focused modules (`config`, `parse`, `decision`, `worktree`, `log`, `watch`, `queue`, `live_rules`)
+
+## Code Style
+
+- Format code with `cargo fmt`
+- Keep `cargo test` green and `cargo clippy` clean
