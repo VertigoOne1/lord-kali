@@ -317,35 +317,54 @@ mod tui {
     // A request from a crashed hook (no self-cleanup) is swept after this age.
     const REQ_MAX_AGE_MS: u64 = 120_000;
 
-    // Which column a node sits in. Every node is in exactly one; a commit resolves the
-    // whole call at once (allow the left column, deny the right). Default is Allow.
-    #[derive(Clone, Copy, PartialEq)]
-    enum Side {
+    // Which lane a node sits in. A commit resolves the whole call: allow the ALLOW lane,
+    // deny the DENY lane, and hand ASK nodes back to Claude Code's own prompt (a passthrough,
+    // which makes the call defer to the terminal). Default is Allow.
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Choice {
         Allow,
+        Ask,
         Deny,
     }
 
-    impl Side {
-        fn flip(self) -> Side {
+    impl Choice {
+        // space cycles allow -> ask -> deny -> allow.
+        fn cycle(self) -> Choice {
             match self {
-                Side::Allow => Side::Deny,
-                Side::Deny => Side::Allow,
+                Choice::Allow => Choice::Ask,
+                Choice::Ask => Choice::Deny,
+                Choice::Deny => Choice::Allow,
+            }
+        }
+
+        // ←/→ step one lane toward allow / deny (clamped at the ends).
+        fn left(self) -> Choice {
+            match self {
+                Choice::Deny => Choice::Ask,
+                _ => Choice::Allow,
+            }
+        }
+
+        fn right(self) -> Choice {
+            match self {
+                Choice::Allow => Choice::Ask,
+                _ => Choice::Deny,
             }
         }
     }
 
     struct Pending {
         request: QueueRequest,
-        sides: Vec<Side>,
+        choices: Vec<Choice>,
         cursor: usize,
     }
 
     impl Pending {
         fn new(request: QueueRequest) -> Self {
-            let sides = vec![Side::Allow; request.nodes.len()];
+            let choices = vec![Choice::Allow; request.nodes.len()];
             Pending {
                 request,
-                sides,
+                choices,
                 cursor: 0,
             }
         }
@@ -361,29 +380,31 @@ mod tui {
 
     enum Key {
         Quit,
-        Flip,
-        SetAllow,
-        SetDeny,
+        Cycle,
+        Left,
+        Right,
         Up,
         Down,
         PrevReq,
         NextReq,
         Commit(CommitMode),
+        SkipCall,
         Ignore,
     }
 
     fn map_key(code: KeyCode) -> Key {
         match code {
             KeyCode::Char('q') | KeyCode::Esc => Key::Quit,
-            KeyCode::Char(' ') => Key::Flip,
-            KeyCode::Left | KeyCode::Char('h') => Key::SetAllow,
-            KeyCode::Right | KeyCode::Char('l') => Key::SetDeny,
+            KeyCode::Char(' ') => Key::Cycle,
+            KeyCode::Left | KeyCode::Char('h') => Key::Left,
+            KeyCode::Right | KeyCode::Char('l') => Key::Right,
             KeyCode::Up | KeyCode::Char('k') => Key::Up,
             KeyCode::Down | KeyCode::Char('j') => Key::Down,
             KeyCode::Tab => Key::NextReq,
             KeyCode::BackTab => Key::PrevReq,
             KeyCode::Char('a') => Key::Commit(CommitMode::Always),
             KeyCode::Char('o') => Key::Commit(CommitMode::Once),
+            KeyCode::Char('s') => Key::SkipCall,
             _ => Key::Ignore,
         }
     }
@@ -422,21 +443,22 @@ mod tui {
         Some(format!("{first}{{, **}}"))
     }
 
-    // Each node resolves by its column: Allow -> allow, Deny -> deny; the mode picks
-    // once vs always. *_always actions also persist a subcommand-scoped rule (web-fetch
-    // persists the exact URL). Every node is decided, so the call never defers here.
+    // Each node resolves by its lane: Allow -> allow, Deny -> deny, Ask -> passthrough
+    // (deferred to Claude Code's prompt). The mode picks once vs always; *_always actions
+    // persist a subcommand-scoped rule (web-fetch persists the exact URL). Ask never persists.
     fn build_verdict(p: &Pending, mode: CommitMode) -> (Verdict, Vec<LiveRule>) {
         let mut nodes = Vec::new();
         let mut live = Vec::new();
         for (i, node) in p.request.nodes.iter().enumerate() {
-            let allow = p.sides[i] == Side::Allow;
-            let action = match (allow, mode) {
-                (true, CommitMode::Once) => Action::AllowOnce,
-                (true, CommitMode::Always) => Action::AllowAlways,
-                (false, CommitMode::Once) => Action::DenyOnce,
-                (false, CommitMode::Always) => Action::DenyAlways,
+            let choice = p.choices[i];
+            let action = match (choice, mode) {
+                (Choice::Allow, CommitMode::Once) => Action::AllowOnce,
+                (Choice::Allow, CommitMode::Always) => Action::AllowAlways,
+                (Choice::Deny, CommitMode::Once) => Action::DenyOnce,
+                (Choice::Deny, CommitMode::Always) => Action::DenyAlways,
+                (Choice::Ask, _) => Action::Passthrough,
             };
-            if matches!(mode, CommitMode::Always) {
+            if matches!(mode, CommitMode::Always) && choice != Choice::Ask {
                 let args = if node.shell == "web-fetch" {
                     None
                 } else {
@@ -446,7 +468,7 @@ mod tui {
                     shell: node.shell.clone(),
                     target: node.command.clone(),
                     args,
-                    allow,
+                    allow: choice == Choice::Allow,
                 });
             }
             nodes.push(VerdictNode {
@@ -464,11 +486,21 @@ mod tui {
         )
     }
 
-    fn set_side(app: &mut App, side: Side) {
-        if let Some(p) = app.focused_mut() {
-            if let Some(s) = p.sides.get_mut(p.cursor) {
-                *s = side;
-            }
+    // Skip the whole call: every node passthrough, nothing persisted — defers the entire
+    // call to Claude Code's own prompt, ignoring the lane settings.
+    fn build_skip(p: &Pending) -> Verdict {
+        Verdict {
+            id: p.request.id.clone(),
+            nodes: p
+                .request
+                .nodes
+                .iter()
+                .map(|n| VerdictNode {
+                    command: n.command.clone(),
+                    args: n.args.clone(),
+                    action: Action::Passthrough,
+                })
+                .collect(),
         }
     }
 
@@ -492,20 +524,28 @@ mod tui {
                 }
                 None
             }
-            Key::Flip => {
+            Key::Cycle => {
                 if let Some(p) = app.focused_mut() {
-                    if let Some(s) = p.sides.get_mut(p.cursor) {
-                        *s = s.flip();
+                    if let Some(c) = p.choices.get_mut(p.cursor) {
+                        *c = c.cycle();
                     }
                 }
                 None
             }
-            Key::SetAllow => {
-                set_side(app, Side::Allow);
+            Key::Left => {
+                if let Some(p) = app.focused_mut() {
+                    if let Some(c) = p.choices.get_mut(p.cursor) {
+                        *c = c.left();
+                    }
+                }
                 None
             }
-            Key::SetDeny => {
-                set_side(app, Side::Deny);
+            Key::Right => {
+                if let Some(p) = app.focused_mut() {
+                    if let Some(c) = p.choices.get_mut(p.cursor) {
+                        *c = c.right();
+                    }
+                }
                 None
             }
             Key::PrevReq => {
@@ -519,6 +559,7 @@ mod tui {
                 None
             }
             Key::Commit(mode) => app.focused().map(|p| build_verdict(p, mode)),
+            Key::SkipCall => app.focused().map(|p| (build_skip(p), Vec::new())),
             Key::Ignore => None,
         }
     }
@@ -621,16 +662,16 @@ mod tui {
         }
         found.sort_by_key(|r| r.ts_ms);
 
-        let mut prev: HashMap<String, (Vec<Side>, usize)> = HashMap::new();
+        let mut prev: HashMap<String, (Vec<Choice>, usize)> = HashMap::new();
         for p in app.pending.drain(..) {
-            prev.insert(p.request.id.clone(), (p.sides, p.cursor));
+            prev.insert(p.request.id.clone(), (p.choices, p.cursor));
         }
         app.pending = found
             .into_iter()
             .map(|req| match prev.remove(&req.id) {
-                Some((sides, cur)) if sides.len() == req.nodes.len() => Pending {
+                Some((choices, cur)) if choices.len() == req.nodes.len() => Pending {
                     cursor: cur.min(req.nodes.len().saturating_sub(1)),
-                    sides,
+                    choices,
                     request: req,
                 },
                 _ => Pending::new(req),
@@ -701,17 +742,16 @@ mod tui {
         )));
         f.render_widget(Paragraph::new(head), header);
 
-        let [left, right] =
-            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .areas(cols);
-        let mut allow_lines: Vec<Line> = Vec::new();
-        let mut deny_lines: Vec<Line> = Vec::new();
+        let [allow_area, ask_area, deny_area] = Layout::horizontal([
+            Constraint::Percentage(34),
+            Constraint::Percentage(33),
+            Constraint::Percentage(33),
+        ])
+        .areas(cols);
+
+        let mut lanes: [Vec<Line>; 3] = [Vec::new(), Vec::new(), Vec::new()];
         for (i, node) in p.request.nodes.iter().enumerate() {
-            let base = match p.sides[i] {
-                Side::Allow => Color::Green,
-                Side::Deny => Color::Red,
-            };
-            let mut style = Style::new().fg(base);
+            let mut style = Style::new();
             if i == p.cursor {
                 style = style.add_modifier(Modifier::REVERSED);
             }
@@ -719,36 +759,36 @@ mod tui {
                 format!("{} {}", node.command, node.args),
                 style,
             ));
-            match p.sides[i] {
-                Side::Allow => allow_lines.push(line),
-                Side::Deny => deny_lines.push(line),
-            }
+            let lane = match p.choices[i] {
+                Choice::Allow => 0,
+                Choice::Ask => 1,
+                Choice::Deny => 2,
+            };
+            lanes[lane].push(line);
         }
-        f.render_widget(
-            Paragraph::new(allow_lines)
+        let [allow_lines, ask_lines, deny_lines] = lanes;
+
+        let lane = |lines: Vec<Line<'static>>, title: String, color: Color| {
+            Paragraph::new(lines)
                 .block(
                     Block::bordered()
-                        .title(format!(
-                            "ALLOW ({})",
-                            p.sides.iter().filter(|s| **s == Side::Allow).count()
-                        ))
-                        .border_style(Style::new().fg(Color::Green)),
+                        .title(title)
+                        .border_style(Style::new().fg(color)),
                 )
-                .wrap(Wrap { trim: false }),
-            left,
+                .wrap(Wrap { trim: false })
+        };
+        let (na, nk, nd) = (allow_lines.len(), ask_lines.len(), deny_lines.len());
+        f.render_widget(
+            lane(allow_lines, format!("ALLOW ({na})"), Color::Green),
+            allow_area,
         );
         f.render_widget(
-            Paragraph::new(deny_lines)
-                .block(
-                    Block::bordered()
-                        .title(format!(
-                            "DENY ({})",
-                            p.sides.iter().filter(|s| **s == Side::Deny).count()
-                        ))
-                        .border_style(Style::new().fg(Color::Red)),
-                )
-                .wrap(Wrap { trim: false }),
-            right,
+            lane(ask_lines, format!("ASK ({nk})"), Color::Yellow),
+            ask_area,
+        );
+        f.render_widget(
+            lane(deny_lines, format!("DENY ({nd})"), Color::Red),
+            deny_area,
         );
     }
 
@@ -756,7 +796,7 @@ mod tui {
         let text = if app.pending.is_empty() {
             "q quit · waiting for approvals…"
         } else {
-            "space flip · ← allow  → deny · ↑↓ node · ⇥ next call · a apply-always · o apply-once · q quit"
+            "space cycle · ←→ lane (allow·ask·deny) · ↑↓ node · ⇥ call · a apply-always · o apply-once · s skip · q quit"
         };
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -834,35 +874,64 @@ mod tui {
             }
         }
 
-        // Flip node 0 (gh) to the deny column, leave node 1 (jq) in allow, commit-always:
-        // the call denies, and both columns persist subcommand-scoped rules.
-        #[test]
-        fn mixed_columns_commit_always_resolves_both() {
+        fn pending_app() -> App {
             let mut app = App::new();
             app.pending.push(Pending::new(req()));
-            assert!(apply_key(&mut app, Key::SetDeny).is_none()); // cursor at gh -> deny
+            app
+        }
+
+        #[test]
+        fn arrows_step_allow_ask_deny() {
+            let mut app = pending_app();
+            apply_key(&mut app, Key::Right);
+            assert_eq!(app.focused().unwrap().choices[0], Choice::Ask);
+            apply_key(&mut app, Key::Right);
+            assert_eq!(app.focused().unwrap().choices[0], Choice::Deny);
+            apply_key(&mut app, Key::Right); // clamped at Deny
+            assert_eq!(app.focused().unwrap().choices[0], Choice::Deny);
+            apply_key(&mut app, Key::Left);
+            assert_eq!(app.focused().unwrap().choices[0], Choice::Ask);
+        }
+
+        // gh -> Deny (two steps), jq stays Allow, commit-always: call denies and both
+        // lanes persist subcommand-scoped rules.
+        #[test]
+        fn deny_lane_commit_always_resolves_and_persists() {
+            let mut app = pending_app();
+            apply_key(&mut app, Key::Right);
+            apply_key(&mut app, Key::Right);
             let (verdict, live) =
                 apply_key(&mut app, Key::Commit(CommitMode::Always)).expect("commit");
             assert_eq!(verdict.nodes[0].action, Action::DenyAlways);
             assert_eq!(verdict.nodes[1].action, Action::AllowAlways);
-            // any deny makes the whole call deny
             assert_eq!(
                 combine_verdict(&verdict.nodes).map(|(d, _)| d),
                 Some(Decision::Deny)
             );
-            // both sides persist, subcommand-scoped
             assert_eq!(live.len(), 2);
             let gh = live.iter().find(|r| r.target == "gh").unwrap();
             assert!(!gh.allow);
             assert_eq!(gh.args, scope_args("pr list"));
-            let jq = live.iter().find(|r| r.target == "jq").unwrap();
-            assert!(jq.allow);
+            assert!(live.iter().find(|r| r.target == "jq").unwrap().allow);
+        }
+
+        // An ASK node passes through (defers the whole call) and persists nothing for itself.
+        #[test]
+        fn ask_lane_defers_call() {
+            let mut app = pending_app();
+            apply_key(&mut app, Key::Right); // gh -> Ask
+            let (verdict, live) =
+                apply_key(&mut app, Key::Commit(CommitMode::Always)).expect("commit");
+            assert_eq!(verdict.nodes[0].action, Action::Passthrough);
+            assert_eq!(verdict.nodes[1].action, Action::AllowAlways);
+            assert_eq!(combine_verdict(&verdict.nodes), None);
+            assert_eq!(live.len(), 1);
+            assert_eq!(live[0].target, "jq");
         }
 
         #[test]
         fn all_allow_once_allows_call_without_persisting() {
-            let mut app = App::new();
-            app.pending.push(Pending::new(req()));
+            let mut app = pending_app();
             let (verdict, live) =
                 apply_key(&mut app, Key::Commit(CommitMode::Once)).expect("commit");
             assert!(live.is_empty());
@@ -872,25 +941,29 @@ mod tui {
             );
         }
 
+        // Global skip overrides the lanes: every node passthrough, nothing persisted.
         #[test]
-        fn flip_is_reversible() {
-            let mut app = App::new();
-            app.pending.push(Pending::new(req()));
-            apply_key(&mut app, Key::Flip); // gh -> deny
-            apply_key(&mut app, Key::Flip); // gh -> allow again
-            let (verdict, _) = apply_key(&mut app, Key::Commit(CommitMode::Once)).expect("commit");
-            assert_eq!(verdict.nodes[0].action, Action::AllowOnce);
+        fn skip_call_passes_everything_through() {
+            let mut app = pending_app();
+            apply_key(&mut app, Key::Right);
+            apply_key(&mut app, Key::Right); // gh -> Deny, would otherwise deny
+            let (verdict, live) = apply_key(&mut app, Key::SkipCall).expect("skip");
+            assert!(verdict
+                .nodes
+                .iter()
+                .all(|n| n.action == Action::Passthrough));
+            assert!(live.is_empty());
+            assert_eq!(combine_verdict(&verdict.nodes), None);
         }
 
         #[test]
         fn renders_without_panic() {
             use ratatui::backend::TestBackend;
             use ratatui::Terminal;
-            let mut app = App::new();
-            app.pending.push(Pending::new(req()));
-            apply_key(&mut app, Key::SetDeny);
+            let mut app = pending_app();
+            apply_key(&mut app, Key::Right); // exercise the ASK lane + cursor highlight
             app.stream.push(Line::raw("ALLOW  Bash: ls"));
-            let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+            let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
             terminal.draw(|f| ui(f, &app)).unwrap();
             // also exercise the idle (no-pending) layout
             let idle = App::new();
