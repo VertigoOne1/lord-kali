@@ -296,7 +296,7 @@ fn watch_tail(explicit_path: Option<&str>) {
 // pane below where the operator rules on the actionable command nodes of each blocked call.
 mod tui {
     use super::{event_target, resolve_log_path, unmatched_nodes, Tailer};
-    use crate::config::load_config;
+    use crate::config::{load_config, ApprovalConfig};
     use crate::live_rules::{append_rules, live_rules_path, LiveRule};
     use crate::log::now_ms;
     use crate::queue::{
@@ -356,15 +356,24 @@ mod tui {
     struct Pending {
         request: QueueRequest,
         choices: Vec<Choice>,
+        // Per node: whether an *-always rule persists tight (full-args, path-specific)
+        // rather than subcommand-scoped. Defaults true for guardrail commands.
+        tight: Vec<bool>,
         cursor: usize,
     }
 
     impl Pending {
-        fn new(request: QueueRequest) -> Self {
+        fn new(request: QueueRequest, approval: &ApprovalConfig) -> Self {
             let choices = vec![Choice::Allow; request.nodes.len()];
+            let tight = request
+                .nodes
+                .iter()
+                .map(|n| approval.is_guardrail(&n.command))
+                .collect();
             Pending {
                 request,
                 choices,
+                tight,
                 cursor: 0,
             }
         }
@@ -387,6 +396,7 @@ mod tui {
         Down,
         PrevReq,
         NextReq,
+        ToggleScope,
         Commit(CommitMode),
         SkipCall,
         Ignore,
@@ -402,6 +412,7 @@ mod tui {
             KeyCode::Down | KeyCode::Char('j') => Key::Down,
             KeyCode::Tab => Key::NextReq,
             KeyCode::BackTab => Key::PrevReq,
+            KeyCode::Char('t') => Key::ToggleScope,
             KeyCode::Char('a') => Key::Commit(CommitMode::Always),
             KeyCode::Char('o') => Key::Commit(CommitMode::Once),
             KeyCode::Char('s') => Key::SkipCall,
@@ -447,6 +458,28 @@ mod tui {
         Some(format!("{first}{{, **}}"))
     }
 
+    // Tight (path-specific) scope: pin the whole args string, tolerating extra trailing
+    // args. So `rm -rf ./test-results` persists as `-rf ./test-results{, **}` — it can
+    // never match `rm -rf /`. None (command-wide) only when there were no args at all.
+    fn tight_args(args: &str) -> Option<String> {
+        if args.is_empty() {
+            None
+        } else {
+            Some(format!("{args}{{, **}}"))
+        }
+    }
+
+    // The args pattern an *-always rule would persist for a node, honoring its tight flag.
+    fn node_scope(tight: bool, shell: &str, args: &str) -> Option<String> {
+        if shell == "web-fetch" {
+            None
+        } else if tight {
+            tight_args(args)
+        } else {
+            scope_args(args)
+        }
+    }
+
     // Each node resolves by its lane: Allow -> allow, Deny -> deny, Ask -> passthrough
     // (deferred to Claude Code's prompt). The mode picks once vs always; *_always actions
     // persist a subcommand-scoped rule (web-fetch persists the exact URL). Ask never persists.
@@ -463,15 +496,10 @@ mod tui {
                 (Choice::Ask, _) => Action::Passthrough,
             };
             if matches!(mode, CommitMode::Always) && choice != Choice::Ask {
-                let args = if node.shell == "web-fetch" {
-                    None
-                } else {
-                    scope_args(&node.args)
-                };
                 live.push(LiveRule {
                     shell: node.shell.clone(),
                     target: node.command.clone(),
-                    args,
+                    args: node_scope(p.tight[i], &node.shell, &node.args),
                     allow: choice == Choice::Allow,
                 });
             }
@@ -562,6 +590,14 @@ mod tui {
                 }
                 None
             }
+            Key::ToggleScope => {
+                if let Some(p) = app.focused_mut() {
+                    if let Some(t) = p.tight.get_mut(p.cursor) {
+                        *t = !*t;
+                    }
+                }
+                None
+            }
             Key::Commit(mode) => app.focused().map(|p| build_verdict(p, mode)),
             Key::SkipCall => app.focused().map(|p| (build_skip(p), Vec::new())),
             Key::Ignore => None,
@@ -623,12 +659,14 @@ mod tui {
             &state_dir,
             &qdir,
             &live_path,
+            &cfg.approval,
         );
         ratatui::restore();
         clear_attention();
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_loop(
         terminal: &mut DefaultTerminal,
         app: &mut App,
@@ -636,6 +674,7 @@ mod tui {
         state_dir: &Path,
         qdir: &Path,
         live_path: &Path,
+        approval: &ApprovalConfig,
     ) -> std::io::Result<()> {
         // usize::MAX forces the first iteration to set the title/taskbar without ringing
         // the bell for approvals that were already waiting when the TUI opened.
@@ -653,7 +692,7 @@ mod tui {
                 }
             }
 
-            sync_pending(app, qdir);
+            sync_pending(app, qdir, approval);
             let count = app.pending.len();
             if count != prev_pending {
                 set_attention(count);
@@ -702,7 +741,7 @@ mod tui {
 
     // Reconcile the in-memory pending list with the request files on disk, preserving each
     // item's selection/cursor by id and sweeping requests from hooks that died mid-wait.
-    fn sync_pending(app: &mut App, qdir: &Path) {
+    fn sync_pending(app: &mut App, qdir: &Path, approval: &ApprovalConfig) {
         let mut found: Vec<QueueRequest> = Vec::new();
         if let Ok(entries) = std::fs::read_dir(qdir) {
             for e in entries.flatten() {
@@ -727,19 +766,20 @@ mod tui {
         }
         found.sort_by_key(|r| r.ts_ms);
 
-        let mut prev: HashMap<String, (Vec<Choice>, usize)> = HashMap::new();
+        let mut prev: HashMap<String, (Vec<Choice>, Vec<bool>, usize)> = HashMap::new();
         for p in app.pending.drain(..) {
-            prev.insert(p.request.id.clone(), (p.choices, p.cursor));
+            prev.insert(p.request.id.clone(), (p.choices, p.tight, p.cursor));
         }
         app.pending = found
             .into_iter()
             .map(|req| match prev.remove(&req.id) {
-                Some((choices, cur)) if choices.len() == req.nodes.len() => Pending {
+                Some((choices, tight, cur)) if choices.len() == req.nodes.len() => Pending {
                     cursor: cur.min(req.nodes.len().saturating_sub(1)),
                     choices,
+                    tight,
                     request: req,
                 },
-                _ => Pending::new(req),
+                _ => Pending::new(req, approval),
             })
             .collect();
         if app.focus >= app.pending.len() {
@@ -784,7 +824,7 @@ mod tui {
         };
 
         let [header, cols] =
-            Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).areas(area);
+            Layout::vertical([Constraint::Length(3), Constraint::Min(1)]).areas(area);
 
         let mut head = vec![Line::from(vec![
             Span::styled(
@@ -805,6 +845,22 @@ mod tui {
                 .unwrap_or_default(),
             Style::new().fg(Color::DarkGray),
         )));
+        // What an *-always commit would persist for the focused node, so the operator sees
+        // the exact (path-specific or subcommand-scoped) rule before pressing a/d.
+        if let Some(fnode) = p.request.nodes.get(p.cursor) {
+            let tight = p.tight[p.cursor];
+            let pat = node_scope(tight, &fnode.shell, &fnode.args)
+                .map(|a| format!("args=\"{a}\""))
+                .unwrap_or_else(|| "any args".into());
+            let mode = if tight { "tight" } else { "scope" };
+            head.push(Line::from(Span::styled(
+                format!(
+                    "→ rule: {} {}   ·  t: {} (toggle)",
+                    fnode.command, pat, mode
+                ),
+                Style::new().fg(if tight { Color::Green } else { Color::Yellow }),
+            )));
+        }
         f.render_widget(Paragraph::new(head), header);
 
         let [allow_area, ask_area, deny_area] = Layout::horizontal([
@@ -871,7 +927,7 @@ mod tui {
         let text = if app.pending.is_empty() {
             "q quit · waiting for approvals…"
         } else {
-            "space cycle · ←→ lane (allow·ask·deny) · ↑↓ node · ⇥ call · a apply-always · o apply-once · s skip · q quit"
+            "space cycle · ←→ lane · ↑↓ node · t scope · ⇥ call · a apply-always · o apply-once · s skip · q quit"
         };
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -951,8 +1007,50 @@ mod tui {
 
         fn pending_app() -> App {
             let mut app = App::new();
-            app.pending.push(Pending::new(req()));
+            app.pending
+                .push(Pending::new(req(), &ApprovalConfig::default()));
             app
+        }
+
+        fn rm_request() -> QueueRequest {
+            QueueRequest {
+                id: "rm1".into(),
+                ts_ms: 0,
+                cwd: None,
+                tool: "Bash".into(),
+                target: "rm -rf ./test-results".into(),
+                nodes: vec![QueueNode {
+                    shell: "bash".into(),
+                    command: "rm".into(),
+                    args: "-rf ./test-results".into(),
+                    decision: "passthrough".into(),
+                }],
+            }
+        }
+
+        // A guardrail command (rm) defaults to tight, path-specific persistence; `t` toggles
+        // it to the broad subcommand scope only when the operator deliberately asks.
+        #[test]
+        fn guardrail_defaults_tight_and_t_toggles() {
+            let mut app = App::new();
+            app.pending
+                .push(Pending::new(rm_request(), &ApprovalConfig::default()));
+            assert!(app.focused().unwrap().tight[0], "rm should default tight");
+
+            let (_, live) = apply_key(&mut app, Key::Commit(CommitMode::Always)).expect("commit");
+            assert_eq!(live[0].args.as_deref(), Some("-rf ./test-results{, **}"));
+
+            apply_key(&mut app, Key::ToggleScope);
+            assert!(!app.focused().unwrap().tight[0]);
+            let (_, live2) = apply_key(&mut app, Key::Commit(CommitMode::Always)).expect("commit");
+            assert_eq!(live2[0].args, scope_args("-rf ./test-results"));
+        }
+
+        // A non-guardrail command defaults to subcommand scope (not tight).
+        #[test]
+        fn non_guardrail_defaults_to_subcommand_scope() {
+            let app = pending_app();
+            assert!(!app.focused().unwrap().tight[0], "gh should not be tight");
         }
 
         #[test]

@@ -13,6 +13,9 @@ path = "~/.local/state/lord-kali/hook.jsonl"
 # enabled = true
 # live_rules = "99-live.toml"            # file the TUI appends allow/deny-always rules to
 # state_dir = "~/.local/state/lord-kali" # queue + heartbeat live here
+# Destructive commands (rm, dd, Remove-Item, …) always default to tight, path-specific
+# rules in the TUI; list extra commands here to give them the same treatment.
+# guardrail_commands = ["terraform", "kubectl"]
 
 [bash]
 allowed_commands = [

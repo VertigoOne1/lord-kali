@@ -282,6 +282,7 @@ impl Config {
                 enabled: raw.approval.enabled,
                 live_rules: raw.approval.live_rules,
                 state_dir: raw.approval.state_dir,
+                guardrail_commands: raw.approval.guardrail_commands,
             },
         }
     }
@@ -369,25 +370,50 @@ impl Default for RawWorktreeProtectionConfig {
 // Opt-in central approval. Disabled by default so installing this version never changes
 // an existing user's gate behavior. When enabled and a live TUI is present, ask/pass-through
 // calls are routed to the TUI queue instead of Claude Code's own prompt.
+// Destructive, path-operating commands whose TUI allow/deny-always rules default to a
+// tight, path-specific (full-args) scope instead of subcommand scope — so a one-off
+// `rm -rf ./tmp` never persists as a blanket `rm -rf` allow. Always on; users extend it.
+const DEFAULT_GUARDRAIL: &[&str] = &[
+    "rm",
+    "rmdir",
+    "dd",
+    "mkfs",
+    "shred",
+    "truncate",
+    "del",
+    "rd",
+    "Remove-Item",
+    "Clear-Content",
+];
+
 #[derive(Default)]
 pub(crate) struct ApprovalConfig {
     pub(crate) enabled: bool,
     pub(crate) live_rules: Option<String>,
     pub(crate) state_dir: Option<String>,
+    pub(crate) guardrail_commands: Vec<String>,
 }
 
 impl ApprovalConfig {
-    // enabling anywhere enables; an explicit file/dir from a later config overrides.
-    fn merge(self, other: Self) -> Self {
+    // enabling anywhere enables; an explicit file/dir from a later config overrides;
+    // guardrail lists accumulate (union) so protection can only be added, never removed.
+    fn merge(mut self, other: Self) -> Self {
+        self.guardrail_commands.extend(other.guardrail_commands);
         Self {
             enabled: self.enabled || other.enabled,
             live_rules: other.live_rules.or(self.live_rules),
             state_dir: other.state_dir.or(self.state_dir),
+            guardrail_commands: self.guardrail_commands,
         }
     }
 
     pub(crate) fn live_rules_file(&self) -> &str {
         self.live_rules.as_deref().unwrap_or("99-live.toml")
+    }
+
+    // Built-in destructive set unioned with the user's additions.
+    pub(crate) fn is_guardrail(&self, command: &str) -> bool {
+        DEFAULT_GUARDRAIL.contains(&command) || self.guardrail_commands.iter().any(|c| c == command)
     }
 }
 
@@ -397,6 +423,8 @@ pub(crate) struct RawApprovalConfig {
     pub(crate) enabled: bool,
     pub(crate) live_rules: Option<String>,
     pub(crate) state_dir: Option<String>,
+    #[serde(default)]
+    pub(crate) guardrail_commands: Vec<String>,
 }
 
 pub(crate) fn expand_tilde(path: &str) -> PathBuf {

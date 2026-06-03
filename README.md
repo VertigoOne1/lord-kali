@@ -308,6 +308,7 @@ The **approval TUI** gives you one. When you opt in and run `lord-kali watch`, e
 enabled = true
 # live_rules = "99-live.toml"            # file the TUI appends allow/deny-always rules to
 # state_dir  = "~/.local/state/lord-kali" # queue + heartbeat live here
+# guardrail_commands = ["terraform", "kubectl"]  # extra commands that default to tight scope
 ```
 
 ```sh
@@ -323,6 +324,7 @@ The TUI has three regions: a scrolling decision **stream** on top, the **approva
 | `←` / `→` | step the focused node one lane toward ALLOW / DENY (ASK is the middle) |
 | `space` | cycle the focused node ALLOW → ASK → DENY |
 | `↑` / `↓` | move between nodes |
+| `t` | toggle the focused node's persisted scope: **tight** (full args, path-specific) ⇄ **subcommand** |
 | `⇥` (Tab) | switch between pending calls |
 | `a` | **apply-always** — resolve the call by lane and persist a rule for each allowed/denied node |
 | `o` | **apply-once** — same, but for this call only (nothing persisted) |
@@ -331,7 +333,9 @@ The TUI has three regions: a scrolling decision **stream** on top, the **approva
 
 One commit resolves the whole call from the lanes: any node in **DENY** denies the call; a node in **ASK** defers the call to Claude Code's own prompt (a passthrough); only if every node is in **ALLOW** does the call run outright. So you can allow the parts you trust, deny the dangerous ones, and hand the uncertain ones back to the agent — in a single keystroke. `s` is the quick "I'm not deciding this here" for an entire call.
 
-**apply-always** appends an ordinary, **subcommand-scoped** rule to `~/.config/lord-kali/99-live.toml` for each node (sorted last, so it never shadows your explicit rules). The scope is the node's first argument: allowing `git push` writes `command = "git", args = "push{, **}"`, so it does **not** also bless `git commit`. Web-fetch nodes persist the exact URL. Future matching calls then resolve instantly without reaching the queue — the gap closes as you go.
+**apply-always** appends an ordinary rule to `~/.config/lord-kali/99-live.toml` for each node (sorted last, so it never shadows your explicit rules). By default the scope is **subcommand** (the node's first argument): allowing `git push` writes `command = "git", args = "push{, **}"`, so it does **not** also bless `git commit`. Web-fetch nodes persist the exact URL. Future matching calls then resolve instantly without reaching the queue — the gap closes as you go.
+
+**Guardrail commands and tight scope.** Subcommand scope is wrong for destructive, path-operating commands: a one-off `rm -rf ./test-results` would otherwise persist as a blanket `rm -rf` allow (the first argument is the flag `-rf`, not a subcommand). So a built-in set of destructive commands — `rm`, `rmdir`, `dd`, `mkfs`, `shred`, `truncate`, `del`, `rd`, `Remove-Item`, `Clear-Content` (extend it via `guardrail_commands`) — defaults to **tight** scope instead: the full args are pinned, so `rm -rf ./test-results` persists `args = "-rf ./test-results{, **}"` and can never match `rm -rf /`. Press **`t`** to toggle any node between tight and subcommand scope; the header shows the exact rule that will be written before you commit.
 
 ### Graceful degradation
 
