@@ -568,6 +568,45 @@ mod tui {
         }
     }
 
+    // Surface "waiting for you" on the terminal tab itself (like Claude Code): the window
+    // title carries the waiting count, and on Windows Terminal the tab/taskbar icon turns
+    // amber (OSC 9;4 state 4) while approvals are pending. Terminals that don't understand
+    // a given sequence ignore it.
+    fn attention_title(count: usize) -> String {
+        if count > 0 {
+            format!("● lord-kali — {count} waiting")
+        } else {
+            "lord-kali — watching".to_string()
+        }
+    }
+
+    fn set_attention(count: usize) {
+        use std::io::Write;
+        let mut out = std::io::stdout();
+        let _ = write!(out, "\x1b]0;{}\x07", attention_title(count));
+        let state = if count > 0 {
+            "\x1b]9;4;4;0\x07"
+        } else {
+            "\x1b]9;4;0;0\x07"
+        };
+        let _ = write!(out, "{state}");
+        let _ = out.flush();
+    }
+
+    fn ring_bell() {
+        use std::io::Write;
+        let mut out = std::io::stdout();
+        let _ = write!(out, "\x07");
+        let _ = out.flush();
+    }
+
+    fn clear_attention() {
+        use std::io::Write;
+        let mut out = std::io::stdout();
+        let _ = write!(out, "\x1b]0;\x07\x1b]9;4;0;0\x07");
+        let _ = out.flush();
+    }
+
     pub(crate) fn run(explicit_path: Option<&str>) -> std::io::Result<()> {
         let cfg = load_config(None);
         let state_dir = queue::state_dir(&cfg.approval);
@@ -586,6 +625,7 @@ mod tui {
             &live_path,
         );
         ratatui::restore();
+        clear_attention();
         result
     }
 
@@ -597,6 +637,9 @@ mod tui {
         qdir: &Path,
         live_path: &Path,
     ) -> std::io::Result<()> {
+        // usize::MAX forces the first iteration to set the title/taskbar without ringing
+        // the bell for approvals that were already waiting when the TUI opened.
+        let mut prev_pending = usize::MAX;
         loop {
             let _ = write_heartbeat_in(state_dir);
 
@@ -611,6 +654,15 @@ mod tui {
             }
 
             sync_pending(app, qdir);
+            let count = app.pending.len();
+            if count != prev_pending {
+                set_attention(count);
+                // Ring once when a new approval arrives (count rose), not on every change.
+                if count > prev_pending {
+                    ring_bell();
+                }
+                prev_pending = count;
+            }
             terminal.draw(|f| ui(f, app))?;
 
             if event::poll(Duration::from_millis(POLL_MS))? {
@@ -950,6 +1002,14 @@ mod tui {
             assert_eq!(combine_verdict(&verdict.nodes), None);
             assert_eq!(live.len(), 1);
             assert_eq!(live[0].target, "jq");
+        }
+
+        #[test]
+        fn attention_title_reflects_waiting_count() {
+            assert_eq!(attention_title(0), "lord-kali — watching");
+            let t = attention_title(3);
+            assert!(t.contains("3 waiting"), "got {t}");
+            assert!(t.starts_with('●'), "got {t}");
         }
 
         #[test]

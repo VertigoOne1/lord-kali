@@ -314,6 +314,8 @@ enabled = true
 lord-kali watch   # opens the TUI; keep it running while you work
 ```
 
+You don't have to babysit the window: while approvals are pending the terminal **title** shows `● lord-kali — N waiting`, the tab/taskbar icon turns amber (on Windows Terminal, via `OSC 9;4`), and a bell rings when a new one arrives — so a backgrounded watch tab tells you when it needs you. All three clear once the queue is empty, and reset on quit. (Terminals that don't support a given sequence simply ignore it.)
+
 The TUI has three regions: a scrolling decision **stream** on top, the **approval zone** in the middle, and a help line locked to the bottom row. Each pending call expands to its **actionable command nodes** — the ones that matched no rule or matched an `ask` rule (a chain like `pwd && gh ... | jq ...` lists only `gh` and `jq`). The approval zone is three lanes — **ALLOW · ASK · DENY**; every node starts in ALLOW, and you sort each into a lane before committing:
 
 | key | action |
