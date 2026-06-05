@@ -14,6 +14,7 @@ pub(crate) struct Config {
     pub(crate) bash: CommandRules,
     pub(crate) powershell: CommandRules,
     pub(crate) web_fetch: WebFetchConfig,
+    pub(crate) mcp: McpConfig,
     pub(crate) log: Option<LogConfig>,
     pub(crate) worktree_protection: WorktreeProtectionConfig,
     pub(crate) approval: ApprovalConfig,
@@ -28,6 +29,7 @@ impl Config {
             self.powershell.rules.entry(cmd).or_default().extend(rules);
         }
         self.web_fetch.rules.extend(other.web_fetch.rules);
+        self.mcp.rules.extend(other.mcp.rules);
         if other.log.is_some() {
             self.log = other.log;
         }
@@ -212,6 +214,69 @@ pub(crate) struct RawWebFetchRule {
     pub(crate) projects: Vec<String>,
 }
 
+// MCP tool-call gating, keyed on the full `mcp__<server>__<tool>` name (glob or /regex/).
+// A flat rule list like web-fetch — no args matching; the tool name is the whole key.
+#[derive(Default)]
+pub(crate) struct McpConfig {
+    pub(crate) rules: Vec<McpRule>,
+}
+
+impl McpConfig {
+    pub(crate) fn from_raw(raw: RawMcpConfig, group_projects: &[String], source: Source) -> Self {
+        McpConfig {
+            rules: raw
+                .rules
+                .into_iter()
+                .map(|r| {
+                    let decision = match r.decision.as_str() {
+                        "allow" => Decision::Allow,
+                        "deny" => Decision::Deny,
+                        "ask" => Decision::Ask,
+                        other => panic!("Invalid decision '{}' for mcp tool '{}'", other, r.tool),
+                    };
+                    let projects = merge_and_expand_projects(group_projects, &r.projects);
+                    let meta = RuleMeta {
+                        source_file: source.clone(),
+                        rule_kind: RuleKind::Explicit,
+                        rule_command: Some(r.tool.clone()),
+                        rule_args: Some(r.tool.clone()),
+                    };
+                    McpRule {
+                        decision,
+                        pattern: compile_pattern(&r.tool),
+                        reason: r.reason.unwrap_or_else(|| "ok".into()),
+                        projects,
+                        meta,
+                    }
+                })
+                .collect(),
+        }
+    }
+}
+
+pub(crate) struct McpRule {
+    pub(crate) decision: Decision,
+    pub(crate) pattern: Pattern,
+    pub(crate) reason: String,
+    pub(crate) projects: Vec<PathBuf>,
+    pub(crate) meta: RuleMeta,
+}
+
+#[derive(Default, Deserialize)]
+pub(crate) struct RawMcpConfig {
+    #[serde(default)]
+    pub(crate) rules: Vec<RawMcpRule>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct RawMcpRule {
+    pub(crate) tool: String,
+    pub(crate) decision: String,
+    pub(crate) reason: Option<String>,
+    #[serde(default)]
+    pub(crate) projects: Vec<String>,
+}
+
 #[derive(Default, Deserialize)]
 pub(crate) struct RawConfig {
     #[serde(default)]
@@ -220,6 +285,8 @@ pub(crate) struct RawConfig {
     pub(crate) powershell: RawCommandConfig,
     #[serde(default, rename = "web-fetch")]
     pub(crate) web_fetch: RawWebFetchConfig,
+    #[serde(default)]
+    pub(crate) mcp: RawMcpConfig,
     pub(crate) log: Option<LogConfig>,
     #[serde(default, rename = "worktree-protection")]
     pub(crate) worktree_protection: RawWorktreeProtectionConfig,
@@ -239,6 +306,8 @@ pub(crate) struct RawGroupConfig {
     pub(crate) powershell: RawCommandConfig,
     #[serde(default, rename = "web-fetch")]
     pub(crate) web_fetch: RawWebFetchConfig,
+    #[serde(default)]
+    pub(crate) mcp: RawMcpConfig,
 }
 
 impl From<RawConfig> for Config {
@@ -252,6 +321,7 @@ impl Config {
         let mut bash = CommandRules::from_raw(raw.bash, &[], source.clone());
         let mut powershell = CommandRules::from_raw(raw.powershell, &[], source.clone());
         let mut web_fetch = WebFetchConfig::from_raw(raw.web_fetch, &[], source.clone());
+        let mut mcp = McpConfig::from_raw(raw.mcp, &[], source.clone());
 
         for group in raw.group {
             let group_bash = CommandRules::from_raw(group.bash, &group.projects, source.clone());
@@ -268,12 +338,16 @@ impl Config {
             let group_web_fetch =
                 WebFetchConfig::from_raw(group.web_fetch, &group.projects, source.clone());
             web_fetch.rules.extend(group_web_fetch.rules);
+
+            let group_mcp = McpConfig::from_raw(group.mcp, &group.projects, source.clone());
+            mcp.rules.extend(group_mcp.rules);
         }
 
         Config {
             bash,
             powershell,
             web_fetch,
+            mcp,
             log: raw.log,
             worktree_protection: WorktreeProtectionConfig {
                 enabled: raw.worktree_protection.enabled,
@@ -622,6 +696,7 @@ mod tests {
             log: None,
             worktree_protection: RawWorktreeProtectionConfig::default(),
             approval: RawApprovalConfig::default(),
+            mcp: RawMcpConfig::default(),
             group: vec![RawGroupConfig {
                 projects: vec!["/home/user/projects/test".into()],
                 bash: RawCommandConfig {
@@ -636,6 +711,7 @@ mod tests {
                 },
                 powershell: RawCommandConfig::default(),
                 web_fetch: RawWebFetchConfig::default(),
+                mcp: RawMcpConfig::default(),
             }],
         };
         let config = Config::from(raw);
@@ -669,6 +745,7 @@ mod tests {
             log: None,
             worktree_protection: RawWorktreeProtectionConfig::default(),
             approval: RawApprovalConfig::default(),
+            mcp: RawMcpConfig::default(),
             group: vec![RawGroupConfig {
                 projects: vec!["/home/user/projects/a".into()],
                 bash: RawCommandConfig {
@@ -683,6 +760,7 @@ mod tests {
                 },
                 powershell: RawCommandConfig::default(),
                 web_fetch: RawWebFetchConfig::default(),
+                mcp: RawMcpConfig::default(),
             }],
         };
         let config = Config::from(raw);
@@ -713,6 +791,7 @@ mod tests {
             log: None,
             worktree_protection: RawWorktreeProtectionConfig::default(),
             approval: RawApprovalConfig::default(),
+            mcp: RawMcpConfig::default(),
             group: vec![RawGroupConfig {
                 projects: vec!["/home/user/projects/test".into()],
                 bash: RawCommandConfig {
@@ -721,6 +800,7 @@ mod tests {
                 },
                 powershell: RawCommandConfig::default(),
                 web_fetch: RawWebFetchConfig::default(),
+                mcp: RawMcpConfig::default(),
             }],
         };
         let config = Config::from(raw);
@@ -754,6 +834,7 @@ mod tests {
             log: None,
             worktree_protection: RawWorktreeProtectionConfig::default(),
             approval: RawApprovalConfig::default(),
+            mcp: RawMcpConfig::default(),
             group: vec![RawGroupConfig {
                 projects: vec!["/home/user/projects/test".into()],
                 bash: RawCommandConfig::default(),
@@ -766,6 +847,7 @@ mod tests {
                         projects: vec![],
                     }],
                 },
+                mcp: RawMcpConfig::default(),
             }],
         };
         let config = Config::from(raw);
@@ -808,6 +890,7 @@ mod tests {
             log: None,
             worktree_protection: RawWorktreeProtectionConfig::default(),
             approval: RawApprovalConfig::default(),
+            mcp: RawMcpConfig::default(),
             group: vec![RawGroupConfig {
                 projects: vec!["/home/user/projects/test".into()],
                 bash: RawCommandConfig {
@@ -822,6 +905,7 @@ mod tests {
                 },
                 powershell: RawCommandConfig::default(),
                 web_fetch: RawWebFetchConfig::default(),
+                mcp: RawMcpConfig::default(),
             }],
         };
         let config = Config::from(raw);

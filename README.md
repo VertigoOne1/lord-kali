@@ -1,6 +1,6 @@
 # lord-kali
 
-A Claude Code [PreToolUse hook](https://docs.anthropic.com/en/docs/claude-code/hooks) that filters Bash, PowerShell, and WebFetch tool calls with a more powerful matching system than Claude Code supports natively, and protects worktrees from accidental parent-directory file operations. It can also route everything it would otherwise leave to Claude Code's per-terminal prompt into one central [approval TUI](#central-approval-tui) shared across all your Claude instances.
+A Claude Code [PreToolUse hook](https://docs.anthropic.com/en/docs/claude-code/hooks) that filters Bash, PowerShell, WebFetch, and MCP tool calls with a more powerful matching system than Claude Code supports natively, and protects worktrees from accidental parent-directory file operations. It can also route everything it would otherwise leave to Claude Code's per-terminal prompt into one central [approval TUI](#central-approval-tui) shared across all your Claude instances.
 
 Bash commands are parsed with [tree-sitter-bash](https://github.com/tree-sitter/tree-sitter-bash), correctly handling pipelines, `&&`, `||`, `;` chains, subshells, command substitutions (`$(...)`), and `xargs`-wrapped commands. PowerShell commands are parsed with [tree-sitter-powershell](https://github.com/airbus-cert/tree-sitter-powershell), handling pipelines, `;`/newline-separated statements, `&&`/`||` chains, script blocks (`{ ... }`), command substitutions (`$(...)`), the call operator (`& 'C:\path\app.exe'`), and `.exe`/path normalization — and a `pwsh -Command "..."` invocation inside a Bash call is unwrapped and its inner commands matched against the PowerShell rules. WebFetch URLs are matched against configurable glob/regex patterns. Worktree protection automatically denies file reads/writes targeting the parent project when Claude is operating inside a `.claude/worktrees/<name>` directory.
 
@@ -164,6 +164,21 @@ url = "/[^?]*/"
 decision = "allow"
 ```
 
+### MCP tool filtering
+
+```toml
+# Gate MCP tool calls by tool name (mcp__<server>__<tool>). Glob and /regex/ both work.
+# A specific ask/deny must precede a broader allow (first match wins).
+[[mcp.rules]]
+tool = "mcp__playwright__browser_fill_form"
+decision = "ask"
+reason = "Eyeball form fills"
+
+[[mcp.rules]]
+tool = "mcp__playwright__*"
+decision = "allow"
+```
+
 See [`config.toml`](config.toml) for a more thorough example with many common rules.
 
 ### Bash rules
@@ -191,9 +206,19 @@ Rules are defined as `[[web-fetch.rules]]` entries. Each rule has:
 
 Rules are evaluated in config file order - the first matching rule wins.
 
+### MCP rules
+
+Rules are defined as `[[mcp.rules]]` entries and apply to any tool whose name starts with `mcp__` (the `mcp__<server>__<tool>` convention). Each rule has:
+
+- **`tool`** (required): glob or regex pattern matched against the full tool name, e.g. `mcp__playwright__*` for a whole server or `mcp__playwright__browser_fill_form` for one tool
+- **`decision`** (required): `allow`, `deny`, or `ask`
+- **`reason`** (optional): message shown to the user. Defaults to `"ok"`.
+
+Rules are evaluated in config file order — the first matching rule wins. Matching is on the **tool name only**; the tool's structured arguments are never inspected (they are shown read-only in the approval TUI so you can eyeball a call before approving). Because there are no arguments to scope, an allow/deny persisted from the TUI keys on the exact tool name.
+
 ### Per-rule project scoping
 
-Any rule (bash or web-fetch) can have an optional `projects` array to restrict it to specific directories. A rule with `projects` only applies when the hook's `cwd` is inside one of the listed directories. Rules without `projects` are global (match all cwds). `~` is expanded in project paths.
+Any rule (bash, web-fetch, or mcp) can have an optional `projects` array to restrict it to specific directories. A rule with `projects` only applies when the hook's `cwd` is inside one of the listed directories. Rules without `projects` are global (match all cwds). `~` is expanded in project paths.
 
 ```toml
 [[bash.rules]]
@@ -231,7 +256,7 @@ url = "https://internal.example.com/**"
 decision = "allow"
 ```
 
-Multiple `[[group]]` sections can be defined. Group rules are appended after top-level rules (first-match-wins, definition order). Group `bash` and `web-fetch` sections use the same format as the top-level sections.
+Multiple `[[group]]` sections can be defined. Group rules are appended after top-level rules (first-match-wins, definition order). Group `bash`, `powershell`, `web-fetch`, and `mcp` sections use the same format as the top-level sections.
 
 ### Worktree protection
 
@@ -333,7 +358,7 @@ The TUI has three regions: a scrolling decision **stream** on top, the **approva
 
 One commit resolves the whole call from the lanes: any node in **DENY** denies the call; a node in **ASK** defers the call to Claude Code's own prompt (a passthrough); only if every node is in **ALLOW** does the call run outright. So you can allow the parts you trust, deny the dangerous ones, and hand the uncertain ones back to the agent — in a single keystroke. `s` is the quick "I'm not deciding this here" for an entire call.
 
-**apply-always** appends an ordinary rule to `~/.config/lord-kali/99-live.toml` for each node (sorted last, so it never shadows your explicit rules). By default the scope is **subcommand** (the node's first argument): allowing `git push` writes `command = "git", args = "push{, **}"`, so it does **not** also bless `git commit`. Web-fetch nodes persist the exact URL. Future matching calls then resolve instantly without reaching the queue — the gap closes as you go.
+**apply-always** appends an ordinary rule to `~/.config/lord-kali/99-live.toml` for each node (sorted last, so it never shadows your explicit rules). By default the scope is **subcommand** (the node's first argument): allowing `git push` writes `command = "git", args = "push{, **}"`, so it does **not** also bless `git commit`. Web-fetch nodes persist the exact URL; MCP nodes persist the exact tool name (no args, no `t` toggle). Future matching calls then resolve instantly without reaching the queue — the gap closes as you go.
 
 **Guardrail commands and tight scope.** Subcommand scope is wrong for destructive, path-operating commands: a one-off `rm -rf ./test-results` would otherwise persist as a blanket `rm -rf` allow (the first argument is the flag `-rf`, not a subcommand). So a built-in set of destructive commands — `rm`, `rmdir`, `dd`, `mkfs`, `shred`, `truncate`, `del`, `rd`, `Remove-Item`, `Clear-Content` (extend it via `guardrail_commands`) — defaults to **tight** scope instead: the full args are pinned, so `rm -rf ./test-results` persists `args = "-rf ./test-results{, **}"` and can never match `rm -rf /`. Press **`t`** to toggle any node between tight and subcommand scope; the header shows the exact rule that will be written before you commit.
 
@@ -359,6 +384,13 @@ Given the set of commands extracted from a bash string, each command is resolved
 ### WebFetch
 
 Given a URL, rules are evaluated in config file order:
+
+1. **First matching rule** - its decision (allow/deny/ask) is returned
+2. **pass-through** - if no rule matches (no output, defers to Claude Code defaults)
+
+### MCP
+
+Given a tool whose name starts with `mcp__`, `[[mcp.rules]]` are evaluated in config file order against the tool name:
 
 1. **First matching rule** - its decision (allow/deny/ask) is returned
 2. **pass-through** - if no rule matches (no output, defers to Claude Code defaults)

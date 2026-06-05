@@ -471,7 +471,7 @@ mod tui {
 
     // The args pattern an *-always rule would persist for a node, honoring its tight flag.
     fn node_scope(tight: bool, shell: &str, args: &str) -> Option<String> {
-        if shell == "web-fetch" {
+        if shell == "web-fetch" || shell == "mcp" {
             None
         } else if tight {
             tight_args(args)
@@ -848,18 +848,29 @@ mod tui {
         // What an *-always commit would persist for the focused node, so the operator sees
         // the exact (path-specific or subcommand-scoped) rule before pressing a/d.
         if let Some(fnode) = p.request.nodes.get(p.cursor) {
-            let tight = p.tight[p.cursor];
-            let pat = node_scope(tight, &fnode.shell, &fnode.args)
-                .map(|a| format!("args=\"{a}\""))
-                .unwrap_or_else(|| "any args".into());
-            let mode = if tight { "tight" } else { "scope" };
-            head.push(Line::from(Span::styled(
-                format!(
-                    "→ rule: {} {}   ·  t: {} (toggle)",
-                    fnode.command, pat, mode
-                ),
-                Style::new().fg(if tight { Color::Green } else { Color::Yellow }),
-            )));
+            // MCP rules key on the exact tool name — no args scope, no tight toggle.
+            if fnode.shell == "mcp" {
+                head.push(Line::from(Span::styled(
+                    format!(
+                        "→ rule: tool=\"{}\"   ·  exact tool-name (no args)",
+                        fnode.command
+                    ),
+                    Style::new().fg(Color::Green),
+                )));
+            } else {
+                let tight = p.tight[p.cursor];
+                let pat = node_scope(tight, &fnode.shell, &fnode.args)
+                    .map(|a| format!("args=\"{a}\""))
+                    .unwrap_or_else(|| "any args".into());
+                let mode = if tight { "tight" } else { "scope" };
+                head.push(Line::from(Span::styled(
+                    format!(
+                        "→ rule: {} {}   ·  t: {} (toggle)",
+                        fnode.command, pat, mode
+                    ),
+                    Style::new().fg(if tight { Color::Green } else { Color::Yellow }),
+                )));
+            }
         }
         f.render_widget(Paragraph::new(head), header);
 
@@ -1100,6 +1111,57 @@ mod tui {
             assert_eq!(combine_verdict(&verdict.nodes), None);
             assert_eq!(live.len(), 1);
             assert_eq!(live[0].target, "jq");
+        }
+
+        fn mcp_request() -> QueueRequest {
+            QueueRequest {
+                id: "mcp1".into(),
+                ts_ms: 0,
+                cwd: None,
+                tool: "mcp__playwright__browser_fill_form".into(),
+                target: "mcp__playwright__browser_fill_form".into(),
+                nodes: vec![QueueNode {
+                    shell: "mcp".into(),
+                    command: "mcp__playwright__browser_fill_form".into(),
+                    args: r#"{"fields":[{"name":"Password"}]}"#.into(),
+                    decision: "passthrough".into(),
+                }],
+            }
+        }
+
+        // MCP rules key on the exact tool name — never an args scope, regardless of tight.
+        #[test]
+        fn mcp_node_scope_is_always_none() {
+            assert_eq!(node_scope(false, "mcp", r#"{"fields":[]}"#), None);
+            assert_eq!(node_scope(true, "mcp", r#"{"fields":[]}"#), None);
+        }
+
+        #[test]
+        fn mcp_allow_always_persists_tool_rule_without_args() {
+            let mut app = App::new();
+            app.pending
+                .push(Pending::new(mcp_request(), &ApprovalConfig::default()));
+            let (verdict, live) =
+                apply_key(&mut app, Key::Commit(CommitMode::Always)).expect("commit");
+            assert_eq!(verdict.nodes[0].action, Action::AllowAlways);
+            assert_eq!(live.len(), 1);
+            assert_eq!(live[0].shell, "mcp");
+            assert_eq!(live[0].target, "mcp__playwright__browser_fill_form");
+            assert!(live[0].args.is_none());
+            assert!(live[0].allow);
+        }
+
+        #[test]
+        fn mcp_deny_always_persists_deny_without_args() {
+            let mut app = App::new();
+            app.pending
+                .push(Pending::new(mcp_request(), &ApprovalConfig::default()));
+            apply_key(&mut app, Key::Right); // -> Ask
+            apply_key(&mut app, Key::Right); // -> Deny
+            let (_, live) = apply_key(&mut app, Key::Commit(CommitMode::Always)).expect("commit");
+            assert_eq!(live.len(), 1);
+            assert!(!live[0].allow);
+            assert!(live[0].args.is_none());
         }
 
         #[test]

@@ -2,7 +2,9 @@
 // per-node decisions into one verdict for the tool call. `dispatch` also builds a
 // parallel per-node trace (for logging) that never affects the decision.
 
-use crate::config::{CommandRule, CommandRules, Config, Pattern, RuleMeta, WebFetchConfig};
+use crate::config::{
+    CommandRule, CommandRules, Config, McpConfig, Pattern, RuleMeta, WebFetchConfig,
+};
 use crate::parse::{extract_commands, extract_commands_powershell, inner_powershell_script};
 use crate::worktree::check_worktree_protection;
 use crate::HookInput;
@@ -159,6 +161,14 @@ pub(crate) fn dispatch(
             },
             None => empty_trace("web_fetch"),
         },
+        name if name.starts_with("mcp__") => {
+            let summary = hook_input.tool_input.summary();
+            InvocationTrace {
+                final_decision: handle_mcp(&config.mcp, cwd, name),
+                kind: "mcp",
+                nodes: vec![trace_mcp(&config.mcp, cwd, name, summary)],
+            }
+        }
         _ => empty_trace("unknown"),
     }
 }
@@ -208,6 +218,41 @@ fn trace_web_fetch(config: &WebFetchConfig, cwd: Option<&str>, url: &str) -> Nod
         shell: "web-fetch",
         command: url.to_string(),
         args: String::new(),
+        matched,
+    }
+}
+
+pub(crate) fn handle_mcp(
+    config: &McpConfig,
+    cwd: Option<&str>,
+    tool: &str,
+) -> Option<(Decision, String)> {
+    for rule in &config.rules {
+        if rule_matches_cwd(&rule.projects, cwd) && rule.pattern.is_match(tool) {
+            return Some((rule.decision.clone(), rule.reason.clone()));
+        }
+    }
+    None
+}
+
+// `summary` is a display-only view of the tool input (see ToolInput::summary); MCP rules
+// match the tool name only, so it never participates in the decision.
+fn trace_mcp(config: &McpConfig, cwd: Option<&str>, tool: &str, summary: String) -> NodeTrace {
+    let matched = config
+        .rules
+        .iter()
+        .find(|rule| rule_matches_cwd(&rule.projects, cwd) && rule.pattern.is_match(tool))
+        .map(|rule| {
+            (
+                rule.decision.clone(),
+                rule.reason.clone(),
+                rule.meta.clone(),
+            )
+        });
+    NodeTrace {
+        shell: "mcp",
+        command: tool.to_string(),
+        args: summary,
         matched,
     }
 }
@@ -1194,6 +1239,155 @@ mod tests {
         let powershell = test_powershell_config();
         assert_eq!(
             handle_bash_tool(&bash, &powershell, None, "pwsh -File x.ps1").map(|(d, _)| d),
+            None
+        );
+    }
+
+    // --- MCP tool gating ---
+
+    fn config_from(toml_str: &str) -> Config {
+        let raw: crate::config::RawConfig = toml::from_str(toml_str).unwrap();
+        Config::from(raw)
+    }
+
+    fn mcp_hook(tool: &str, input_json: &str) -> HookInput {
+        HookInput {
+            tool_name: tool.into(),
+            tool_input: serde_json::from_str(input_json).unwrap(),
+            cwd: None,
+            hook_event_name: None,
+            session_id: None,
+        }
+    }
+
+    #[test]
+    fn dispatch_mcp_glob_deny() {
+        let config = config_from(
+            r#"
+[[mcp.rules]]
+tool = "mcp__playwright__*"
+decision = "deny"
+reason = "no browser"
+"#,
+        );
+        let trace = dispatch(
+            &config,
+            &mcp_hook("mcp__playwright__browser_click", "{}"),
+            None,
+        );
+        assert_eq!(trace.kind, "mcp");
+        assert_eq!(trace.final_decision.map(|(d, _)| d), Some(Decision::Deny));
+    }
+
+    #[test]
+    fn dispatch_mcp_passthrough_is_actionable() {
+        let config = config_from("");
+        let trace = dispatch(
+            &config,
+            &mcp_hook("mcp__playwright__browser_click", r#"{"ref":"e1"}"#),
+            None,
+        );
+        assert_eq!(trace.kind, "mcp");
+        assert!(trace.final_decision.is_none());
+        let nodes = trace.actionable_nodes();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].shell, "mcp");
+        assert_eq!(nodes[0].command, "mcp__playwright__browser_click");
+        assert_eq!(nodes[0].decision, "passthrough");
+    }
+
+    #[test]
+    fn dispatch_mcp_ask_is_actionable() {
+        let config = config_from(
+            r#"
+[[mcp.rules]]
+tool = "mcp__playwright__browser_fill_form"
+decision = "ask"
+"#,
+        );
+        let trace = dispatch(
+            &config,
+            &mcp_hook("mcp__playwright__browser_fill_form", "{}"),
+            None,
+        );
+        assert_eq!(
+            trace.final_decision.as_ref().map(|(d, _)| d),
+            Some(&Decision::Ask)
+        );
+        assert_eq!(trace.actionable_nodes().len(), 1);
+    }
+
+    // The tool name decides; the structured input is only captured for display.
+    #[test]
+    fn dispatch_mcp_summary_does_not_affect_decision() {
+        let config = config_from(
+            r#"
+[[mcp.rules]]
+tool = "mcp__x__y"
+decision = "allow"
+"#,
+        );
+        let trace = dispatch(
+            &config,
+            &mcp_hook("mcp__x__y", r#"{"password":"secret","fields":[1,2,3]}"#),
+            None,
+        );
+        assert_eq!(trace.final_decision.map(|(d, _)| d), Some(Decision::Allow));
+        assert!(trace.nodes[0].args.contains("password"));
+    }
+
+    #[test]
+    fn dispatch_mcp_first_match_wins() {
+        // The specific ask must precede the broad allow to win.
+        let config = config_from(
+            r#"
+[[mcp.rules]]
+tool = "mcp__playwright__browser_fill_form"
+decision = "ask"
+
+[[mcp.rules]]
+tool = "mcp__playwright__*"
+decision = "allow"
+"#,
+        );
+        assert_eq!(
+            dispatch(
+                &config,
+                &mcp_hook("mcp__playwright__browser_fill_form", "{}"),
+                None
+            )
+            .final_decision
+            .map(|(d, _)| d),
+            Some(Decision::Ask)
+        );
+        assert_eq!(
+            dispatch(
+                &config,
+                &mcp_hook("mcp__playwright__browser_click", "{}"),
+                None
+            )
+            .final_decision
+            .map(|(d, _)| d),
+            Some(Decision::Allow)
+        );
+    }
+
+    #[test]
+    fn handle_mcp_project_scoped() {
+        let config = config_from(
+            r#"
+[[mcp.rules]]
+tool = "mcp__*"
+decision = "deny"
+projects = ["/home/user/secret"]
+"#,
+        );
+        assert_eq!(
+            handle_mcp(&config.mcp, Some("/home/user/secret"), "mcp__x__y").map(|(d, _)| d),
+            Some(Decision::Deny)
+        );
+        assert_eq!(
+            handle_mcp(&config.mcp, Some("/home/user/other"), "mcp__x__y"),
             None
         );
     }

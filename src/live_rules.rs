@@ -8,9 +8,9 @@ use crate::queue::write_atomic;
 use std::path::{Path, PathBuf};
 
 pub(crate) struct LiveRule {
-    // "bash", "powershell", or "web-fetch" — picks the rules table.
+    // "bash", "powershell", "web-fetch", or "mcp" — picks the rules table.
     pub(crate) shell: String,
-    // command basename for bash/powershell, or the full URL for web-fetch.
+    // command basename for bash/powershell, the full URL for web-fetch, or the MCP tool name.
     pub(crate) target: String,
     // optional args pattern, scoping the rule to a subcommand (e.g. "push{, **}").
     // None means command-wide (any args) — used when the node had no arguments.
@@ -28,6 +28,7 @@ fn render_rule(r: &LiveRule) -> String {
     let (table, key) = match r.shell.as_str() {
         "web-fetch" => ("web-fetch.rules", "url"),
         "powershell" => ("powershell.rules", "command"),
+        "mcp" => ("mcp.rules", "tool"),
         _ => ("bash.rules", "command"),
     };
     let mut block = format!("\n[[{table}]]\n{key} = {value}\n");
@@ -72,7 +73,7 @@ pub(crate) fn append_rules(path: &Path, rules: &[LiveRule]) -> std::io::Result<(
 mod tests {
     use super::*;
     use crate::config::{Config, RawConfig};
-    use crate::decision::{handle_bash, handle_web_fetch, Decision};
+    use crate::decision::{handle_bash, handle_mcp, handle_web_fetch, Decision};
 
     fn load(path: &Path) -> Config {
         let content = std::fs::read_to_string(path).unwrap();
@@ -175,6 +176,33 @@ mod tests {
         let config = load(&path);
         assert_eq!(
             handle_web_fetch(&config.web_fetch, None, "https://docs.rs/tokio").map(|(d, _)| d),
+            Some(Decision::Allow)
+        );
+    }
+
+    #[test]
+    fn mcp_persists_tool_name_without_args() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("99-live.toml");
+        append_rules(
+            &path,
+            &[LiveRule {
+                shell: "mcp".into(),
+                target: "mcp__playwright__browser_fill_form".into(),
+                args: None,
+                allow: true,
+            }],
+        )
+        .unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("[[mcp.rules]]"));
+        assert!(content.contains("tool = \"mcp__playwright__browser_fill_form\""));
+        assert!(!content.contains("args ="), "mcp rules carry no args scope");
+
+        let config = load(&path);
+        assert_eq!(
+            handle_mcp(&config.mcp, None, "mcp__playwright__browser_fill_form").map(|(d, _)| d),
             Some(Decision::Allow)
         );
     }

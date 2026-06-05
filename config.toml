@@ -84,6 +84,17 @@ decision = "allow"
 url = "/[^?]*/"
 decision = "allow"
 
+# MCP tool gating. Rules key on the full tool name (mcp__<server>__<tool>); glob and
+# /regex/ both work. Matching is on the name only — the tool's structured arguments are
+# never inspected (they are shown read-only in the approval TUI). First match wins, so a
+# specific `ask`/`deny` must precede a broader `allow`.
+[[mcp.rules]]
+tool = "mcp__playwright__browser_fill_form"
+decision = "ask"                       # eyeball form fills in the TUI even if the rest is allowed
+[[mcp.rules]]
+tool = "mcp__playwright__*"
+decision = "allow"
+
 # Per-rule project scoping: restrict a rule to specific directories
 #
 # [[bash.rules]]
