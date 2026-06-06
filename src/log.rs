@@ -1,10 +1,14 @@
 // JSONL logging. Best-effort: any failure here is swallowed so a gate decision already
 // printed to Claude Code is never blocked or altered by a logging problem.
 
-use crate::config::{expand_tilde, LogConfig};
+use crate::config::{expand_tilde, load_config, LogConfig};
 use crate::decision::{deciding_index, InvocationTrace};
+use crate::queue::write_atomic;
+use std::path::{Path, PathBuf};
 
 pub(crate) const DEFAULT_LOG_PATH: &str = "~/.local/state/lord-kali/hook.jsonl";
+// Log entries older than this are dropped by `prune-logs` and the watch housekeeper.
+pub(crate) const DEFAULT_RETAIN_DAYS: u64 = 3;
 
 fn append_log_line(log_config: &LogConfig, line: String) {
     let path_str = log_config.path.as_deref().unwrap_or(DEFAULT_LOG_PATH);
@@ -43,6 +47,100 @@ pub(crate) fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+// Resolve the active log path: an explicit override (tilde-expanded), else the configured
+// `[log] path`, else the default. Shared by the watcher and `prune-logs` so both agree.
+pub(crate) fn resolve_log_path(explicit: Option<&str>) -> PathBuf {
+    if let Some(p) = explicit {
+        return expand_tilde(p);
+    }
+    let config = load_config(None);
+    let path_str = config
+        .log
+        .as_ref()
+        .and_then(|l| l.path.as_deref())
+        .unwrap_or(DEFAULT_LOG_PATH);
+    expand_tilde(path_str)
+}
+
+fn entry_ts_ms(line: &str) -> Option<u64> {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()?
+        .get("ts_ms")?
+        .as_u64()
+}
+
+// Drop entries older than `max_age_days`, rewriting the file atomically. Lines whose ts_ms
+// can't be parsed are kept (we never silently discard data we can't date). A missing file
+// is a no-op. Returns (kept, removed). Best-effort callers (the watcher) ignore the result.
+pub(crate) fn prune_log_file(
+    path: &Path,
+    max_age_days: u64,
+    now_ms: u64,
+) -> std::io::Result<(usize, usize)> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0)),
+        Err(e) => return Err(e),
+    };
+    let cutoff = now_ms.saturating_sub(max_age_days.saturating_mul(86_400_000));
+    let mut kept: Vec<&str> = Vec::new();
+    let mut removed = 0usize;
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if entry_ts_ms(line).is_none_or(|ts| ts >= cutoff) {
+            kept.push(line);
+        } else {
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        let mut out = kept.join("\n");
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        write_atomic(path, &out)?;
+    }
+    Ok((kept.len(), removed))
+}
+
+// `lord-kali prune-logs [--days N] [path]`: drop log entries older than N days (default 7).
+pub(crate) fn prune_logs_cli(args: &[String]) {
+    let mut days = DEFAULT_RETAIN_DAYS;
+    let mut path_arg: Option<&str> = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--days" => {
+                days = match it.next().and_then(|d| d.parse().ok()) {
+                    Some(n) => n,
+                    None => {
+                        eprintln!("lord-kali prune-logs: --days requires a number");
+                        std::process::exit(2);
+                    }
+                };
+            }
+            s if s.starts_with("--") => {
+                eprintln!("lord-kali prune-logs: unknown flag {s}");
+                std::process::exit(2);
+            }
+            s => path_arg = Some(s),
+        }
+    }
+    let path = resolve_log_path(path_arg);
+    match prune_log_file(&path, days, now_ms()) {
+        Ok((kept, removed)) => println!(
+            "lord-kali prune-logs: removed {removed}, kept {kept} (retained < {days}d) in {}",
+            path.display()
+        ),
+        Err(e) => {
+            eprintln!("lord-kali prune-logs: {}: {e}", path.display());
+            std::process::exit(1);
+        }
+    }
 }
 
 // Parse the hook input into an object, stamp ts_ms + lk_event, then let the caller add
@@ -154,5 +252,52 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(v["lk_event"], serde_json::json!("pre_tool_use"));
         assert!(v.get("lk_decision").is_some());
+    }
+
+    // --- prune_log_file ---
+
+    const NOW: u64 = 1_000_000_000_000;
+    const DAY_MS: u64 = 86_400_000;
+
+    #[test]
+    fn prune_drops_old_keeps_recent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("hook.jsonl");
+        let old = format!(r#"{{"ts_ms":{},"x":"old"}}"#, NOW - 8 * DAY_MS);
+        let recent = format!(r#"{{"ts_ms":{},"x":"recent"}}"#, NOW - DAY_MS);
+        std::fs::write(&path, format!("{old}\n{recent}\n")).unwrap();
+
+        assert_eq!(prune_log_file(&path, 7, NOW).unwrap(), (1, 1));
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("recent"));
+        assert!(!content.contains("old"));
+        assert!(content.ends_with('\n'));
+    }
+
+    // Lines we can't date are kept — pruning never silently discards unparseable data.
+    #[test]
+    fn prune_keeps_lines_without_ts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("hook.jsonl");
+        std::fs::write(&path, "not json\n{\"no\":\"ts\"}\n").unwrap();
+        assert_eq!(prune_log_file(&path, 7, NOW).unwrap(), (2, 0));
+    }
+
+    #[test]
+    fn prune_missing_file_is_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("absent.jsonl");
+        assert_eq!(prune_log_file(&path, 7, NOW).unwrap(), (0, 0));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn prune_without_removals_leaves_file_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("hook.jsonl");
+        let recent = format!("{{\"ts_ms\":{},\"x\":\"r\"}}\n", NOW - 1000);
+        std::fs::write(&path, &recent).unwrap();
+        assert_eq!(prune_log_file(&path, 7, NOW).unwrap(), (1, 0));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), recent);
     }
 }

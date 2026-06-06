@@ -2,14 +2,15 @@
 // correlating each pre_tool_use with its post_tool_use so you can see in real time what
 // ran, what is awaiting approval, and which command nodes matched no rule.
 
-use crate::config::{expand_tilde, load_config};
-use crate::log::{now_ms, DEFAULT_LOG_PATH};
+use crate::log::now_ms;
 use std::collections::HashMap;
 use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
 
 const WATCH_POLL_MS: u64 = 200;
 const PENDING_TIMEOUT_MS: u64 = 60_000;
+// The watcher tidies the log on open and once an hour while running (best-effort).
+const PRUNE_INTERVAL_MS: u64 = 3_600_000;
 
 struct Palette {
     color: bool,
@@ -35,19 +36,6 @@ struct PendingPre {
     // For an `ask`, the node in the chain that drove the verdict (`command args — reason`).
     // None for `passthrough` (nothing matched, so nothing "triggered" the rejection).
     deciding: Option<String>,
-}
-
-fn resolve_log_path(explicit: Option<&str>) -> PathBuf {
-    if let Some(p) = explicit {
-        return expand_tilde(p);
-    }
-    let config = load_config(None);
-    let path_str = config
-        .log
-        .as_ref()
-        .and_then(|l| l.path.as_deref())
-        .unwrap_or(DEFAULT_LOG_PATH);
-    expand_tilde(path_str)
 }
 
 fn event_target(v: &serde_json::Value) -> String {
@@ -224,6 +212,13 @@ impl Tailer {
         }
     }
 
+    // Skip to the current end of file without emitting anything. Used right after a prune
+    // rewrites the log, so the retained history is not replayed into the live stream.
+    fn resync_to_end(&mut self) {
+        self.offset = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
+        self.carry.clear();
+    }
+
     fn read_new(&mut self) -> Vec<String> {
         use std::io::{Seek, SeekFrom};
         let mut lines = Vec::new();
@@ -270,7 +265,7 @@ pub(crate) fn watch(args: &[String]) {
 }
 
 fn watch_tail(explicit_path: Option<&str>) {
-    let path = resolve_log_path(explicit_path);
+    let path = crate::log::resolve_log_path(explicit_path);
     let palette = Palette {
         color: std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none(),
     };
@@ -280,10 +275,19 @@ fn watch_tail(explicit_path: Option<&str>) {
         "PASS/ASK go to approval; an indented line shows whether they ran. Ctrl-C to stop.\n"
     );
 
-    let mut tailer = Tailer::new(path);
+    // Tidy before tailing so retained history is not printed as if it were new.
+    let _ = crate::log::prune_log_file(&path, crate::log::DEFAULT_RETAIN_DAYS, now_ms());
+    let mut tailer = Tailer::new(path.clone());
     let mut pending: HashMap<String, PendingPre> = HashMap::new();
+    let mut next_prune_ms = now_ms() + PRUNE_INTERVAL_MS;
 
     loop {
+        let now = now_ms();
+        if now >= next_prune_ms {
+            let _ = crate::log::prune_log_file(&path, crate::log::DEFAULT_RETAIN_DAYS, now);
+            tailer.resync_to_end();
+            next_prune_ms = now + PRUNE_INTERVAL_MS;
+        }
         for line in tailer.read_new() {
             handle_line(&palette, &line, &mut pending);
         }
@@ -295,10 +299,11 @@ fn watch_tail(explicit_path: Option<&str>) {
 // The interactive approval TUI: a scrolling decision stream on top, and a pending-approval
 // pane below where the operator rules on the actionable command nodes of each blocked call.
 mod tui {
-    use super::{event_target, resolve_log_path, unmatched_nodes, Tailer};
+    use super::{event_target, unmatched_nodes, Tailer, PRUNE_INTERVAL_MS};
     use crate::config::{load_config, ApprovalConfig};
     use crate::live_rules::{append_rules, live_rules_path, LiveRule};
     use crate::log::now_ms;
+    use crate::log::{prune_log_file, resolve_log_path, DEFAULT_RETAIN_DAYS};
     use crate::queue::{
         self, write_atomic, write_heartbeat_in, Action, QueueRequest, Verdict, VerdictNode,
     };
@@ -648,7 +653,10 @@ mod tui {
         let state_dir = queue::state_dir(&cfg.approval);
         let qdir = queue::queue_dir_in(&state_dir);
         let live_path = live_rules_path(&cfg.approval);
-        let mut tailer = Tailer::new(resolve_log_path(explicit_path));
+        let log_path = resolve_log_path(explicit_path);
+        // Tidy on open before tailing so retained history is not replayed into the stream.
+        let _ = prune_log_file(&log_path, DEFAULT_RETAIN_DAYS, now_ms());
+        let mut tailer = Tailer::new(log_path.clone());
 
         let mut terminal = ratatui::init();
         let mut app = App::new();
@@ -660,6 +668,7 @@ mod tui {
             &qdir,
             &live_path,
             &cfg.approval,
+            &log_path,
         );
         ratatui::restore();
         clear_attention();
@@ -675,12 +684,23 @@ mod tui {
         qdir: &Path,
         live_path: &Path,
         approval: &ApprovalConfig,
+        log_path: &Path,
     ) -> std::io::Result<()> {
         // usize::MAX forces the first iteration to set the title/taskbar without ringing
         // the bell for approvals that were already waiting when the TUI opened.
         let mut prev_pending = usize::MAX;
+        // Already pruned once on open; schedule the next housekeeping pass an hour out.
+        let mut next_prune_ms = now_ms() + PRUNE_INTERVAL_MS;
         loop {
             let _ = write_heartbeat_in(state_dir);
+
+            let now = now_ms();
+            if now >= next_prune_ms {
+                // Best-effort housekeeping; a prune error must never disturb the watch loop.
+                let _ = prune_log_file(log_path, DEFAULT_RETAIN_DAYS, now);
+                tailer.resync_to_end();
+                next_prune_ms = now + PRUNE_INTERVAL_MS;
+            }
 
             for line in tailer.read_new() {
                 if let Some(l) = stream_line(&line) {

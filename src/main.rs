@@ -65,12 +65,11 @@ impl ToolInput {
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    if args.next().as_deref() == Some("watch") {
-        let rest: Vec<String> = args.collect();
-        watch::watch(&rest);
-        return;
+    match args.next().as_deref() {
+        Some("watch") => watch::watch(&args.collect::<Vec<_>>()),
+        Some("prune-logs") => log::prune_logs_cli(&args.collect::<Vec<_>>()),
+        _ => run_hook(),
     }
-    run_hook();
 }
 
 fn run_hook() {

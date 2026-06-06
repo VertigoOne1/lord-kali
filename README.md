@@ -289,12 +289,28 @@ To capture `post_tool_use` records you must also register the binary as a `PostT
 
 Logging is best-effort: if the log file cannot be created or written, the failure is swallowed so it can never block or alter a gate decision.
 
+### Pruning the log
+
+The log is append-only and grows with every tool call. To keep it bounded, drop entries older than a retention window:
+
+```sh
+lord-kali prune-logs                 # drop entries older than 3 days (default)
+lord-kali prune-logs --days 7        # keep a week instead
+lord-kali prune-logs --days 3 /path/to.jsonl  # an explicit log file
+```
+
+It rewrites the file atomically, keeping only entries whose `ts_ms` is within the window (lines that can't be dated are kept — pruning never silently discards data it can't read). `lord-kali watch` also runs this automatically on open and once an hour while running (best-effort, 3-day window), so a live watcher self-maintains. For headless retention, schedule the command — e.g. a daily Windows Task Scheduler job:
+
+```powershell
+schtasks /create /tn "lord-kali prune" /tr "lord-kali prune-logs" /sc daily /st 03:00
+```
+
 ### `lk_decision` (pre_tool_use only)
 
 `pre_tool_use` records carry an `lk_decision` object describing how the gate ruled. It is built alongside the decision and never affects it:
 
 - **`final`**: `allow`, `deny`, `ask`, or `passthrough`
-- **`kind`**: `command_chain`, `web_fetch`, `worktree_protection`, or `unknown`
+- **`kind`**: `command_chain`, `web_fetch`, `mcp`, `worktree_protection`, or `unknown`
 - **`reason`**: the message shown to Claude (absent when `final` is `passthrough`)
 - **`deciding`**: the node that set the final verdict — the first deny, else the first ask, else the first matched allow — or `null` if nothing matched
 - **`nodes`**: every command (or URL) extracted from the call. Each node records its `shell`, `command`, `args`, resolved `decision`, and whether it `matched` a rule. When a rule matched, the node also carries that rule's `reason`, `rule_kind` (`explicit` or `allowed_commands`), `rule_command`, `rule_args`, and `source_file` so you can trace which rule in which config file made the call.
