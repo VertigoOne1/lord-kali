@@ -1,6 +1,8 @@
 mod config;
 mod decision;
+mod eval;
 mod live_rules;
+mod llm;
 mod log;
 mod parse;
 mod queue;
@@ -68,6 +70,7 @@ fn main() {
     match args.next().as_deref() {
         Some("watch") => watch::watch(&args.collect::<Vec<_>>()),
         Some("prune-logs") => log::prune_logs_cli(&args.collect::<Vec<_>>()),
+        Some("eval") => eval::eval_cli(&args.collect::<Vec<_>>()),
         _ => run_hook(),
     }
 }

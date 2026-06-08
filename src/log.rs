@@ -12,24 +12,58 @@ pub(crate) const DEFAULT_RETAIN_DAYS: u64 = 3;
 
 fn append_log_line(log_config: &LogConfig, line: String) {
     let path_str = log_config.path.as_deref().unwrap_or(DEFAULT_LOG_PATH);
-    let expanded = expand_tilde(path_str);
+    append_line_to_path(&expand_tilde(path_str), line);
+}
 
-    if let Some(parent) = expanded.parent() {
+// Best-effort append to an explicit log path. Any IO failure is swallowed (logging never
+// blocks a gate or, here, an auto-approval).
+fn append_line_to_path(path: &Path, line: String) {
+    if let Some(parent) = path.parent() {
         if std::fs::create_dir_all(parent).is_err() {
             return;
         }
     }
-
     use std::io::Write;
     let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&expanded)
+        .open(path)
     else {
         return;
     };
-
     let _ = writeln!(file, "{}", line);
+}
+
+// Record that the LLM auto-approved a passthrough call (Phase 2). Mirrors the jsonl shape of
+// gate records so `watch --tail` and audits can see exactly which approvals the model made.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn log_llm_auto_approve(
+    path: &Path,
+    id: &str,
+    tool: &str,
+    target: &str,
+    cwd: Option<&str>,
+    model: &str,
+    reason: &str,
+    confidence: f32,
+) {
+    let line = serde_json::json!({
+        "ts_ms": now_ms(),
+        "lk_event": "llm_auto_approve",
+        "id": id,
+        "tool_name": tool,
+        "target": target,
+        "cwd": cwd,
+        "lk_llm": {
+            "model": model,
+            "verdict": "safe",
+            "confidence": confidence,
+            "reason": reason,
+            "auto_applied": true,
+        },
+    })
+    .to_string();
+    append_line_to_path(path, line);
 }
 
 pub(crate) fn log_invocation(log_config: &LogConfig, input: &str, trace: &InvocationTrace) {

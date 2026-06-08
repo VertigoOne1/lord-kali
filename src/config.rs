@@ -357,6 +357,7 @@ impl Config {
                 live_rules: raw.approval.live_rules,
                 state_dir: raw.approval.state_dir,
                 guardrail_commands: raw.approval.guardrail_commands,
+                llm: raw.approval.llm.map(ApprovalLlmConfig::from),
             },
         }
     }
@@ -466,6 +467,8 @@ pub(crate) struct ApprovalConfig {
     pub(crate) live_rules: Option<String>,
     pub(crate) state_dir: Option<String>,
     pub(crate) guardrail_commands: Vec<String>,
+    // Optional LLM auto-approval (Phase 2). None or disabled => the watch never consults a model.
+    pub(crate) llm: Option<ApprovalLlmConfig>,
 }
 
 impl ApprovalConfig {
@@ -478,6 +481,7 @@ impl ApprovalConfig {
             live_rules: other.live_rules.or(self.live_rules),
             state_dir: other.state_dir.or(self.state_dir),
             guardrail_commands: self.guardrail_commands,
+            llm: other.llm.or(self.llm),
         }
     }
 
@@ -499,6 +503,66 @@ pub(crate) struct RawApprovalConfig {
     pub(crate) state_dir: Option<String>,
     #[serde(default)]
     pub(crate) guardrail_commands: Vec<String>,
+    pub(crate) llm: Option<RawApprovalLlmConfig>,
+}
+
+// Runtime LLM auto-approval (Phase 2). When `enabled` and the watch is running, a passthrough
+// request the operator hasn't touched after `queue_wait_ms` is sent to the model; a confident
+// `safe` becomes a proposal that auto-applies after `proposal_wait_ms` if still untouched.
+// Anything else degrades to passthrough. Timings are sized to fit the 50s hook self-timeout.
+pub(crate) struct ApprovalLlmConfig {
+    pub(crate) enabled: bool,
+    pub(crate) model: String,
+    pub(crate) base_url: String,
+    // Name of the env var holding the API key (kept out of config files).
+    pub(crate) api_key_env: String,
+    pub(crate) queue_wait_ms: u64,
+    pub(crate) proposal_wait_ms: u64,
+    pub(crate) timeout_ms: u64,
+    pub(crate) max_attempts: u32,
+    pub(crate) min_confidence: f32,
+    // Prompt override; None => the locked default in llm.rs.
+    pub(crate) system: Option<String>,
+    pub(crate) user: Option<String>,
+}
+
+impl From<RawApprovalLlmConfig> for ApprovalLlmConfig {
+    fn from(r: RawApprovalLlmConfig) -> Self {
+        use crate::llm;
+        ApprovalLlmConfig {
+            enabled: r.enabled,
+            model: r.model.unwrap_or_else(|| llm::DEFAULT_MODEL.to_string()),
+            base_url: r
+                .base_url
+                .unwrap_or_else(|| llm::DEFAULT_BASE_URL.to_string()),
+            api_key_env: r
+                .api_key_env
+                .unwrap_or_else(|| "OPENROUTER_API_KEY".to_string()),
+            queue_wait_ms: r.queue_wait_ms.unwrap_or(15_000),
+            proposal_wait_ms: r.proposal_wait_ms.unwrap_or(10_000),
+            timeout_ms: r.timeout_ms.unwrap_or(llm::DEFAULT_TIMEOUT_MS),
+            max_attempts: r.max_attempts.unwrap_or(llm::DEFAULT_MAX_ATTEMPTS),
+            min_confidence: r.min_confidence.unwrap_or(0.0),
+            system: r.system,
+            user: r.user,
+        }
+    }
+}
+
+#[derive(Default, Deserialize)]
+pub(crate) struct RawApprovalLlmConfig {
+    #[serde(default)]
+    pub(crate) enabled: bool,
+    pub(crate) model: Option<String>,
+    pub(crate) base_url: Option<String>,
+    pub(crate) api_key_env: Option<String>,
+    pub(crate) queue_wait_ms: Option<u64>,
+    pub(crate) proposal_wait_ms: Option<u64>,
+    pub(crate) timeout_ms: Option<u64>,
+    pub(crate) max_attempts: Option<u32>,
+    pub(crate) min_confidence: Option<f32>,
+    pub(crate) system: Option<String>,
+    pub(crate) user: Option<String>,
 }
 
 pub(crate) fn expand_tilde(path: &str) -> PathBuf {

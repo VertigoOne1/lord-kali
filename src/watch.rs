@@ -300,10 +300,14 @@ fn watch_tail(explicit_path: Option<&str>) {
 // pane below where the operator rules on the actionable command nodes of each blocked call.
 mod tui {
     use super::{event_target, unmatched_nodes, Tailer, PRUNE_INTERVAL_MS};
-    use crate::config::{load_config, ApprovalConfig};
+    use crate::config::{load_config, ApprovalConfig, ApprovalLlmConfig};
     use crate::live_rules::{append_rules, live_rules_path, LiveRule};
+    use crate::llm::{
+        judge, parse_judgement, LlmConfig, PromptTemplate, PromptVars, Verdict as LlmVerdict,
+        DEFAULT_BACKOFF_MS, DEFAULT_SYSTEM_PROMPT, DEFAULT_USER_TEMPLATE,
+    };
     use crate::log::now_ms;
-    use crate::log::{prune_log_file, resolve_log_path, DEFAULT_RETAIN_DAYS};
+    use crate::log::{log_llm_auto_approve, prune_log_file, resolve_log_path, DEFAULT_RETAIN_DAYS};
     use crate::queue::{
         self, write_atomic, write_heartbeat_in, Action, QueueRequest, Verdict, VerdictNode,
     };
@@ -315,6 +319,7 @@ mod tui {
     use ratatui::{DefaultTerminal, Frame};
     use std::collections::HashMap;
     use std::path::Path;
+    use std::sync::mpsc::{channel, Receiver, Sender};
     use std::time::Duration;
 
     const POLL_MS: u64 = 200;
@@ -648,6 +653,256 @@ mod tui {
         let _ = out.flush();
     }
 
+    // ---- LLM auto-approval (Phase 2) -----------------------------------------------------
+    //
+    // A passthrough the operator hasn't touched for `queue_wait_ms` is sent to the model on a
+    // worker thread (never blocking the TUI). A confident `safe` becomes a Proposed entry that
+    // auto-applies — as a TIGHT, persisted allow rule — after `proposal_wait_ms` if still
+    // untouched. Any other model outcome (unsafe / malformed / transport error) becomes
+    // Declined and the call simply rides out to the hook's own fallback. The model never
+    // auto-denies. This whole path is inert unless `[approval.llm] enabled` and the key is set.
+
+    // What a worker thread reports back; only a confident `safe` is actionable.
+    enum LlmOutcome {
+        Safe { reason: String, confidence: f32 },
+        NotSafe,
+    }
+
+    // Per-request state, keyed by request id so it survives sync_pending rebuilding the list.
+    enum LlmPhase {
+        Requested,
+        Proposed {
+            reason: String,
+            confidence: f32,
+            at_ms: u64,
+        },
+        Declined,
+    }
+
+    // The fields a worker needs, pulled out so spawning doesn't borrow the pending list.
+    struct SpawnReq {
+        id: String,
+        target: String,
+        tool: String,
+        cwd: Option<String>,
+    }
+
+    struct AutoApprover {
+        cfg: LlmConfig,
+        prompt: PromptTemplate,
+        queue_wait_ms: u64,
+        proposal_wait_ms: u64,
+        min_confidence: f32,
+        tx: Sender<(String, LlmOutcome)>,
+        rx: Receiver<(String, LlmOutcome)>,
+        state: HashMap<String, LlmPhase>,
+    }
+
+    impl AutoApprover {
+        // Build from config + the API key env var. Err (with a reason to surface) when the key
+        // is unset, so the caller degrades to today's behavior rather than failing.
+        fn from_config(llm: &ApprovalLlmConfig) -> Result<Self, String> {
+            let api_key = std::env::var(&llm.api_key_env)
+                .ok()
+                .filter(|k| !k.is_empty())
+                .ok_or_else(|| format!("${} not set", llm.api_key_env))?;
+            let (tx, rx) = channel();
+            Ok(AutoApprover {
+                cfg: LlmConfig {
+                    model: llm.model.clone(),
+                    base_url: llm.base_url.clone(),
+                    api_key,
+                    timeout_ms: llm.timeout_ms,
+                    max_attempts: llm.max_attempts,
+                    backoff_ms: DEFAULT_BACKOFF_MS,
+                },
+                prompt: PromptTemplate {
+                    name: "runtime".into(),
+                    system: llm
+                        .system
+                        .clone()
+                        .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string()),
+                    user: llm
+                        .user
+                        .clone()
+                        .unwrap_or_else(|| DEFAULT_USER_TEMPLATE.to_string()),
+                },
+                queue_wait_ms: llm.queue_wait_ms,
+                proposal_wait_ms: llm.proposal_wait_ms,
+                min_confidence: llm.min_confidence,
+                tx,
+                rx,
+                state: HashMap::new(),
+            })
+        }
+
+        fn spawn(&self, s: &SpawnReq) {
+            let rendered = self.prompt.render(&PromptVars {
+                command: &s.target,
+                tool: &s.tool,
+                cwd: s.cwd.as_deref().unwrap_or(""),
+                policy: "",
+            });
+            let cfg = self.cfg.clone();
+            let id = s.id.clone();
+            let tx = self.tx.clone();
+            let min = self.min_confidence;
+            std::thread::spawn(move || {
+                let outcome = match judge(&cfg, &rendered, now_ms).result {
+                    Ok(resp) => match parse_judgement(&resp.content) {
+                        Ok(j) if j.verdict == LlmVerdict::Safe && j.confidence >= min => {
+                            LlmOutcome::Safe {
+                                reason: j.reason,
+                                confidence: j.confidence,
+                            }
+                        }
+                        _ => LlmOutcome::NotSafe,
+                    },
+                    Err(_) => LlmOutcome::NotSafe,
+                };
+                let _ = tx.send((id, outcome));
+            });
+        }
+
+        // Advance the state machine once per loop. Ingests worker results, fires new requests
+        // whose queue wait elapsed, and auto-applies proposals whose operator window elapsed
+        // (writing the verdict + persisting a tight allow rule + logging). Mutates app.pending.
+        fn tick(
+            &mut self,
+            app: &mut App,
+            qdir: &Path,
+            live_path: &Path,
+            log_path: &Path,
+            now: u64,
+        ) {
+            while let Ok((id, outcome)) = self.rx.try_recv() {
+                if let Some(phase) = self.state.get_mut(&id) {
+                    *phase = match outcome {
+                        LlmOutcome::Safe { reason, confidence } => LlmPhase::Proposed {
+                            reason,
+                            confidence,
+                            at_ms: now,
+                        },
+                        LlmOutcome::NotSafe => LlmPhase::Declined,
+                    };
+                }
+            }
+
+            // Forget state for requests the operator resolved or that were swept.
+            let live: std::collections::HashSet<String> =
+                app.pending.iter().map(|p| p.request.id.clone()).collect();
+            self.state.retain(|id, _| live.contains(id));
+
+            let mut to_spawn: Vec<SpawnReq> = Vec::new();
+            let mut to_apply: Vec<usize> = Vec::new();
+            for (i, p) in app.pending.iter().enumerate() {
+                match self.state.get(&p.request.id) {
+                    None if now.saturating_sub(p.request.ts_ms) >= self.queue_wait_ms => {
+                        to_spawn.push(SpawnReq {
+                            id: p.request.id.clone(),
+                            target: p.request.target.clone(),
+                            tool: p.request.tool.clone(),
+                            cwd: p.request.cwd.clone(),
+                        });
+                    }
+                    Some(LlmPhase::Proposed { at_ms, .. })
+                        if now.saturating_sub(*at_ms) >= self.proposal_wait_ms =>
+                    {
+                        to_apply.push(i);
+                    }
+                    _ => {}
+                }
+            }
+
+            for s in &to_spawn {
+                self.spawn(s);
+                app.stream
+                    .push(stream_note(&format!("consulting model on: {}", s.target)));
+                self.state.insert(s.id.clone(), LlmPhase::Requested);
+            }
+
+            // Apply highest index first so earlier removals don't shift later indices.
+            to_apply.sort_unstable_by(|a, b| b.cmp(a));
+            for i in to_apply {
+                let (reason, confidence) = match self.state.get(&app.pending[i].request.id) {
+                    Some(LlmPhase::Proposed {
+                        reason, confidence, ..
+                    }) => (reason.clone(), *confidence),
+                    _ => continue,
+                };
+                let p = &mut app.pending[i];
+                p.choices = vec![Choice::Allow; p.request.nodes.len()];
+                p.tight = vec![true; p.request.nodes.len()];
+                let (verdict, live_rules) = build_verdict(p, CommitMode::Always);
+
+                let vpath = qdir.join(format!("{}.verdict.json", verdict.id));
+                if let Ok(j) = serde_json::to_string(&verdict) {
+                    let _ = write_atomic(&vpath, &j);
+                }
+                let _ = append_rules(live_path, &live_rules);
+                log_llm_auto_approve(
+                    log_path,
+                    &p.request.id,
+                    &p.request.tool,
+                    &p.request.target,
+                    p.request.cwd.as_deref(),
+                    &self.cfg.model,
+                    &reason,
+                    confidence,
+                );
+                app.stream.push(stream_note(&format!(
+                    "auto-approved (model): {} — {reason}",
+                    p.request.target
+                )));
+
+                let id = p.request.id.clone();
+                app.pending.remove(i);
+                self.state.remove(&id);
+            }
+            if app.focus >= app.pending.len() {
+                app.focus = app.pending.len().saturating_sub(1);
+            }
+        }
+    }
+
+    // A dim stream line for model activity, distinct from the gate-decision stream lines.
+    fn stream_note(msg: &str) -> Line<'static> {
+        Line::from(vec![
+            Span::styled(
+                "  llm  ",
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(msg.to_string(), Style::default().fg(Color::DarkGray)),
+        ])
+    }
+
+    // Build the auto-approver if configured + enabled + the key is present. On enabled-but-no-key
+    // it pushes a one-line warning to the stream and returns None (degrade, never fail).
+    fn build_auto(approval: &ApprovalConfig, app: &mut App) -> Option<AutoApprover> {
+        let llm = approval.llm.as_ref()?;
+        if !llm.enabled {
+            return None;
+        }
+        match AutoApprover::from_config(llm) {
+            Ok(a) => {
+                app.stream.push(stream_note(&format!(
+                    "auto-approval on: {} ({}s queue, {}s proposal)",
+                    a.cfg.model,
+                    a.queue_wait_ms / 1000,
+                    a.proposal_wait_ms / 1000
+                )));
+                Some(a)
+            }
+            Err(e) => {
+                app.stream
+                    .push(stream_note(&format!("auto-approval disabled: {e}")));
+                None
+            }
+        }
+    }
+
     pub(crate) fn run(explicit_path: Option<&str>) -> std::io::Result<()> {
         let cfg = load_config(None);
         let state_dir = queue::state_dir(&cfg.approval);
@@ -660,6 +915,7 @@ mod tui {
 
         let mut terminal = ratatui::init();
         let mut app = App::new();
+        let mut auto = build_auto(&cfg.approval, &mut app);
         let result = run_loop(
             &mut terminal,
             &mut app,
@@ -669,6 +925,7 @@ mod tui {
             &live_path,
             &cfg.approval,
             &log_path,
+            &mut auto,
         );
         ratatui::restore();
         clear_attention();
@@ -685,6 +942,7 @@ mod tui {
         live_path: &Path,
         approval: &ApprovalConfig,
         log_path: &Path,
+        auto: &mut Option<AutoApprover>,
     ) -> std::io::Result<()> {
         // usize::MAX forces the first iteration to set the title/taskbar without ringing
         // the bell for approvals that were already waiting when the TUI opened.
@@ -713,6 +971,9 @@ mod tui {
             }
 
             sync_pending(app, qdir, approval);
+            if let Some(a) = auto.as_mut() {
+                a.tick(app, qdir, live_path, log_path, now);
+            }
             let count = app.pending.len();
             if count != prev_pending {
                 set_attention(count);

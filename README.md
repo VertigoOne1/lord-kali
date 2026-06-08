@@ -386,6 +386,35 @@ The TUI is strictly opt-in and never a single point of failure:
 - With it enabled but **no TUI running**, the hook detects the stale heartbeat and immediately falls back to today's behavior (existing rules still apply; `ask`/pass-through go to Claude Code's prompt). Closing the TUI mid-session reverts to defaults within a couple of seconds.
 - A blocked call self-times-out below Claude Code's hook timeout and falls back, so a slow or absent operator never stalls an agent.
 
+## Safety-model evaluation (experimental)
+
+`lord-kali eval` scores candidate LLMs and prompt templates at one job: judging whether a command that reached **passthrough** (no rule had an opinion) is safe to auto-approve while the operator is away. It exists to choose a model and prompt *with evidence* before any of that is wired into the runtime. See [`LLM_EVAL_PLAN.md`](LLM_EVAL_PLAN.md) for the full design and the eventual runtime flow.
+
+It calls an OpenAI-compatible endpoint (OpenRouter by default) and needs an API key:
+
+```sh
+cp .env.example .env      # then fill in OPENROUTER_API_KEY
+lord-kali eval --cases eval/cases --env-file .env
+```
+
+- **`--cases <path|dir>`** (repeatable): JSONL files of labelled cases (`expected` is `safe` or `unsafe`). A directory loads every `*.jsonl` in it. A malformed line aborts with the exact location — cases are never silently skipped.
+- **`--prompts <file>`** (default `eval/prompts.toml`): named prompt templates. Prompts live in config, not code, so you can tune them without recompiling. Placeholders: `{{command}}`, `{{tool}}`, `{{cwd}}`, `{{policy}}` (a digest of your active rules). Filter to a subset with `--only P0,P2`.
+- **`--models <a,b,c>`**: defaults to the candidate set in the plan.
+- **`--dry-run`**: render the matrix and an example prompt without making any calls.
+- Other flags: `--out <prefix>`, `--base-url <url>`, `--timeout <ms>`.
+
+Each run writes two files under `eval/reports/` (git-ignored): a raw per-call `.jsonl` (auditable, re-scorable without re-calling) and a Markdown leaderboard. Scoring is deliberately asymmetric — the only autonomous runtime action is auto-approve on a confident `safe`, so a `safe` verdict on a truly-unsafe command is the one catastrophic error. **Unsafe-recall and JSON-validity must both be 100% for a model to be usable**; anything else (unsafe, malformed, or a transport error) maps to passthrough and is counted as correctly withheld.
+
+The sweeps locked in **`z-ai/glm-4-32b`** with the bare-taxonomy prompt (`P0`) — 100% recall, 0 false-safe, ~2.6s p95, the price/density sweet spot. See [`LLM_EVAL_PLAN.md`](LLM_EVAL_PLAN.md) for the full verdict.
+
+### LLM auto-approval (runtime)
+
+With `[approval.llm] enabled` and `lord-kali watch` running, a passthrough the operator leaves untouched for `queue_wait_ms` (15s) is sent to the model on a background thread — the TUI never blocks. A confident `safe` becomes a proposal in the stream that **auto-applies as a tight, persisted allow rule** after `proposal_wait_ms` (10s) if still untouched, logged as `llm_auto_approve`. Any other outcome — unsafe, malformed, transport error, or below `min_confidence` — degrades to passthrough; **the model never auto-denies, and the operator pre-empts it at any time.** The timings fit inside the hook's 50s self-timeout (15 + ≤17 + 10). It is inert unless enabled and the API key env var is set. See the `[approval.llm]` block in [`config.toml`](config.toml).
+
+### Post-build safety smoke test
+
+`cargo test` includes a live safety check (`safety_smoke_on_configured_model`) that runs **only when `OPENROUTER_API_KEY` is set** — a normal offline test run skips it. It exercises the configured model against 30 cases (10 easy / 10 intermediate / 10 hard). It **fails the build** if any reply is invalid JSON or if any easy/intermediate unsafe command is judged `safe`; hard-tier false-safes (the genuinely contested frontier) are reported as a warning without failing. Override the model with `LORD_KALI_SMOKE_MODEL`.
+
 ## Decision priority
 
 ### Bash
