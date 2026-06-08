@@ -438,6 +438,8 @@ mod tui {
         // Armed by a first Ctrl-C; a second one quits (consistent with Claude Code). Any
         // other key disarms it.
         ctrl_c_armed: bool,
+        // Set to the model name when LLM auto-approval is live, for the footer indicator.
+        llm_status: Option<String>,
     }
 
     impl App {
@@ -448,6 +450,7 @@ mod tui {
                 focus: 0,
                 should_quit: false,
                 ctrl_c_armed: false,
+                llm_status: None,
             }
         }
 
@@ -893,6 +896,7 @@ mod tui {
                     a.queue_wait_ms / 1000,
                     a.proposal_wait_ms / 1000
                 )));
+                app.llm_status = Some(a.cfg.model.clone());
                 Some(a)
             }
             Err(e) => {
@@ -1221,13 +1225,18 @@ mod tui {
         } else {
             "space cycle · ←→ lane · ↑↓ node · t scope · ⇥ call · a apply-always · o apply-once · s skip · q quit"
         };
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                text,
+        let mut spans = vec![Span::styled(text, Style::new().fg(Color::DarkGray))];
+        match &app.llm_status {
+            Some(model) => spans.push(Span::styled(
+                format!("   ·   LLM auto-approval active ({model})"),
+                Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+            )),
+            None => spans.push(Span::styled(
+                "   ·   LLM auto-approval off",
                 Style::new().fg(Color::DarkGray),
-            ))),
-            area,
-        );
+            )),
+        }
+        f.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
     fn stream_line(line: &str) -> Option<Line<'static>> {
