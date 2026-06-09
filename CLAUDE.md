@@ -48,3 +48,21 @@ In accordance with the established principles and previous PRDs, the implementat
 
 - Format code with `cargo fmt`
 - Keep `cargo test` green and `cargo clippy` clean
+
+## Build & install
+
+`make install` (build release + copy to `~/.local/bin/lord-kali`) is the canonical flow, but
+`make` is not available on Windows. The equivalent steps:
+
+```powershell
+cargo build --release
+Copy-Item target\release\lord-kali.exe (Join-Path $HOME ".local\bin\lord-kali.exe") -Force
+```
+
+Runtime changes (anything under `watch`, the LLM gate, decision/parse logic) only take effect
+once the installed binary is replaced — the per-command hook and `lord-kali watch` both run the
+copy at `~/.local/bin/lord-kali.exe`, not the build output.
+
+**The copy fails while `lord-kali watch` is running** — Windows locks the running exe
+(`The process cannot access the file ... being used by another process`). Stop the watch, copy,
+then restart it.
