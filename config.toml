@@ -18,8 +18,8 @@ path = "~/.local/state/lord-kali/hook.jsonl"
 # guardrail_commands = ["terraform", "kubectl"]
 
 # LLM auto-approval (opt-in; default off). When enabled AND `lord-kali watch` is running, a
-# passthrough the operator hasn't touched for `queue_wait_ms` is sent to a safety model. A
-# confident "safe" becomes a proposal that auto-applies as a TIGHT allow rule after
+# passthrough the operator hasn't touched for `queue_wait_ms` is sent to a safety model (only
+# Bash/PowerShell calls — MCP and WebFetch skip it). A "safe" verdict becomes a proposal that auto-applies as a TIGHT allow rule after
 # `proposal_wait_ms` if still untouched. Anything else (unsafe/malformed/error) just passes
 # through — the model never auto-denies. The key is read from the named env var, never config.
 # [approval.llm]
@@ -30,7 +30,6 @@ path = "~/.local/state/lord-kali/hook.jsonl"
 # proposal_wait_ms = 10000          # operator grace after a proposal before auto-applying
 # timeout_ms = 8000                 # per-attempt; with 2 attempts fits the 50s hook budget
 # max_attempts = 2
-# min_confidence = 0.0
 # base_url = "https://openrouter.ai/api/v1/chat/completions"
 # The prompt defaults to the locked taxonomy in code; override here to tune without rebuilding.
 # system = "..."

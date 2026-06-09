@@ -520,7 +520,6 @@ pub(crate) struct ApprovalLlmConfig {
     pub(crate) proposal_wait_ms: u64,
     pub(crate) timeout_ms: u64,
     pub(crate) max_attempts: u32,
-    pub(crate) min_confidence: f32,
     // Prompt override; None => the locked default in llm.rs.
     pub(crate) system: Option<String>,
     pub(crate) user: Option<String>,
@@ -542,7 +541,6 @@ impl From<RawApprovalLlmConfig> for ApprovalLlmConfig {
             proposal_wait_ms: r.proposal_wait_ms.unwrap_or(10_000),
             timeout_ms: r.timeout_ms.unwrap_or(llm::DEFAULT_TIMEOUT_MS),
             max_attempts: r.max_attempts.unwrap_or(llm::DEFAULT_MAX_ATTEMPTS),
-            min_confidence: r.min_confidence.unwrap_or(0.0),
             system: r.system,
             user: r.user,
         }
@@ -560,7 +558,6 @@ pub(crate) struct RawApprovalLlmConfig {
     pub(crate) proposal_wait_ms: Option<u64>,
     pub(crate) timeout_ms: Option<u64>,
     pub(crate) max_attempts: Option<u32>,
-    pub(crate) min_confidence: Option<f32>,
     pub(crate) system: Option<String>,
     pub(crate) user: Option<String>,
 }

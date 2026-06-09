@@ -666,13 +666,12 @@ mod tui {
     // auto-denies. This whole path is inert unless `[approval.llm] enabled` and the key is set.
 
     // What a worker thread reports back — full detail so every consult is logged, not just the
-    // ones that auto-apply. `kind` is "safe" | "unsafe" | "malformed" | "error"; the main loop
-    // decides actionability (safe AND confidence ≥ min).
+    // ones that auto-apply. `kind` is "safe" | "unsafe" | "malformed" | "error"; only a "safe"
+    // is actionable (the model never auto-denies).
     struct LlmReport {
         target: String,
         kind: &'static str,
         reason: Option<String>,
-        confidence: Option<f32>,
         latency_ms: u64,
         detail: Option<String>,
     }
@@ -680,11 +679,7 @@ mod tui {
     // Per-request state, keyed by request id so it survives sync_pending rebuilding the list.
     enum LlmPhase {
         Requested,
-        Proposed {
-            reason: String,
-            confidence: f32,
-            at_ms: u64,
-        },
+        Proposed { reason: String, at_ms: u64 },
         Declined,
     }
 
@@ -696,12 +691,18 @@ mod tui {
         cwd: Option<String>,
     }
 
+    // The model is a *shell-command* safety gate, so only Bash/PowerShell calls are ever
+    // consulted. MCP tools and WebFetch don't carry a shell command to reason about — they
+    // skip the model entirely and ride out to the operator/hook fallback.
+    fn is_shell_tool(tool: &str) -> bool {
+        matches!(tool, "Bash" | "PowerShell")
+    }
+
     struct AutoApprover {
         cfg: LlmConfig,
         prompt: PromptTemplate,
         queue_wait_ms: u64,
         proposal_wait_ms: u64,
-        min_confidence: f32,
         tx: Sender<(String, LlmReport)>,
         rx: Receiver<(String, LlmReport)>,
         state: HashMap<String, LlmPhase>,
@@ -738,7 +739,6 @@ mod tui {
                 },
                 queue_wait_ms: llm.queue_wait_ms,
                 proposal_wait_ms: llm.proposal_wait_ms,
-                min_confidence: llm.min_confidence,
                 tx,
                 rx,
                 state: HashMap::new(),
@@ -768,7 +768,6 @@ mod tui {
                                 LlmVerdict::Unsafe => "unsafe",
                             },
                             reason: Some(j.reason),
-                            confidence: Some(j.confidence),
                             latency_ms,
                             detail: None,
                         },
@@ -776,7 +775,6 @@ mod tui {
                             target,
                             kind: "malformed",
                             reason: None,
-                            confidence: None,
                             latency_ms,
                             detail: Some(e.to_string()),
                         },
@@ -785,7 +783,6 @@ mod tui {
                         target,
                         kind: "error",
                         reason: None,
-                        confidence: None,
                         latency_ms,
                         detail: Some(e.to_string()),
                     },
@@ -806,12 +803,10 @@ mod tui {
             now: u64,
         ) {
             while let Ok((id, rep)) = self.rx.try_recv() {
-                let proposable =
-                    rep.kind == "safe" && rep.confidence.is_some_and(|c| c >= self.min_confidence);
+                let proposable = rep.kind == "safe";
                 let note = if proposable {
                     format!(
-                        "model: SAFE {:.0}% — {} · auto-approve in {}s unless you act",
-                        rep.confidence.unwrap_or(0.0) * 100.0,
+                        "model: SAFE — {} · auto-approve in {}s unless you act",
                         rep.reason.as_deref().unwrap_or(""),
                         self.proposal_wait_ms / 1000
                     )
@@ -830,7 +825,6 @@ mod tui {
                     *phase = if proposable {
                         LlmPhase::Proposed {
                             reason: rep.reason.clone().unwrap_or_default(),
-                            confidence: rep.confidence.unwrap_or(0.0),
                             at_ms: now,
                         }
                     } else {
@@ -846,7 +840,6 @@ mod tui {
                         "target": rep.target,
                         "verdict": rep.kind,
                         "reason": rep.reason,
-                        "confidence": rep.confidence,
                         "latency_ms": rep.latency_ms,
                         "detail": rep.detail,
                         "will_auto_approve": proposable,
@@ -863,7 +856,9 @@ mod tui {
             let mut to_apply: Vec<usize> = Vec::new();
             for (i, p) in app.pending.iter().enumerate() {
                 match self.state.get(&p.request.id) {
-                    None if now.saturating_sub(p.request.ts_ms) >= self.queue_wait_ms => {
+                    None if is_shell_tool(&p.request.tool)
+                        && now.saturating_sub(p.request.ts_ms) >= self.queue_wait_ms =>
+                    {
                         to_spawn.push(SpawnReq {
                             id: p.request.id.clone(),
                             target: p.request.target.clone(),
@@ -901,10 +896,8 @@ mod tui {
             // Apply highest index first so earlier removals don't shift later indices.
             to_apply.sort_unstable_by(|a, b| b.cmp(a));
             for i in to_apply {
-                let (reason, confidence) = match self.state.get(&app.pending[i].request.id) {
-                    Some(LlmPhase::Proposed {
-                        reason, confidence, ..
-                    }) => (reason.clone(), *confidence),
+                let reason = match self.state.get(&app.pending[i].request.id) {
+                    Some(LlmPhase::Proposed { reason, .. }) => reason.clone(),
                     _ => continue,
                 };
                 let p = &mut app.pending[i];
@@ -928,7 +921,6 @@ mod tui {
                         "lk_llm": {
                             "model": self.cfg.model,
                             "verdict": "safe",
-                            "confidence": confidence,
                             "reason": reason,
                             "auto_applied": true,
                         },

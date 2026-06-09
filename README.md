@@ -399,10 +399,10 @@ hook: passthrough  ──queue──▶  watch shows it as pending
                                    │
         model judges on a background thread (the TUI never blocks)
                                    │
-   confident "safe" ──▶ proposal shown ──▶ no action for proposal_wait_ms (10s) ──▶ auto-apply:
+   a "safe" verdict ──▶ proposal shown ──▶ no action for proposal_wait_ms (10s) ──▶ auto-apply:
                                    │                                                  write allow verdict,
    anything else ──────────────────┘                                                 persist a TIGHT allow rule,
-   (unsafe · malformed · error · below min_confidence)                               log `llm_auto_approve`
+   (unsafe · malformed · error · non-shell tool)                                     log `llm_auto_approve`
                                    │
         passthrough (today's fallback — Claude Code's own prompt)
 ```
@@ -436,7 +436,6 @@ Defaults cover everything else: the key is read from `OPENROUTER_API_KEY`, the e
 | `proposal_wait_ms` | u64 | `10000` | Operator grace after a proposal before auto-applying. |
 | `timeout_ms` | u64 | `8000` | Per-attempt request timeout. |
 | `max_attempts` | u32 | `2` | Total attempts; only transient errors (timeout / 429 / 5xx) retry. |
-| `min_confidence` | f32 | `0.0` | Minimum confidence for a `safe` verdict to auto-apply. |
 | `system` | string | locked taxonomy | System-prompt override. |
 | `user` | string | `tool: {{tool}}\ncwd: {{cwd}}\ncommand: {{command}}` | User-template override. |
 
@@ -447,7 +446,7 @@ The decision prompt lives in config, not code, so you can tune it without rebuil
 ```toml
 [approval.llm]
 enabled = true
-system = "You are a shell-command safety gate. Decide if this command is safe to auto-approve unattended. Reply ONLY with the JSON contract {\"verdict\":\"safe\"|\"unsafe\",\"confidence\":0-1,\"reason\":\"...\"}."
+system = "You are a shell-command safety gate. Decide if this command is safe to auto-approve unattended. Reply ONLY with the JSON contract {\"verdict\":\"safe\"|\"unsafe\",\"reason\":\"...\"}."
 user = "tool: {{tool}}\ncwd: {{cwd}}\ncommand: {{command}}"
 ```
 
@@ -477,12 +476,14 @@ Re-validate any model you swap in with the eval harness before trusting it (see 
 
 ### What it persists, and auditing
 
-An auto-approval writes the allow verdict (unblocking the hook) and appends a **tight, path-specific** allow rule to the live ruleset (`99-live.toml`) — `pip install requests` persists as `pip install requests{, **}`, never a blanket `pip` allow. Each is logged as an `llm_auto_approve` JSONL record carrying an `lk_llm` block (model, verdict, confidence, reason). Tail them with `lord-kali watch --tail`.
+An auto-approval writes the allow verdict (unblocking the hook) and appends a **tight, path-specific** allow rule to the live ruleset (`99-live.toml`) — `pip install requests` persists as `pip install requests{, **}`, never a blanket `pip` allow. Each is logged as an `llm_auto_approve` JSONL record carrying an `lk_llm` block (model, verdict, reason). Tail them with `lord-kali watch --tail`.
 
 ### Safety model
 
-- **Auto-approve only.** A confident `safe` (≥ `min_confidence`) is the sole autonomous action; the model can never deny.
-- **Everything uncertain passes through.** `unsafe`, malformed/non-JSON replies, transport errors, timeouts, and below-confidence verdicts all fall back to today's behavior. Only transient errors are retried (cost-conscious — a malformed reply or a 4xx won't change on a retry).
+- **Shell commands only.** Only `Bash` and `PowerShell` calls are ever sent to the model — it's a shell-command gate. MCP tools and `WebFetch` carry no shell command to reason about, so they skip the model and ride out to the operator/hook fallback.
+- **Auto-approve only.** A `safe` verdict is the sole autonomous action; the model can never deny.
+- **Everything uncertain passes through.** `unsafe`, malformed/non-JSON replies, transport errors, and timeouts all fall back to today's behavior. Only transient errors are retried (cost-conscious — a malformed reply or a 4xx won't change on a retry).
+- **No self-reported confidence.** The model returns only a verdict and a reason; safety is decided by what the command does, not by a number the model assigns itself.
 - **The operator wins.** Acting on a pending call at any point cancels the model path.
 - **Inert by default.** Off unless `[approval.llm] enabled` and the key are both present; a missing key disables it with a stream notice rather than failing.
 
