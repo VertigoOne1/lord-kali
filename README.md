@@ -343,6 +343,8 @@ The **approval TUI** gives you one. When you opt in and run `lord-kali watch`, e
 
 ![lord-kali approval TUI — a blocked command's nodes sorted across the ALLOW, ASK, and DENY lanes](media/lord-kali-tui.png)
 
+![lord-kali approval TUI + LLM Auto approval](media/lord-kali-tui2.png)
+
 ```toml
 # in any ~/.config/lord-kali/*.toml — opt in (default off)
 [approval]

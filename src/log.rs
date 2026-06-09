@@ -34,36 +34,18 @@ fn append_line_to_path(path: &Path, line: String) {
     let _ = writeln!(file, "{}", line);
 }
 
-// Record that the LLM auto-approved a passthrough call (Phase 2). Mirrors the jsonl shape of
-// gate records so `watch --tail` and audits can see exactly which approvals the model made.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn log_llm_auto_approve(
-    path: &Path,
-    id: &str,
-    tool: &str,
-    target: &str,
-    cwd: Option<&str>,
-    model: &str,
-    reason: &str,
-    confidence: f32,
-) {
-    let line = serde_json::json!({
-        "ts_ms": now_ms(),
-        "lk_event": "llm_auto_approve",
-        "id": id,
-        "tool_name": tool,
-        "target": target,
-        "cwd": cwd,
-        "lk_llm": {
-            "model": model,
-            "verdict": "safe",
-            "confidence": confidence,
-            "reason": reason,
-            "auto_applied": true,
-        },
-    })
-    .to_string();
-    append_line_to_path(path, line);
+// Append an LLM auto-approval observability event to the log, stamped with ts_ms + lk_event.
+// The watch builds the field set (so this stays a thin, generic sink), letting it record the
+// full lifecycle — `llm_consult` (model asked), `llm_result` (what it replied + latency), and
+// `llm_auto_approve` (applied) — so `watch --tail` and audits can see if/what/when it decided.
+// Best-effort: a logging failure never blocks an auto-approval.
+pub(crate) fn log_event(path: &Path, event: &str, fields: serde_json::Value) {
+    let mut fields = fields;
+    if let Some(obj) = fields.as_object_mut() {
+        obj.insert("ts_ms".to_string(), serde_json::json!(now_ms()));
+        obj.insert("lk_event".to_string(), serde_json::json!(event));
+    }
+    append_line_to_path(path, fields.to_string());
 }
 
 pub(crate) fn log_invocation(log_config: &LogConfig, input: &str, trace: &InvocationTrace) {

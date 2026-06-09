@@ -307,7 +307,7 @@ mod tui {
         DEFAULT_BACKOFF_MS, DEFAULT_SYSTEM_PROMPT, DEFAULT_USER_TEMPLATE,
     };
     use crate::log::now_ms;
-    use crate::log::{log_llm_auto_approve, prune_log_file, resolve_log_path, DEFAULT_RETAIN_DAYS};
+    use crate::log::{log_event, prune_log_file, resolve_log_path, DEFAULT_RETAIN_DAYS};
     use crate::queue::{
         self, write_atomic, write_heartbeat_in, Action, QueueRequest, Verdict, VerdictNode,
     };
@@ -665,10 +665,16 @@ mod tui {
     // Declined and the call simply rides out to the hook's own fallback. The model never
     // auto-denies. This whole path is inert unless `[approval.llm] enabled` and the key is set.
 
-    // What a worker thread reports back; only a confident `safe` is actionable.
-    enum LlmOutcome {
-        Safe { reason: String, confidence: f32 },
-        NotSafe,
+    // What a worker thread reports back — full detail so every consult is logged, not just the
+    // ones that auto-apply. `kind` is "safe" | "unsafe" | "malformed" | "error"; the main loop
+    // decides actionability (safe AND confidence ≥ min).
+    struct LlmReport {
+        target: String,
+        kind: &'static str,
+        reason: Option<String>,
+        confidence: Option<f32>,
+        latency_ms: u64,
+        detail: Option<String>,
     }
 
     // Per-request state, keyed by request id so it survives sync_pending rebuilding the list.
@@ -696,8 +702,8 @@ mod tui {
         queue_wait_ms: u64,
         proposal_wait_ms: u64,
         min_confidence: f32,
-        tx: Sender<(String, LlmOutcome)>,
-        rx: Receiver<(String, LlmOutcome)>,
+        tx: Sender<(String, LlmReport)>,
+        rx: Receiver<(String, LlmReport)>,
         state: HashMap<String, LlmPhase>,
     }
 
@@ -748,22 +754,43 @@ mod tui {
             });
             let cfg = self.cfg.clone();
             let id = s.id.clone();
+            let target = s.target.clone();
             let tx = self.tx.clone();
-            let min = self.min_confidence;
             std::thread::spawn(move || {
-                let outcome = match judge(&cfg, &rendered, now_ms).result {
+                let jr = judge(&cfg, &rendered, now_ms);
+                let latency_ms = jr.latency_ms;
+                let report = match jr.result {
                     Ok(resp) => match parse_judgement(&resp.content) {
-                        Ok(j) if j.verdict == LlmVerdict::Safe && j.confidence >= min => {
-                            LlmOutcome::Safe {
-                                reason: j.reason,
-                                confidence: j.confidence,
-                            }
-                        }
-                        _ => LlmOutcome::NotSafe,
+                        Ok(j) => LlmReport {
+                            target,
+                            kind: match j.verdict {
+                                LlmVerdict::Safe => "safe",
+                                LlmVerdict::Unsafe => "unsafe",
+                            },
+                            reason: Some(j.reason),
+                            confidence: Some(j.confidence),
+                            latency_ms,
+                            detail: None,
+                        },
+                        Err(e) => LlmReport {
+                            target,
+                            kind: "malformed",
+                            reason: None,
+                            confidence: None,
+                            latency_ms,
+                            detail: Some(e.to_string()),
+                        },
                     },
-                    Err(_) => LlmOutcome::NotSafe,
+                    Err(e) => LlmReport {
+                        target,
+                        kind: "error",
+                        reason: None,
+                        confidence: None,
+                        latency_ms,
+                        detail: Some(e.to_string()),
+                    },
                 };
-                let _ = tx.send((id, outcome));
+                let _ = tx.send((id, report));
             });
         }
 
@@ -778,17 +805,53 @@ mod tui {
             log_path: &Path,
             now: u64,
         ) {
-            while let Ok((id, outcome)) = self.rx.try_recv() {
+            while let Ok((id, rep)) = self.rx.try_recv() {
+                let proposable =
+                    rep.kind == "safe" && rep.confidence.is_some_and(|c| c >= self.min_confidence);
+                let note = if proposable {
+                    format!(
+                        "model: SAFE {:.0}% — {} · auto-approve in {}s unless you act",
+                        rep.confidence.unwrap_or(0.0) * 100.0,
+                        rep.reason.as_deref().unwrap_or(""),
+                        self.proposal_wait_ms / 1000
+                    )
+                } else {
+                    format!(
+                        "model: {} — {} · passthrough",
+                        rep.kind,
+                        rep.reason
+                            .as_deref()
+                            .or(rep.detail.as_deref())
+                            .unwrap_or("")
+                    )
+                };
+                app.stream.push(stream_note(&note));
                 if let Some(phase) = self.state.get_mut(&id) {
-                    *phase = match outcome {
-                        LlmOutcome::Safe { reason, confidence } => LlmPhase::Proposed {
-                            reason,
-                            confidence,
+                    *phase = if proposable {
+                        LlmPhase::Proposed {
+                            reason: rep.reason.clone().unwrap_or_default(),
+                            confidence: rep.confidence.unwrap_or(0.0),
                             at_ms: now,
-                        },
-                        LlmOutcome::NotSafe => LlmPhase::Declined,
+                        }
+                    } else {
+                        LlmPhase::Declined
                     };
                 }
+                log_event(
+                    log_path,
+                    "llm_result",
+                    serde_json::json!({
+                        "id": id,
+                        "model": self.cfg.model,
+                        "target": rep.target,
+                        "verdict": rep.kind,
+                        "reason": rep.reason,
+                        "confidence": rep.confidence,
+                        "latency_ms": rep.latency_ms,
+                        "detail": rep.detail,
+                        "will_auto_approve": proposable,
+                    }),
+                );
             }
 
             // Forget state for requests the operator resolved or that were swept.
@@ -819,6 +882,17 @@ mod tui {
 
             for s in &to_spawn {
                 self.spawn(s);
+                log_event(
+                    log_path,
+                    "llm_consult",
+                    serde_json::json!({
+                        "id": s.id,
+                        "model": self.cfg.model,
+                        "tool": s.tool,
+                        "target": s.target,
+                        "cwd": s.cwd,
+                    }),
+                );
                 app.stream
                     .push(stream_note(&format!("consulting model on: {}", s.target)));
                 self.state.insert(s.id.clone(), LlmPhase::Requested);
@@ -843,15 +917,22 @@ mod tui {
                     let _ = write_atomic(&vpath, &j);
                 }
                 let _ = append_rules(live_path, &live_rules);
-                log_llm_auto_approve(
+                log_event(
                     log_path,
-                    &p.request.id,
-                    &p.request.tool,
-                    &p.request.target,
-                    p.request.cwd.as_deref(),
-                    &self.cfg.model,
-                    &reason,
-                    confidence,
+                    "llm_auto_approve",
+                    serde_json::json!({
+                        "id": p.request.id.clone(),
+                        "tool_name": p.request.tool.clone(),
+                        "target": p.request.target.clone(),
+                        "cwd": p.request.cwd.clone(),
+                        "lk_llm": {
+                            "model": self.cfg.model,
+                            "verdict": "safe",
+                            "confidence": confidence,
+                            "reason": reason,
+                            "auto_applied": true,
+                        },
+                    }),
                 );
                 app.stream.push(stream_note(&format!(
                     "auto-approved (model): {} — {reason}",
