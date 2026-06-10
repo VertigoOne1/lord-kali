@@ -24,7 +24,7 @@ path = "~/.local/state/lord-kali/hook.jsonl"
 # through — the model never auto-denies. The key is read from the named env var, never config.
 # [approval.llm]
 # enabled = true
-# model = "z-ai/glm-4-32b"          # locked winner of the eval sweeps (see LLM_EVAL_PLAN.md)
+# model = "mistralai/mistral-small-3.2-24b-instruct"  # dense non-reasoning 24B; glm-4-32b (eval winner) was delisted
 # api_key_env = "OPENROUTER_API_KEY"
 # queue_wait_ms = 15000             # operator grace before consulting the model
 # proposal_wait_ms = 10000          # operator grace after a proposal before auto-applying

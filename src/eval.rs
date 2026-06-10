@@ -18,12 +18,16 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-// The candidate set (LLM_EVAL_PLAN.md §4.5); overridable with --models. glm-4-32b is the
-// anchor (best so far). Dropped after sweeps: glm-4.7-flash (~55% empty replies),
-// qwen3-235b-thinking (too slow), seed-2.0-mini (weak JSON). deepseek-v4-flash is a thinking
-// model under trial — accuracy is promising for its class, so the open question is whether
-// its latency fits the runtime budget (~25s between the operator gaps).
-const DEFAULT_MODELS: &[&str] = &["z-ai/glm-4-32b", "deepseek/deepseek-v4-flash"];
+// The candidate set (LLM_EVAL_PLAN.md §4.5); overridable with --models. The eval winner
+// glm-4-32b was delisted and the GLM family went reasoning-only (slow + empty replies), so the
+// anchor is now mistral-small-3.2-24b — a dense, non-reasoning 24B with 100% JSON-validity and
+// the best recall of the candidates tested. qwen-2.5-72b is the denser cross-check. A full
+// re-sweep is still owed to formally re-lock. Dropped after earlier sweeps: glm-4.7-flash
+// (~55% empty replies), qwen3-235b-thinking (too slow), seed-2.0-mini (weak JSON).
+const DEFAULT_MODELS: &[&str] = &[
+    "mistralai/mistral-small-3.2-24b-instruct",
+    "qwen/qwen-2.5-72b-instruct",
+];
 
 #[derive(Deserialize)]
 struct Case {
