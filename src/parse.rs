@@ -276,6 +276,13 @@ fn walk_powershell_node(
         if let Some(name) = powershell_command_name(&node, source) {
             commands.push((name, powershell_command_args(&node, source)));
         }
+    } else if node.is_error() {
+        if let Some(cmd) = recover_relative_invocation(&node, source) {
+            commands.push(cmd);
+            // The ERROR subtree is the mis-tokenized fragments of this one invocation,
+            // already recovered — descending would only re-walk that garbage.
+            return;
+        }
     }
 
     if cursor.goto_first_child() {
@@ -287,6 +294,30 @@ fn walk_powershell_node(
         }
         cursor.goto_parent();
     }
+}
+
+// tree-sitter-powershell mis-parses a forward-slash relative invocation (`./script.ps1`):
+// it reads the leading `.` as the dot-source operator, so no `command` node forms and the
+// statement lands in an ERROR subtree. Recover the invocation textually so it is still
+// gated rather than silently passed through to Claude Code's own prompt. Scoped to the `./`
+// prefix because that is the only form the grammar trips on — `.\x`, `../x`, `scripts/x`,
+// `C:/x`, and `& ./x` all parse cleanly as real commands and never reach here. Returns the
+// same basename the clean forms yield (extension retained), so a rule gates them identically.
+fn recover_relative_invocation(
+    node: &tree_sitter::Node,
+    source: &[u8],
+) -> Option<(String, String)> {
+    let text = node.utf8_text(source).ok()?.trim_start();
+    if !text.starts_with("./") {
+        return None;
+    }
+    let tokens = quote_aware_tokens(text);
+    let (first, rest) = tokens.split_first()?;
+    let basename = command_basename(strip_surrounding_quotes(first));
+    if basename.is_empty() {
+        return None;
+    }
+    Some((basename.to_string(), rest.join(" ")))
 }
 
 const POWERSHELL_EXECUTABLES: &[&str] = &["pwsh", "pwsh.exe", "powershell", "powershell.exe"];
@@ -562,6 +593,48 @@ mod tests {
             ps_command_names("$env:NODE_ENV='production'; npm run build"),
             vec!["npm"]
         );
+    }
+
+    #[test]
+    fn ps_extract_forward_slash_relative_invocation() {
+        assert_eq!(
+            extract_commands_powershell(
+                "./scripts/keyvault/Copy-KeyVaultSecret.ps1 -Name foo -WhatIf"
+            ),
+            vec![("Copy-KeyVaultSecret.ps1".into(), "-Name foo -WhatIf".into())]
+        );
+    }
+
+    #[test]
+    fn ps_extract_forward_slash_relative_after_assignment() {
+        assert_eq!(
+            ps_command_names(
+                "$x = @(\n  'a',\n  'b'\n)\n./scripts/Copy-KeyVaultSecret.ps1 -TargetVault qa1 -Name $x -WhatIf"
+            ),
+            vec!["Copy-KeyVaultSecret.ps1"]
+        );
+    }
+
+    #[test]
+    fn ps_extract_forward_slash_relative_after_semicolon() {
+        assert_eq!(
+            ps_command_names("Get-Foo; ./foo.ps1 -Name bar"),
+            vec!["Get-Foo", "foo.ps1"]
+        );
+    }
+
+    // Path forms the grammar parses cleanly must keep yielding the same single command node
+    // (the recovery path is `./`-only and must not double-count or interfere with these).
+    #[test]
+    fn ps_extract_clean_path_forms_unaffected() {
+        assert_eq!(ps_command_names(".\\foo.ps1 -Name x"), vec!["foo.ps1"]);
+        assert_eq!(ps_command_names("../foo.ps1 -Name x"), vec!["foo.ps1"]);
+        assert_eq!(ps_command_names("scripts/foo.ps1 -Name x"), vec!["foo.ps1"]);
+        assert_eq!(
+            ps_command_names("C:/scripts/foo.ps1 -Name x"),
+            vec!["foo.ps1"]
+        );
+        assert_eq!(ps_command_names("& ./foo.ps1 -Name x"), vec!["foo.ps1"]);
     }
 
     #[test]
