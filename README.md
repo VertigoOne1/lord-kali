@@ -395,11 +395,11 @@ When the operator is away, lord-kali can ask a safety model to triage **passthro
 ```
 hook: passthrough  ──queue──▶  watch shows it as pending
                                    │   (operator can act at any point — this pre-empts the model)
-        no operator action for queue_wait_ms (15s)
+        no operator action for queue_wait_ms (10s)
                                    │
         model judges on a background thread (the TUI never blocks)
                                    │
-   a "safe" verdict ──▶ proposal shown ──▶ no action for proposal_wait_ms (10s) ──▶ auto-apply:
+   a "safe" verdict ──▶ proposal shown ──▶ no action for proposal_wait_ms (5s) ──▶ auto-apply:
                                    │                                                  write allow verdict,
    anything else ──────────────────┘                                                 persist a TIGHT allow rule,
    (unsafe · malformed · error · non-shell tool)                                     log `llm_auto_approve`
@@ -412,7 +412,7 @@ hook: passthrough  ──queue──▶  watch shows it as pending
 - `[approval] enabled = true` and `lord-kali watch` running — auto-approval rides on the approval queue.
 - The API key exported in the env var named by `api_key_env` (default `OPENROUTER_API_KEY`). **Only the `watch` process needs it** — the per-command hook just queues. Set it system-wide, then start the watch in a fresh terminal.
 
-On startup the watch stream prints `auto-approval on: <model> (15s queue, 10s proposal)`, or `auto-approval disabled: $OPENROUTER_API_KEY not set` if the key isn't visible — so you get immediate confirmation.
+On startup the watch stream prints `auto-approval on: <model> (10s queue, 5s proposal)`, or `auto-approval disabled: $OPENROUTER_API_KEY not set` if the key isn't visible — so you get immediate confirmation.
 
 ### Enabling
 
@@ -432,8 +432,8 @@ Defaults cover everything else: the key is read from `OPENROUTER_API_KEY`, the e
 | `model` | string | `mistralai/mistral-small-3.2-24b-instruct` | Model id. Dense, non-reasoning 24B chosen after the eval winner `glm-4-32b` was delisted and the GLM family went reasoning-only; re-run the sweeps to formally re-lock. |
 | `base_url` | string | OpenRouter chat-completions URL | Any OpenAI-compatible endpoint (point it at a local server). |
 | `api_key_env` | string | `OPENROUTER_API_KEY` | Env var the watch reads the key from — the key never lives in config. |
-| `queue_wait_ms` | u64 | `15000` | Operator grace before the model is consulted. |
-| `proposal_wait_ms` | u64 | `10000` | Operator grace after a proposal before auto-applying. |
+| `queue_wait_ms` | u64 | `10000` | Operator grace before the model is consulted. |
+| `proposal_wait_ms` | u64 | `5000` | Operator grace after a proposal before auto-applying. |
 | `timeout_ms` | u64 | `8000` | Per-attempt request timeout. |
 | `max_attempts` | u32 | `2` | Total attempts; only transient errors (timeout / 429 / 5xx) retry. |
 | `system` | string | locked taxonomy | System-prompt override. |
@@ -458,7 +458,7 @@ The whole exchange must finish inside Claude Code's hook timeout — lord-kali s
 queue_wait_ms + (timeout_ms × max_attempts) + proposal_wait_ms  <  ~45000
 ```
 
-The defaults leave headroom: `15000 + (8000 × 2) + 10000 = 41000 ms`. Raise the timeout or the waits and you eat into it — a model that routinely answers slower than `timeout_ms` will simply time out and pass through.
+The defaults leave headroom: `10000 + (8000 × 2) + 5000 = 31000 ms`. Raise the timeout or the waits and you eat into it — a model that routinely answers slower than `timeout_ms` will simply time out and pass through.
 
 ### Endpoint and local models
 

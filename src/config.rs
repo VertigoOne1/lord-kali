@@ -537,8 +537,8 @@ impl From<RawApprovalLlmConfig> for ApprovalLlmConfig {
             api_key_env: r
                 .api_key_env
                 .unwrap_or_else(|| "OPENROUTER_API_KEY".to_string()),
-            queue_wait_ms: r.queue_wait_ms.unwrap_or(15_000),
-            proposal_wait_ms: r.proposal_wait_ms.unwrap_or(10_000),
+            queue_wait_ms: r.queue_wait_ms.unwrap_or(10_000),
+            proposal_wait_ms: r.proposal_wait_ms.unwrap_or(5_000),
             timeout_ms: r.timeout_ms.unwrap_or(llm::DEFAULT_TIMEOUT_MS),
             max_attempts: r.max_attempts.unwrap_or(llm::DEFAULT_MAX_ATTEMPTS),
             system: r.system,

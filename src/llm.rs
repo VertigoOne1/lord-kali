@@ -14,9 +14,9 @@ use std::time::Duration;
 
 pub(crate) const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 // Per-attempt timeout and retry budget are sized to be FAIL-SAFE within the runtime's
-// 50s hook self-timeout: a 15s operator gap before the call + a 10s gap after the proposal
-// leaves ~25s for the model. Worst case here is 8s + 0.5s backoff + 8s = 16.5s, so
-// 15 + 16.5 + 10 = 41.5s — comfortably under 50s. Only transient errors are retried, to
+// 50s hook self-timeout: a 10s operator gap before the call + a 5s gap after the proposal
+// leaves ~35s for the model. Worst case here is 8s + 0.5s backoff + 8s = 16.5s, so
+// 10 + 16.5 + 5 = 31.5s — comfortably under 50s. Only transient errors are retried, to
 // keep cost down (a malformed reply or 4xx won't fix itself on a retry).
 pub(crate) const DEFAULT_TIMEOUT_MS: u64 = 8_000;
 pub(crate) const DEFAULT_MAX_ATTEMPTS: u32 = 2;
