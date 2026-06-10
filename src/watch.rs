@@ -324,6 +324,8 @@ mod tui {
 
     const POLL_MS: u64 = 200;
     const STREAM_CAP: usize = 1000;
+    // The model-activity buffer is low-volume, so a small cap keeps plenty of history.
+    const LLM_STREAM_CAP: usize = 200;
     // A request from a crashed hook (no self-cleanup) is swept after this age.
     const REQ_MAX_AGE_MS: u64 = 120_000;
 
@@ -432,6 +434,9 @@ mod tui {
 
     struct App {
         stream: Vec<Line<'static>>,
+        // Model-activity lines (consult / verdict / auto-approve) live in their own buffer so the
+        // high-volume decision stream can't bury or evict them — rendered in a dedicated pane.
+        llm_stream: Vec<Line<'static>>,
         pending: Vec<Pending>,
         focus: usize,
         should_quit: bool,
@@ -446,6 +451,7 @@ mod tui {
         fn new() -> Self {
             App {
                 stream: Vec::new(),
+                llm_stream: Vec::new(),
                 pending: Vec::new(),
                 focus: 0,
                 should_quit: false,
@@ -820,7 +826,7 @@ mod tui {
                             .unwrap_or("")
                     )
                 };
-                app.stream.push(stream_note(&note));
+                push_capped(&mut app.llm_stream, stream_note(&note), LLM_STREAM_CAP);
                 if let Some(phase) = self.state.get_mut(&id) {
                     *phase = if proposable {
                         LlmPhase::Proposed {
@@ -888,8 +894,11 @@ mod tui {
                         "cwd": s.cwd,
                     }),
                 );
-                app.stream
-                    .push(stream_note(&format!("consulting model on: {}", s.target)));
+                push_capped(
+                    &mut app.llm_stream,
+                    stream_note(&format!("consulting model on: {}", s.target)),
+                    LLM_STREAM_CAP,
+                );
                 self.state.insert(s.id.clone(), LlmPhase::Requested);
             }
 
@@ -926,10 +935,14 @@ mod tui {
                         },
                     }),
                 );
-                app.stream.push(stream_note(&format!(
-                    "auto-approved (model): {} — {reason}",
-                    p.request.target
-                )));
+                push_capped(
+                    &mut app.llm_stream,
+                    stream_note(&format!(
+                        "auto-approved (model): {} — {reason}",
+                        p.request.target
+                    )),
+                    LLM_STREAM_CAP,
+                );
 
                 let id = p.request.id.clone();
                 app.pending.remove(i);
@@ -1039,11 +1052,7 @@ mod tui {
 
             for line in tailer.read_new() {
                 if let Some(l) = stream_line(&line) {
-                    app.stream.push(l);
-                    if app.stream.len() > STREAM_CAP {
-                        let drop = app.stream.len() - STREAM_CAP;
-                        app.stream.drain(0..drop);
-                    }
+                    push_capped(&mut app.stream, l, STREAM_CAP);
                 }
             }
 
@@ -1154,19 +1163,46 @@ mod tui {
         } else {
             Constraint::Percentage(55)
         };
-        let [top, mid, help] =
-            Layout::vertical([Constraint::Min(3), body, Constraint::Length(1)]).areas(f.area());
-        render_stream(f, top, app);
-        render_body(f, mid, app);
-        render_help(f, help, app);
+        // The model-activity pane only appears when auto-approval is live; sized to its content
+        // (up to 6 lines) so it never crowds the decision stream or the approval zone.
+        if app.llm_status.is_some() {
+            let model_h = (app.llm_stream.len().min(6) as u16 + 2).max(3);
+            let [top, model, mid, help] = Layout::vertical([
+                Constraint::Min(3),
+                Constraint::Length(model_h),
+                body,
+                Constraint::Length(1),
+            ])
+            .areas(f.area());
+            render_buffer(f, top, "lord-kali — stream", &app.stream);
+            render_buffer(f, model, "model activity", &app.llm_stream);
+            render_body(f, mid, app);
+            render_help(f, help, app);
+        } else {
+            let [top, mid, help] =
+                Layout::vertical([Constraint::Min(3), body, Constraint::Length(1)]).areas(f.area());
+            render_buffer(f, top, "lord-kali — stream", &app.stream);
+            render_body(f, mid, app);
+            render_help(f, help, app);
+        }
     }
 
-    fn render_stream(f: &mut Frame, area: Rect, app: &App) {
+    // Append to a bounded line buffer, dropping the oldest lines once it exceeds `cap`.
+    fn push_capped(buf: &mut Vec<Line<'static>>, line: Line<'static>, cap: usize) {
+        buf.push(line);
+        if buf.len() > cap {
+            let drop = buf.len() - cap;
+            buf.drain(0..drop);
+        }
+    }
+
+    // Render the tail of a line buffer into a bordered box.
+    fn render_buffer(f: &mut Frame, area: Rect, title: &str, buf: &[Line<'static>]) {
         let visible = area.height.saturating_sub(2) as usize;
-        let start = app.stream.len().saturating_sub(visible);
-        let lines: Vec<Line> = app.stream[start..].to_vec();
+        let start = buf.len().saturating_sub(visible);
+        let lines: Vec<Line> = buf[start..].to_vec();
         let para = Paragraph::new(lines)
-            .block(Block::bordered().title("lord-kali — stream"))
+            .block(Block::bordered().title(title.to_string()))
             .wrap(Wrap { trim: false });
         f.render_widget(para, area);
     }
