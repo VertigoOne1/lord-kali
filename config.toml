@@ -113,6 +113,21 @@ decision = "ask"                       # eyeball form fills in the TUI even if t
 tool = "mcp__playwright__*"
 decision = "allow"
 
+# File-edit gating (opt-in; default off). When enabled, file MUTATIONS (Write/Edit/MultiEdit/
+# NotebookEdit) are gated by target path, and reads (Read/Glob/Grep) are gated only when their
+# path escapes cwd. Best paired with [approval] + `lord-kali watch`: unmatched calls route to
+# the TUI where you can whitelist them (apply-always persists a [[file.rules]] rule, scoped via
+# the `t` ladder: full path → dir → cwd subtree → **/*.ext). File calls never reach the LLM.
+# [file]
+# enabled = true
+# mutation_scope = "all"        # "all": every mutation routes to the TUI (see and whitelist them).
+#                               # "outside_cwd": only mutations whose path escapes cwd are gated.
+#
+# [[file.rules]]                # first-match-wins, glob or /regex/ on the resolved absolute path
+# path = "**/*.cs"
+# decision = "allow"
+# projects = ["~/co-flo-apigateway"]
+
 # Per-rule project scoping: restrict a rule to specific directories
 #
 # [[bash.rules]]

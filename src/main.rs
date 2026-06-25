@@ -6,6 +6,7 @@ mod llm;
 mod log;
 mod parse;
 mod queue;
+mod scope;
 mod watch;
 mod worktree;
 
@@ -135,12 +136,7 @@ fn maybe_route_to_approval(
         return trace;
     }
 
-    let target = hook_input
-        .tool_input
-        .command
-        .clone()
-        .or_else(|| hook_input.tool_input.url.clone())
-        .unwrap_or_else(|| hook_input.tool_name.clone());
+    let target = request_target(hook_input);
     let request = QueueRequest {
         id: queue::request_id(hook_input.session_id.as_deref().unwrap_or("")),
         ts_ms: log::now_ms(),
@@ -158,6 +154,19 @@ fn maybe_route_to_approval(
         }
         None => trace,
     }
+}
+
+// The one-line label shown for a queued call: its command, URL, or target path — falling
+// back to the tool name when the call carries none of those.
+fn request_target(hook_input: &HookInput) -> String {
+    hook_input
+        .tool_input
+        .command
+        .clone()
+        .or_else(|| hook_input.tool_input.url.clone())
+        .or_else(|| hook_input.tool_input.file_path.clone())
+        .or_else(|| hook_input.tool_input.path.clone())
+        .unwrap_or_else(|| hook_input.tool_name.clone())
 }
 
 fn print_decision(decision: Decision, reason: &str) {
@@ -222,6 +231,31 @@ mod tests {
         let s = ti.summary();
         assert!(s.chars().count() <= 81, "len was {}", s.chars().count());
         assert!(s.ends_with('…'));
+    }
+
+    #[test]
+    fn request_target_prefers_command_then_url_then_path() {
+        let mut hi = bash_hook_input("ls -la");
+        assert_eq!(request_target(&hi), "ls -la");
+
+        hi.tool_input.command = None;
+        hi.tool_input.url = Some("https://x.test".into());
+        assert_eq!(request_target(&hi), "https://x.test");
+
+        hi = HookInput {
+            tool_name: "Edit".into(),
+            tool_input: ToolInput {
+                command: None,
+                url: None,
+                file_path: Some("/p/Startup.cs".into()),
+                path: None,
+                extra: Default::default(),
+            },
+            cwd: None,
+            hook_event_name: None,
+            session_id: None,
+        };
+        assert_eq!(request_target(&hi), "/p/Startup.cs");
     }
 
     fn bash_hook_input(command: &str) -> HookInput {

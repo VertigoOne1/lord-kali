@@ -311,6 +311,7 @@ mod tui {
     use crate::queue::{
         self, write_atomic, write_heartbeat_in, Action, QueueRequest, Verdict, VerdictNode,
     };
+    use crate::scope::{ladder, ScopeRung};
     use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
     use ratatui::layout::{Constraint, Layout, Rect};
     use ratatui::style::{Color, Modifier, Style};
@@ -368,26 +369,61 @@ mod tui {
     struct Pending {
         request: QueueRequest,
         choices: Vec<Choice>,
-        // Per node: whether an *-always rule persists tight (full-args, path-specific)
-        // rather than subcommand-scoped. Defaults true for guardrail commands.
-        tight: Vec<bool>,
+        // Per node: which rung of its scope ladder an *-always rule persists at. `t` cycles
+        // it; the default comes from scope::ladder (tight for guardrail commands and files).
+        scope_idx: Vec<usize>,
         cursor: usize,
     }
 
     impl Pending {
         fn new(request: QueueRequest, approval: &ApprovalConfig) -> Self {
             let choices = vec![Choice::Allow; request.nodes.len()];
-            let tight = request
+            let scope_idx = request
                 .nodes
                 .iter()
-                .map(|n| approval.is_guardrail(&n.command))
+                .map(|n| {
+                    ladder(
+                        &n.shell,
+                        &request.tool,
+                        &n.command,
+                        &n.args,
+                        request.cwd.as_deref(),
+                        approval.is_guardrail(&n.command),
+                    )
+                    .1
+                })
                 .collect();
             Pending {
                 request,
                 choices,
-                tight,
+                scope_idx,
                 cursor: 0,
             }
+        }
+
+        // The scope rungs for node `i` (tightest → broadest). The guardrail flag only sets
+        // the default index at construction, so it is irrelevant here.
+        fn node_rungs(&self, i: usize) -> Vec<ScopeRung> {
+            let n = &self.request.nodes[i];
+            ladder(
+                &n.shell,
+                &self.request.tool,
+                &n.command,
+                &n.args,
+                self.request.cwd.as_deref(),
+                false,
+            )
+            .0
+        }
+
+        // The rung an *-always rule will persist for node `i`, honoring its `t` selection.
+        fn selected_rung(&self, i: usize) -> ScopeRung {
+            let rungs = self.node_rungs(i);
+            let idx = self.scope_idx[i].min(rungs.len().saturating_sub(1));
+            rungs.into_iter().nth(idx).unwrap_or(ScopeRung {
+                target: self.request.nodes[i].command.clone(),
+                args: None,
+            })
         }
     }
 
@@ -469,39 +505,9 @@ mod tui {
         }
     }
 
-    // Scope a persisted rule to the node's subcommand: the first argument token plus any
-    // trailing args (e.g. "push" -> "push{, **}"). None when the node had no args, which
-    // persists command-wide. This is why allowing `git push` does not bless `git commit`.
-    fn scope_args(args: &str) -> Option<String> {
-        let first = args.split_whitespace().next()?;
-        Some(format!("{first}{{, **}}"))
-    }
-
-    // Tight (path-specific) scope: pin the whole args string, tolerating extra trailing
-    // args. So `rm -rf ./test-results` persists as `-rf ./test-results{, **}` — it can
-    // never match `rm -rf /`. None (command-wide) only when there were no args at all.
-    fn tight_args(args: &str) -> Option<String> {
-        if args.is_empty() {
-            None
-        } else {
-            Some(format!("{args}{{, **}}"))
-        }
-    }
-
-    // The args pattern an *-always rule would persist for a node, honoring its tight flag.
-    fn node_scope(tight: bool, shell: &str, args: &str) -> Option<String> {
-        if shell == "web-fetch" || shell == "mcp" {
-            None
-        } else if tight {
-            tight_args(args)
-        } else {
-            scope_args(args)
-        }
-    }
-
     // Each node resolves by its lane: Allow -> allow, Deny -> deny, Ask -> passthrough
     // (deferred to Claude Code's prompt). The mode picks once vs always; *_always actions
-    // persist a subcommand-scoped rule (web-fetch persists the exact URL). Ask never persists.
+    // persist a rule scoped to the node's currently-selected ladder rung. Ask never persists.
     fn build_verdict(p: &Pending, mode: CommitMode) -> (Verdict, Vec<LiveRule>) {
         let mut nodes = Vec::new();
         let mut live = Vec::new();
@@ -515,10 +521,11 @@ mod tui {
                 (Choice::Ask, _) => Action::Passthrough,
             };
             if matches!(mode, CommitMode::Always) && choice != Choice::Ask {
+                let rung = p.selected_rung(i);
                 live.push(LiveRule {
                     shell: node.shell.clone(),
-                    target: node.command.clone(),
-                    args: node_scope(p.tight[i], &node.shell, &node.args),
+                    target: rung.target,
+                    args: rung.args,
                     allow: choice == Choice::Allow,
                 });
             }
@@ -611,8 +618,12 @@ mod tui {
             }
             Key::ToggleScope => {
                 if let Some(p) = app.focused_mut() {
-                    if let Some(t) = p.tight.get_mut(p.cursor) {
-                        *t = !*t;
+                    let cursor = p.cursor;
+                    let len = p.node_rungs(cursor).len();
+                    if len > 1 {
+                        if let Some(idx) = p.scope_idx.get_mut(cursor) {
+                            *idx = (*idx + 1) % len;
+                        }
                     }
                 }
                 None
@@ -697,21 +708,25 @@ mod tui {
         cwd: Option<String>,
     }
 
-    // The model is a *shell-command* safety gate, so only Bash/PowerShell calls are ever
-    // consulted. MCP tools and WebFetch don't carry a shell command to reason about — they
-    // skip the model entirely and ride out to the operator/hook fallback.
-    fn is_shell_tool(tool: &str) -> bool {
-        matches!(tool, "Bash" | "PowerShell")
-    }
-
     struct AutoApprover {
         cfg: LlmConfig,
         prompt: PromptTemplate,
         queue_wait_ms: u64,
         proposal_wait_ms: u64,
+        // Tools the model is allowed to judge (the LLM-eligibility matcher). The model is a
+        // *shell-command* safety gate, so this is Bash/PowerShell by default; file, MCP, and
+        // WebFetch calls carry no shell command to reason about and skip the model entirely,
+        // riding the operator/hook fallback so they can still be triaged in the TUI.
+        tools: Vec<String>,
         tx: Sender<(String, LlmReport)>,
         rx: Receiver<(String, LlmReport)>,
         state: HashMap<String, LlmPhase>,
+    }
+
+    impl AutoApprover {
+        fn llm_eligible(&self, tool: &str) -> bool {
+            self.tools.iter().any(|t| t == tool)
+        }
     }
 
     impl AutoApprover {
@@ -745,6 +760,7 @@ mod tui {
                 },
                 queue_wait_ms: llm.queue_wait_ms,
                 proposal_wait_ms: llm.proposal_wait_ms,
+                tools: llm.tools.clone(),
                 tx,
                 rx,
                 state: HashMap::new(),
@@ -800,6 +816,8 @@ mod tui {
         // Advance the state machine once per loop. Ingests worker results, fires new requests
         // whose queue wait elapsed, and auto-applies proposals whose operator window elapsed
         // (writing the verdict + persisting a tight allow rule + logging). Mutates app.pending.
+        // Returns whether it changed anything visible (a stream line or the pending list), so
+        // the caller can skip an idle redraw.
         fn tick(
             &mut self,
             app: &mut App,
@@ -807,8 +825,10 @@ mod tui {
             live_path: &Path,
             log_path: &Path,
             now: u64,
-        ) {
+        ) -> bool {
+            let mut changed = false;
             while let Ok((id, rep)) = self.rx.try_recv() {
+                changed = true;
                 let proposable = rep.kind == "safe";
                 let note = if proposable {
                     format!(
@@ -862,7 +882,7 @@ mod tui {
             let mut to_apply: Vec<usize> = Vec::new();
             for (i, p) in app.pending.iter().enumerate() {
                 match self.state.get(&p.request.id) {
-                    None if is_shell_tool(&p.request.tool)
+                    None if self.llm_eligible(&p.request.tool)
                         && now.saturating_sub(p.request.ts_ms) >= self.queue_wait_ms =>
                     {
                         to_spawn.push(SpawnReq {
@@ -881,6 +901,7 @@ mod tui {
                 }
             }
 
+            changed |= !to_spawn.is_empty();
             for s in &to_spawn {
                 self.spawn(s);
                 log_event(
@@ -909,9 +930,11 @@ mod tui {
                     Some(LlmPhase::Proposed { reason, .. }) => reason.clone(),
                     _ => continue,
                 };
+                changed = true;
                 let p = &mut app.pending[i];
                 p.choices = vec![Choice::Allow; p.request.nodes.len()];
-                p.tight = vec![true; p.request.nodes.len()];
+                // Auto-approval persists the tightest rung (index 0) — the path/arg-specific rule.
+                p.scope_idx = vec![0; p.request.nodes.len()];
                 let (verdict, live_rules) = build_verdict(p, CommitMode::Always);
 
                 let vpath = qdir.join(format!("{}.verdict.json", verdict.id));
@@ -951,6 +974,7 @@ mod tui {
             if app.focus >= app.pending.len() {
                 app.focus = app.pending.len().saturating_sub(1);
             }
+            changed
         }
     }
 
@@ -991,6 +1015,28 @@ mod tui {
                 None
             }
         }
+    }
+
+    // A cheap hash of everything the TUI body/footer renders from structured state (the
+    // pending list, focus, per-node selections, and the Ctrl-C arming). The two scrolling
+    // buffers are excluded — their content rotates within a fixed cap, so a length/hash can't
+    // see new lines; the loop tracks their changes via explicit flags instead. Lets the loop
+    // skip a redraw when nothing visible moved, so an idle watcher stops feeding the terminal.
+    fn view_revision(app: &App) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        app.pending.len().hash(&mut h);
+        app.focus.hash(&mut h);
+        app.ctrl_c_armed.hash(&mut h);
+        for p in &app.pending {
+            p.request.id.hash(&mut h);
+            p.cursor.hash(&mut h);
+            for c in &p.choices {
+                (*c as u8).hash(&mut h);
+            }
+            p.scope_idx.hash(&mut h);
+        }
+        h.finish()
     }
 
     pub(crate) fn run(explicit_path: Option<&str>) -> std::io::Result<()> {
@@ -1039,6 +1085,10 @@ mod tui {
         let mut prev_pending = usize::MAX;
         // Already pruned once on open; schedule the next housekeeping pass an hour out.
         let mut next_prune_ms = now_ms() + PRUNE_INTERVAL_MS;
+        // The view revision last handed to the terminal; None until the first frame. Redraw
+        // only when the structured view moved or a scrolling buffer gained a line — an idle
+        // watcher then sends the terminal nothing, which is what keeps its memory flat.
+        let mut last_rev: Option<u64> = None;
         loop {
             let _ = write_heartbeat_in(state_dir);
 
@@ -1050,15 +1100,17 @@ mod tui {
                 next_prune_ms = now + PRUNE_INTERVAL_MS;
             }
 
+            let mut dirty = false;
             for line in tailer.read_new() {
                 if let Some(l) = stream_line(&line) {
                     push_capped(&mut app.stream, l, STREAM_CAP);
+                    dirty = true;
                 }
             }
 
             sync_pending(app, qdir, approval);
             if let Some(a) = auto.as_mut() {
-                a.tick(app, qdir, live_path, log_path, now);
+                dirty |= a.tick(app, qdir, live_path, log_path, now);
             }
             let count = app.pending.len();
             if count != prev_pending {
@@ -1069,7 +1121,11 @@ mod tui {
                 }
                 prev_pending = count;
             }
-            terminal.draw(|f| ui(f, app))?;
+            let rev = view_revision(app);
+            if dirty || Some(rev) != last_rev {
+                terminal.draw(|f| ui(f, app))?;
+                last_rev = Some(rev);
+            }
 
             if event::poll(Duration::from_millis(POLL_MS))? {
                 if let Event::Key(k) = event::read()? {
@@ -1133,17 +1189,17 @@ mod tui {
         }
         found.sort_by_key(|r| r.ts_ms);
 
-        let mut prev: HashMap<String, (Vec<Choice>, Vec<bool>, usize)> = HashMap::new();
+        let mut prev: HashMap<String, (Vec<Choice>, Vec<usize>, usize)> = HashMap::new();
         for p in app.pending.drain(..) {
-            prev.insert(p.request.id.clone(), (p.choices, p.tight, p.cursor));
+            prev.insert(p.request.id.clone(), (p.choices, p.scope_idx, p.cursor));
         }
         app.pending = found
             .into_iter()
             .map(|req| match prev.remove(&req.id) {
-                Some((choices, tight, cur)) if choices.len() == req.nodes.len() => Pending {
+                Some((choices, scope_idx, cur)) if choices.len() == req.nodes.len() => Pending {
                     cursor: cur.min(req.nodes.len().saturating_sub(1)),
                     choices,
-                    tight,
+                    scope_idx,
                     request: req,
                 },
                 _ => Pending::new(req, approval),
@@ -1239,32 +1295,33 @@ mod tui {
                 .unwrap_or_default(),
             Style::new().fg(Color::DarkGray),
         )));
-        // What an *-always commit would persist for the focused node, so the operator sees
-        // the exact (path-specific or subcommand-scoped) rule before pressing a/d.
+        // What an *-always commit would persist for the focused node at its selected ladder
+        // rung, so the operator sees the exact rule before pressing a/d.
         if let Some(fnode) = p.request.nodes.get(p.cursor) {
-            // MCP rules key on the exact tool name — no args scope, no tight toggle.
-            if fnode.shell == "mcp" {
-                head.push(Line::from(Span::styled(
-                    format!(
-                        "→ rule: tool=\"{}\"   ·  exact tool-name (no args)",
-                        fnode.command
-                    ),
-                    Style::new().fg(Color::Green),
-                )));
+            let rungs = p.node_rungs(p.cursor);
+            let idx = p.scope_idx[p.cursor].min(rungs.len().saturating_sub(1));
+            let rule_desc = match fnode.shell.as_str() {
+                "bash" | "powershell" => match &rungs[idx].args {
+                    Some(a) => format!("command=\"{}\" args=\"{}\"", rungs[idx].target, a),
+                    None => format!("command=\"{}\"  (any args)", rungs[idx].target),
+                },
+                "web-fetch" => format!("url=\"{}\"", rungs[idx].target),
+                "file" => format!("path=\"{}\"", rungs[idx].target),
+                _ => format!("tool=\"{}\"", rungs[idx].target),
+            };
+            let cycle = if rungs.len() > 1 {
+                format!("t: rung {}/{} (cycle)", idx + 1, rungs.len())
             } else {
-                let tight = p.tight[p.cursor];
-                let pat = node_scope(tight, &fnode.shell, &fnode.args)
-                    .map(|a| format!("args=\"{a}\""))
-                    .unwrap_or_else(|| "any args".into());
-                let mode = if tight { "tight" } else { "scope" };
-                head.push(Line::from(Span::styled(
-                    format!(
-                        "→ rule: {} {}   ·  t: {} (toggle)",
-                        fnode.command, pat, mode
-                    ),
-                    Style::new().fg(if tight { Color::Green } else { Color::Yellow }),
-                )));
-            }
+                "exact (no t)".to_string()
+            };
+            head.push(Line::from(Span::styled(
+                format!("→ rule: {rule_desc}   ·  {cycle}"),
+                Style::new().fg(if idx == 0 {
+                    Color::Green
+                } else {
+                    Color::Yellow
+                }),
+            )));
         }
         f.render_widget(Paragraph::new(head), header);
 
@@ -1438,29 +1495,33 @@ mod tui {
             }
         }
 
-        // A guardrail command (rm) defaults to tight, path-specific persistence; `t` toggles
-        // it to the broad subcommand scope only when the operator deliberately asks.
+        // A guardrail command (rm) defaults to the tight rung (index 0, full args); `t`
+        // cycles to the broader subcommand rung only when the operator deliberately asks.
         #[test]
         fn guardrail_defaults_tight_and_t_toggles() {
             let mut app = App::new();
             app.pending
                 .push(Pending::new(rm_request(), &ApprovalConfig::default()));
-            assert!(app.focused().unwrap().tight[0], "rm should default tight");
+            assert_eq!(app.focused().unwrap().scope_idx[0], 0, "rm defaults tight");
 
             let (_, live) = apply_key(&mut app, Key::Commit(CommitMode::Always)).expect("commit");
             assert_eq!(live[0].args.as_deref(), Some("-rf ./test-results{, **}"));
 
             apply_key(&mut app, Key::ToggleScope);
-            assert!(!app.focused().unwrap().tight[0]);
+            assert_eq!(app.focused().unwrap().scope_idx[0], 1);
             let (_, live2) = apply_key(&mut app, Key::Commit(CommitMode::Always)).expect("commit");
-            assert_eq!(live2[0].args, scope_args("-rf ./test-results"));
+            assert_eq!(live2[0].args.as_deref(), Some("-rf{, **}"));
         }
 
-        // A non-guardrail command defaults to subcommand scope (not tight).
+        // A non-guardrail command defaults to the subcommand rung (index 1, not tight).
         #[test]
         fn non_guardrail_defaults_to_subcommand_scope() {
             let app = pending_app();
-            assert!(!app.focused().unwrap().tight[0], "gh should not be tight");
+            assert_eq!(
+                app.focused().unwrap().scope_idx[0],
+                1,
+                "gh defaults subcommand"
+            );
         }
 
         #[test]
@@ -1494,7 +1555,7 @@ mod tui {
             assert_eq!(live.len(), 2);
             let gh = live.iter().find(|r| r.target == "gh").unwrap();
             assert!(!gh.allow);
-            assert_eq!(gh.args, scope_args("pr list"));
+            assert_eq!(gh.args.as_deref(), Some("pr{, **}"));
             assert!(live.iter().find(|r| r.target == "jq").unwrap().allow);
         }
 
@@ -1528,11 +1589,21 @@ mod tui {
             }
         }
 
-        // MCP rules key on the exact tool name — never an args scope, regardless of tight.
+        // MCP nodes have a single fixed rung keyed on the exact tool name — never args.
         #[test]
         fn mcp_node_scope_is_always_none() {
-            assert_eq!(node_scope(false, "mcp", r#"{"fields":[]}"#), None);
-            assert_eq!(node_scope(true, "mcp", r#"{"fields":[]}"#), None);
+            let (rungs, def) = ladder(
+                "mcp",
+                "mcp__x__y",
+                "mcp__x__y",
+                r#"{"fields":[]}"#,
+                None,
+                false,
+            );
+            assert_eq!(rungs.len(), 1);
+            assert_eq!(def, 0);
+            assert!(rungs[0].args.is_none());
+            assert_eq!(rungs[0].target, "mcp__x__y");
         }
 
         #[test]
