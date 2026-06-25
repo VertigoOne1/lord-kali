@@ -8,9 +8,10 @@ use crate::queue::write_atomic;
 use std::path::{Path, PathBuf};
 
 pub(crate) struct LiveRule {
-    // "bash", "powershell", or "web-fetch" — picks the rules table.
+    // "bash", "powershell", "web-fetch", "mcp", or "file" — picks the rules table.
     pub(crate) shell: String,
-    // command basename for bash/powershell, or the full URL for web-fetch.
+    // command basename for bash/powershell, the full URL for web-fetch, the MCP tool name,
+    // or the path pattern for file.
     pub(crate) target: String,
     // optional args pattern, scoping the rule to a subcommand (e.g. "push{, **}").
     // None means command-wide (any args) — used when the node had no arguments.
@@ -28,6 +29,8 @@ fn render_rule(r: &LiveRule) -> String {
     let (table, key) = match r.shell.as_str() {
         "web-fetch" => ("web-fetch.rules", "url"),
         "powershell" => ("powershell.rules", "command"),
+        "mcp" => ("mcp.rules", "tool"),
+        "file" => ("file.rules", "path"),
         _ => ("bash.rules", "command"),
     };
     let mut block = format!("\n[[{table}]]\n{key} = {value}\n");
@@ -72,7 +75,7 @@ pub(crate) fn append_rules(path: &Path, rules: &[LiveRule]) -> std::io::Result<(
 mod tests {
     use super::*;
     use crate::config::{Config, RawConfig};
-    use crate::decision::{handle_bash, handle_web_fetch, Decision};
+    use crate::decision::{handle_bash, handle_mcp, handle_web_fetch, Decision};
 
     fn load(path: &Path) -> Config {
         let content = std::fs::read_to_string(path).unwrap();
@@ -175,6 +178,75 @@ mod tests {
         let config = load(&path);
         assert_eq!(
             handle_web_fetch(&config.web_fetch, None, "https://docs.rs/tokio").map(|(d, _)| d),
+            Some(Decision::Allow)
+        );
+    }
+
+    #[test]
+    fn file_persists_path_rule_and_round_trips() {
+        use crate::decision::handle_file;
+        use crate::ToolInput;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("99-live.toml");
+        append_rules(
+            &path,
+            &[LiveRule {
+                shell: "file".into(),
+                target: "/home/u/proj/**".into(),
+                args: None,
+                allow: true,
+            }],
+        )
+        .unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("[[file.rules]]"));
+        assert!(content.contains("path = \"/home/u/proj/**\""));
+        assert!(!content.contains("args ="), "file rules carry no args");
+
+        // The live file carries only rules; `[file] enabled` lives in the user's config and is
+        // OR'd in by the merge — so mirror that here rather than loading the live file alone.
+        let base = {
+            let raw: RawConfig = toml::from_str("[file]\nenabled = true\n").unwrap();
+            Config::from(raw)
+        };
+        let config = base.merge(load(&path));
+        let input = ToolInput {
+            command: None,
+            url: None,
+            file_path: Some("/home/u/proj/src/main.rs".into()),
+            path: None,
+            extra: Default::default(),
+        };
+        assert_eq!(
+            handle_file(&config.file, "Edit", Some("/home/u/proj"), &input).map(|(d, _)| d),
+            Some(Decision::Allow)
+        );
+    }
+
+    #[test]
+    fn mcp_persists_tool_name_without_args() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("99-live.toml");
+        append_rules(
+            &path,
+            &[LiveRule {
+                shell: "mcp".into(),
+                target: "mcp__playwright__browser_fill_form".into(),
+                args: None,
+                allow: true,
+            }],
+        )
+        .unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("[[mcp.rules]]"));
+        assert!(content.contains("tool = \"mcp__playwright__browser_fill_form\""));
+        assert!(!content.contains("args ="), "mcp rules carry no args scope");
+
+        let config = load(&path);
+        assert_eq!(
+            handle_mcp(&config.mcp, None, "mcp__playwright__browser_fill_form").map(|(d, _)| d),
             Some(Decision::Allow)
         );
     }

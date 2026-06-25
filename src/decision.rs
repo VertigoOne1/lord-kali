@@ -2,10 +2,14 @@
 // per-node decisions into one verdict for the tool call. `dispatch` also builds a
 // parallel per-node trace (for logging) that never affects the decision.
 
-use crate::config::{CommandRule, CommandRules, Config, Pattern, RuleMeta, WebFetchConfig};
+use crate::config::{
+    CommandRule, CommandRules, Config, FileConfig, McpConfig, MutationScope, Pattern, RuleMeta,
+    WebFetchConfig,
+};
 use crate::parse::{extract_commands, extract_commands_powershell, inner_powershell_script};
+use crate::scope::{is_mutation_tool, is_read_tool};
 use crate::worktree::check_worktree_protection;
-use crate::HookInput;
+use crate::{HookInput, ToolInput};
 
 #[derive(Debug, PartialEq, Clone)]
 pub(crate) enum Decision {
@@ -159,6 +163,22 @@ pub(crate) fn dispatch(
             },
             None => empty_trace("web_fetch"),
         },
+        name if name.starts_with("mcp__") => {
+            let summary = hook_input.tool_input.summary();
+            InvocationTrace {
+                final_decision: handle_mcp(&config.mcp, cwd, name),
+                kind: "mcp",
+                nodes: vec![trace_mcp(&config.mcp, cwd, name, summary)],
+            }
+        }
+        name if is_mutation_tool(name) || is_read_tool(name) => {
+            let out = resolve_file(&config.file, name, cwd, &hook_input.tool_input);
+            InvocationTrace {
+                final_decision: out.decision,
+                kind: "file",
+                nodes: out.node.into_iter().collect(),
+            }
+        }
         _ => empty_trace("unknown"),
     }
 }
@@ -209,6 +229,201 @@ fn trace_web_fetch(config: &WebFetchConfig, cwd: Option<&str>, url: &str) -> Nod
         command: url.to_string(),
         args: String::new(),
         matched,
+    }
+}
+
+pub(crate) fn handle_mcp(
+    config: &McpConfig,
+    cwd: Option<&str>,
+    tool: &str,
+) -> Option<(Decision, String)> {
+    for rule in &config.rules {
+        if rule_matches_cwd(&rule.projects, cwd) && rule.pattern.is_match(tool) {
+            return Some((rule.decision.clone(), rule.reason.clone()));
+        }
+    }
+    None
+}
+
+// `summary` is a display-only view of the tool input (see ToolInput::summary); MCP rules
+// match the tool name only, so it never participates in the decision.
+fn trace_mcp(config: &McpConfig, cwd: Option<&str>, tool: &str, summary: String) -> NodeTrace {
+    let matched = config
+        .rules
+        .iter()
+        .find(|rule| rule_matches_cwd(&rule.projects, cwd) && rule.pattern.is_match(tool))
+        .map(|rule| {
+            (
+                rule.decision.clone(),
+                rule.reason.clone(),
+                rule.meta.clone(),
+            )
+        });
+    NodeTrace {
+        shell: "mcp",
+        command: tool.to_string(),
+        args: summary,
+        matched,
+    }
+}
+
+// One file tool call resolves to a final decision plus (optionally) one actionable node.
+// `node` is None only when there is truly nothing to gate (an in-cwd read, or an in-cwd
+// mutation under `mutation_scope = "outside_cwd"`); otherwise the node carries either the
+// matched rule or a passthrough placeholder that routes to the TUI / Claude Code's prompt.
+pub(crate) struct FileOutcome {
+    pub(crate) decision: Option<(Decision, String)>,
+    pub(crate) node: Option<NodeTrace>,
+}
+
+pub(crate) fn resolve_file(
+    config: &FileConfig,
+    tool: &str,
+    cwd: Option<&str>,
+    tool_input: &ToolInput,
+) -> FileOutcome {
+    if !config.enabled {
+        return FileOutcome {
+            decision: None,
+            node: None,
+        };
+    }
+    let raw = match tool_input
+        .file_path
+        .as_deref()
+        .or(tool_input.path.as_deref())
+    {
+        Some(p) => p,
+        None => {
+            return FileOutcome {
+                decision: None,
+                node: None,
+            }
+        }
+    };
+    let path = resolve_path(cwd, raw);
+
+    // Explicit rules first (first match wins) — so a persisted allow resolves silently and a
+    // persisted ask/deny is honored before the cwd-containment default.
+    for rule in &config.rules {
+        if rule_matches_cwd(&rule.projects, cwd) && rule.pattern.is_match(&path) {
+            return FileOutcome {
+                decision: Some((rule.decision.clone(), rule.reason.clone())),
+                node: Some(NodeTrace {
+                    shell: "file",
+                    command: path,
+                    args: String::new(),
+                    matched: Some((
+                        rule.decision.clone(),
+                        rule.reason.clone(),
+                        rule.meta.clone(),
+                    )),
+                }),
+            };
+        }
+    }
+
+    // No rule matched: apply the cwd-containment default. A routed call is a passthrough
+    // (final_decision None) with an actionable node, mirroring how an unknown bash command
+    // routes — so the TUI sees it when alive and Claude Code's own prompt handles it otherwise.
+    let route = if is_mutation_tool(tool) {
+        config.mutation_scope == MutationScope::All || path_outside_cwd(&path, cwd)
+    } else {
+        // read-class tool
+        path_outside_cwd(&path, cwd)
+    };
+
+    if route {
+        FileOutcome {
+            decision: None,
+            node: Some(NodeTrace {
+                shell: "file",
+                command: path,
+                args: String::new(),
+                matched: None,
+            }),
+        }
+    } else {
+        FileOutcome {
+            decision: None,
+            node: None,
+        }
+    }
+}
+
+// Decision-only view, for unit tests of the gating logic.
+#[cfg(test)]
+pub(crate) fn handle_file(
+    config: &FileConfig,
+    tool: &str,
+    cwd: Option<&str>,
+    tool_input: &ToolInput,
+) -> Option<(Decision, String)> {
+    resolve_file(config, tool, cwd, tool_input).decision
+}
+
+// Resolve a tool's target path to an absolute, forward-slash, lexically-normalized form so
+// rule globs and the cwd-containment test compare against one canonical shape. Lexical only
+// (no filesystem touch) — a Write target may not exist yet — and host-independent so results
+// are identical on Windows and CI.
+fn resolve_path(cwd: Option<&str>, raw: &str) -> String {
+    let norm = raw.replace('\\', "/");
+    let joined = if is_absolute(&norm) {
+        norm
+    } else if let Some(c) = cwd {
+        format!("{}/{}", c.replace('\\', "/").trim_end_matches('/'), norm)
+    } else {
+        norm
+    };
+    lexical_normalize(&joined)
+}
+
+fn is_absolute(p: &str) -> bool {
+    let b = p.as_bytes();
+    p.starts_with('/')
+        || (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'/')
+}
+
+fn lexical_normalize(p: &str) -> String {
+    let (root, rest) = split_root(p);
+    let mut out: Vec<&str> = Vec::new();
+    for seg in rest.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                if matches!(out.last(), Some(&s) if s != "..") {
+                    out.pop();
+                } else if root.is_empty() {
+                    out.push("..");
+                }
+            }
+            s => out.push(s),
+        }
+    }
+    format!("{root}{}", out.join("/"))
+}
+
+// Split a forward-slash path into its root ("/", "C:/", or "" for relative) and the rest.
+fn split_root(p: &str) -> (&str, &str) {
+    let b = p.as_bytes();
+    if b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'/' {
+        (&p[..3], &p[3..])
+    } else if let Some(rest) = p.strip_prefix('/') {
+        (&p[..1], rest)
+    } else {
+        ("", p)
+    }
+}
+
+fn path_outside_cwd(path: &str, cwd: Option<&str>) -> bool {
+    match cwd {
+        Some(c) => {
+            let c = lexical_normalize(&c.replace('\\', "/"));
+            let c = c.trim_end_matches('/');
+            !(path == c || path.starts_with(&format!("{c}/")))
+        }
+        // cwd unknown: can't prove the path escapes it, so don't gate on containment.
+        None => false,
     }
 }
 
@@ -1196,5 +1411,287 @@ mod tests {
             handle_bash_tool(&bash, &powershell, None, "pwsh -File x.ps1").map(|(d, _)| d),
             None
         );
+    }
+
+    // --- MCP tool gating ---
+
+    fn config_from(toml_str: &str) -> Config {
+        let raw: crate::config::RawConfig = toml::from_str(toml_str).unwrap();
+        Config::from(raw)
+    }
+
+    fn mcp_hook(tool: &str, input_json: &str) -> HookInput {
+        HookInput {
+            tool_name: tool.into(),
+            tool_input: serde_json::from_str(input_json).unwrap(),
+            cwd: None,
+            hook_event_name: None,
+            session_id: None,
+        }
+    }
+
+    #[test]
+    fn dispatch_mcp_glob_deny() {
+        let config = config_from(
+            r#"
+[[mcp.rules]]
+tool = "mcp__playwright__*"
+decision = "deny"
+reason = "no browser"
+"#,
+        );
+        let trace = dispatch(
+            &config,
+            &mcp_hook("mcp__playwright__browser_click", "{}"),
+            None,
+        );
+        assert_eq!(trace.kind, "mcp");
+        assert_eq!(trace.final_decision.map(|(d, _)| d), Some(Decision::Deny));
+    }
+
+    #[test]
+    fn dispatch_mcp_passthrough_is_actionable() {
+        let config = config_from("");
+        let trace = dispatch(
+            &config,
+            &mcp_hook("mcp__playwright__browser_click", r#"{"ref":"e1"}"#),
+            None,
+        );
+        assert_eq!(trace.kind, "mcp");
+        assert!(trace.final_decision.is_none());
+        let nodes = trace.actionable_nodes();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].shell, "mcp");
+        assert_eq!(nodes[0].command, "mcp__playwright__browser_click");
+        assert_eq!(nodes[0].decision, "passthrough");
+    }
+
+    #[test]
+    fn dispatch_mcp_ask_is_actionable() {
+        let config = config_from(
+            r#"
+[[mcp.rules]]
+tool = "mcp__playwright__browser_fill_form"
+decision = "ask"
+"#,
+        );
+        let trace = dispatch(
+            &config,
+            &mcp_hook("mcp__playwright__browser_fill_form", "{}"),
+            None,
+        );
+        assert_eq!(
+            trace.final_decision.as_ref().map(|(d, _)| d),
+            Some(&Decision::Ask)
+        );
+        assert_eq!(trace.actionable_nodes().len(), 1);
+    }
+
+    // The tool name decides; the structured input is only captured for display.
+    #[test]
+    fn dispatch_mcp_summary_does_not_affect_decision() {
+        let config = config_from(
+            r#"
+[[mcp.rules]]
+tool = "mcp__x__y"
+decision = "allow"
+"#,
+        );
+        let trace = dispatch(
+            &config,
+            &mcp_hook("mcp__x__y", r#"{"password":"secret","fields":[1,2,3]}"#),
+            None,
+        );
+        assert_eq!(trace.final_decision.map(|(d, _)| d), Some(Decision::Allow));
+        assert!(trace.nodes[0].args.contains("password"));
+    }
+
+    #[test]
+    fn dispatch_mcp_first_match_wins() {
+        // The specific ask must precede the broad allow to win.
+        let config = config_from(
+            r#"
+[[mcp.rules]]
+tool = "mcp__playwright__browser_fill_form"
+decision = "ask"
+
+[[mcp.rules]]
+tool = "mcp__playwright__*"
+decision = "allow"
+"#,
+        );
+        assert_eq!(
+            dispatch(
+                &config,
+                &mcp_hook("mcp__playwright__browser_fill_form", "{}"),
+                None
+            )
+            .final_decision
+            .map(|(d, _)| d),
+            Some(Decision::Ask)
+        );
+        assert_eq!(
+            dispatch(
+                &config,
+                &mcp_hook("mcp__playwright__browser_click", "{}"),
+                None
+            )
+            .final_decision
+            .map(|(d, _)| d),
+            Some(Decision::Allow)
+        );
+    }
+
+    #[test]
+    fn handle_mcp_project_scoped() {
+        let config = config_from(
+            r#"
+[[mcp.rules]]
+tool = "mcp__*"
+decision = "deny"
+projects = ["/home/user/secret"]
+"#,
+        );
+        assert_eq!(
+            handle_mcp(&config.mcp, Some("/home/user/secret"), "mcp__x__y").map(|(d, _)| d),
+            Some(Decision::Deny)
+        );
+        assert_eq!(
+            handle_mcp(&config.mcp, Some("/home/user/other"), "mcp__x__y"),
+            None
+        );
+    }
+
+    // --- file tool gating ---
+
+    fn file_input(file_path: &str) -> ToolInput {
+        ToolInput {
+            command: None,
+            url: None,
+            file_path: Some(file_path.into()),
+            path: None,
+            extra: Default::default(),
+        }
+    }
+
+    #[test]
+    fn file_disabled_is_inert() {
+        let config = config_from("");
+        let out = resolve_file(&config.file, "Edit", Some("/p"), &file_input("/p/a.rs"));
+        assert!(out.decision.is_none() && out.node.is_none());
+    }
+
+    #[test]
+    fn file_explicit_allow_runs_silently() {
+        let config = config_from(
+            "[file]\nenabled = true\n[[file.rules]]\npath = \"**/*.cs\"\ndecision = \"allow\"\n",
+        );
+        let out = resolve_file(
+            &config.file,
+            "Edit",
+            Some("/p"),
+            &file_input("/p/Startup.cs"),
+        );
+        assert_eq!(out.decision.map(|(d, _)| d), Some(Decision::Allow));
+        // an allow node is resolved (matched) — not actionable, so it never queues.
+        assert!(!out.node.unwrap().is_actionable());
+    }
+
+    #[test]
+    fn file_explicit_deny_and_ask() {
+        let config = config_from(
+            "[file]\nenabled = true\n\
+             [[file.rules]]\npath = \"**/secrets/**\"\ndecision = \"deny\"\n\
+             [[file.rules]]\npath = \"**/*.env\"\ndecision = \"ask\"\n",
+        );
+        assert_eq!(
+            handle_file(
+                &config.file,
+                "Write",
+                Some("/p"),
+                &file_input("/p/secrets/k")
+            )
+            .map(|(d, _)| d),
+            Some(Decision::Deny)
+        );
+        let ask = resolve_file(&config.file, "Write", Some("/p"), &file_input("/p/.env"));
+        assert_eq!(ask.decision.map(|(d, _)| d), Some(Decision::Ask));
+        assert!(ask.node.unwrap().is_actionable());
+    }
+
+    #[test]
+    fn mutation_scope_all_routes_in_cwd_edit() {
+        let config = config_from("[file]\nenabled = true\n"); // mutation_scope defaults to all
+        let out = resolve_file(&config.file, "Edit", Some("/p"), &file_input("/p/src/a.rs"));
+        assert!(
+            out.decision.is_none(),
+            "routed passthrough, no forced decision"
+        );
+        let node = out.node.expect("an actionable node so it queues");
+        assert!(node.is_actionable());
+        assert_eq!(node.shell, "file");
+        assert_eq!(node.command, "/p/src/a.rs");
+    }
+
+    #[test]
+    fn mutation_scope_outside_cwd_skips_in_cwd_but_gates_escapes() {
+        let config = config_from("[file]\nenabled = true\nmutation_scope = \"outside_cwd\"\n");
+        // in-cwd edit: nothing to gate
+        let inside = resolve_file(&config.file, "Edit", Some("/p"), &file_input("/p/src/a.rs"));
+        assert!(inside.node.is_none());
+        // edit escaping cwd via a relative path resolves and routes
+        let outside = resolve_file(
+            &config.file,
+            "Edit",
+            Some("/home/u/proj"),
+            &file_input("../other/Startup.cs"),
+        );
+        assert!(outside.decision.is_none());
+        let node = outside.node.expect("out-of-cwd edit routes");
+        assert_eq!(node.command, "/home/u/other/Startup.cs");
+    }
+
+    #[test]
+    fn read_only_gated_outside_cwd() {
+        let config = config_from("[file]\nenabled = true\n");
+        assert!(
+            resolve_file(&config.file, "Read", Some("/p"), &file_input("/p/src/a.rs"))
+                .node
+                .is_none()
+        );
+        let out = resolve_file(&config.file, "Read", Some("/p"), &file_input("/other/x.rs"));
+        assert!(out.node.expect("out-of-cwd read routes").is_actionable());
+    }
+
+    #[test]
+    fn file_windows_path_resolves_against_cwd() {
+        let config = config_from("[file]\nenabled = true\nmutation_scope = \"outside_cwd\"\n");
+        let out = resolve_file(
+            &config.file,
+            "Edit",
+            Some(r"C:\Users\me\proj"),
+            &file_input(r"..\co-flo-apigateway\Startup.cs"),
+        );
+        let node = out.node.expect("escapes cwd → routes");
+        assert_eq!(node.command, "C:/Users/me/co-flo-apigateway/Startup.cs");
+    }
+
+    #[test]
+    fn worktree_deny_precedes_file_rules() {
+        // Inside a worktree, an edit targeting the parent project is denied by worktree
+        // protection before file gating ever runs.
+        let config = config_from(
+            "[file]\nenabled = true\n[[file.rules]]\npath = \"**\"\ndecision = \"allow\"\n",
+        );
+        let hook = HookInput {
+            tool_name: "Edit".into(),
+            tool_input: file_input("/home/u/proj/src/main.rs"),
+            cwd: Some("/home/u/proj/.claude/worktrees/feat".into()),
+            hook_event_name: None,
+            session_id: None,
+        };
+        let trace = dispatch(&config, &hook, hook.cwd.as_deref());
+        assert_eq!(trace.kind, "worktree_protection");
+        assert_eq!(trace.final_decision.map(|(d, _)| d), Some(Decision::Deny));
     }
 }

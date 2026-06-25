@@ -127,6 +127,7 @@ mod tests {
             url: None,
             file_path: file_path.map(String::from),
             path: path.map(String::from),
+            extra: Default::default(),
         }
     }
 

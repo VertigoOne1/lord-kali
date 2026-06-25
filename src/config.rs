@@ -14,6 +14,8 @@ pub(crate) struct Config {
     pub(crate) bash: CommandRules,
     pub(crate) powershell: CommandRules,
     pub(crate) web_fetch: WebFetchConfig,
+    pub(crate) mcp: McpConfig,
+    pub(crate) file: FileConfig,
     pub(crate) log: Option<LogConfig>,
     pub(crate) worktree_protection: WorktreeProtectionConfig,
     pub(crate) approval: ApprovalConfig,
@@ -28,6 +30,8 @@ impl Config {
             self.powershell.rules.entry(cmd).or_default().extend(rules);
         }
         self.web_fetch.rules.extend(other.web_fetch.rules);
+        self.mcp.rules.extend(other.mcp.rules);
+        self.file = self.file.merge(other.file);
         if other.log.is_some() {
             self.log = other.log;
         }
@@ -212,6 +216,172 @@ pub(crate) struct RawWebFetchRule {
     pub(crate) projects: Vec<String>,
 }
 
+// MCP tool-call gating, keyed on the full `mcp__<server>__<tool>` name (glob or /regex/).
+// A flat rule list like web-fetch — no args matching; the tool name is the whole key.
+#[derive(Default)]
+pub(crate) struct McpConfig {
+    pub(crate) rules: Vec<McpRule>,
+}
+
+impl McpConfig {
+    pub(crate) fn from_raw(raw: RawMcpConfig, group_projects: &[String], source: Source) -> Self {
+        McpConfig {
+            rules: raw
+                .rules
+                .into_iter()
+                .map(|r| {
+                    let decision = match r.decision.as_str() {
+                        "allow" => Decision::Allow,
+                        "deny" => Decision::Deny,
+                        "ask" => Decision::Ask,
+                        other => panic!("Invalid decision '{}' for mcp tool '{}'", other, r.tool),
+                    };
+                    let projects = merge_and_expand_projects(group_projects, &r.projects);
+                    let meta = RuleMeta {
+                        source_file: source.clone(),
+                        rule_kind: RuleKind::Explicit,
+                        rule_command: Some(r.tool.clone()),
+                        rule_args: Some(r.tool.clone()),
+                    };
+                    McpRule {
+                        decision,
+                        pattern: compile_pattern(&r.tool),
+                        reason: r.reason.unwrap_or_else(|| "ok".into()),
+                        projects,
+                        meta,
+                    }
+                })
+                .collect(),
+        }
+    }
+}
+
+pub(crate) struct McpRule {
+    pub(crate) decision: Decision,
+    pub(crate) pattern: Pattern,
+    pub(crate) reason: String,
+    pub(crate) projects: Vec<PathBuf>,
+    pub(crate) meta: RuleMeta,
+}
+
+#[derive(Default, Deserialize)]
+pub(crate) struct RawMcpConfig {
+    #[serde(default)]
+    pub(crate) rules: Vec<RawMcpRule>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct RawMcpRule {
+    pub(crate) tool: String,
+    pub(crate) decision: String,
+    pub(crate) reason: Option<String>,
+    #[serde(default)]
+    pub(crate) projects: Vec<String>,
+}
+
+// File-edit gating, keyed on the target path (glob or /regex/). Same flat-rule shape as
+// web-fetch — first-match-wins, no args. Opt-in: inert unless `[file] enabled = true`.
+#[derive(Default)]
+pub(crate) struct FileConfig {
+    pub(crate) enabled: bool,
+    pub(crate) mutation_scope: MutationScope,
+    pub(crate) rules: Vec<FileRule>,
+}
+
+// What an unmatched file mutation (Write/Edit/MultiEdit/NotebookEdit) defaults to:
+// `All` routes every mutation to the gate so the operator can see and whitelist them;
+// `OutsideCwd` only gates mutations whose resolved path escapes cwd (in-cwd passes through).
+#[derive(Clone, Copy, Default, PartialEq, Debug)]
+pub(crate) enum MutationScope {
+    #[default]
+    All,
+    OutsideCwd,
+}
+
+impl FileConfig {
+    // Opt-in feature: enabling anywhere enables. The scope follows whichever config first
+    // turned it on (self is higher priority); rules concatenate, first-match-wins.
+    fn merge(mut self, other: Self) -> Self {
+        let mutation_scope = if self.enabled {
+            self.mutation_scope
+        } else {
+            other.mutation_scope
+        };
+        self.rules.extend(other.rules);
+        FileConfig {
+            enabled: self.enabled || other.enabled,
+            mutation_scope,
+            rules: self.rules,
+        }
+    }
+
+    fn from_raw(raw: RawFileConfig, group_projects: &[String], source: Source) -> Self {
+        let mutation_scope = match raw.mutation_scope.as_deref() {
+            None | Some("all") => MutationScope::All,
+            Some("outside_cwd") => MutationScope::OutsideCwd,
+            Some(other) => {
+                panic!("Invalid mutation_scope '{other}' (use \"all\" or \"outside_cwd\")")
+            }
+        };
+        FileConfig {
+            enabled: raw.enabled,
+            mutation_scope,
+            rules: raw
+                .rules
+                .into_iter()
+                .map(|r| {
+                    let decision = match r.decision.as_str() {
+                        "allow" => Decision::Allow,
+                        "deny" => Decision::Deny,
+                        "ask" => Decision::Ask,
+                        other => panic!("Invalid decision '{}' for path '{}'", other, r.path),
+                    };
+                    let projects = merge_and_expand_projects(group_projects, &r.projects);
+                    let meta = RuleMeta {
+                        source_file: source.clone(),
+                        rule_kind: RuleKind::Explicit,
+                        rule_command: Some(r.path.clone()),
+                        rule_args: Some(r.path.clone()),
+                    };
+                    FileRule {
+                        decision,
+                        pattern: compile_pattern(&r.path),
+                        reason: r.reason.unwrap_or_else(|| "ok".into()),
+                        projects,
+                        meta,
+                    }
+                })
+                .collect(),
+        }
+    }
+}
+
+pub(crate) struct FileRule {
+    pub(crate) decision: Decision,
+    pub(crate) pattern: Pattern,
+    pub(crate) reason: String,
+    pub(crate) projects: Vec<PathBuf>,
+    pub(crate) meta: RuleMeta,
+}
+
+#[derive(Default, Deserialize)]
+pub(crate) struct RawFileConfig {
+    #[serde(default)]
+    pub(crate) enabled: bool,
+    pub(crate) mutation_scope: Option<String>,
+    #[serde(default)]
+    pub(crate) rules: Vec<RawFileRule>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct RawFileRule {
+    pub(crate) path: String,
+    pub(crate) decision: String,
+    pub(crate) reason: Option<String>,
+    #[serde(default)]
+    pub(crate) projects: Vec<String>,
+}
+
 #[derive(Default, Deserialize)]
 pub(crate) struct RawConfig {
     #[serde(default)]
@@ -220,6 +390,10 @@ pub(crate) struct RawConfig {
     pub(crate) powershell: RawCommandConfig,
     #[serde(default, rename = "web-fetch")]
     pub(crate) web_fetch: RawWebFetchConfig,
+    #[serde(default)]
+    pub(crate) mcp: RawMcpConfig,
+    #[serde(default)]
+    pub(crate) file: RawFileConfig,
     pub(crate) log: Option<LogConfig>,
     #[serde(default, rename = "worktree-protection")]
     pub(crate) worktree_protection: RawWorktreeProtectionConfig,
@@ -239,6 +413,10 @@ pub(crate) struct RawGroupConfig {
     pub(crate) powershell: RawCommandConfig,
     #[serde(default, rename = "web-fetch")]
     pub(crate) web_fetch: RawWebFetchConfig,
+    #[serde(default)]
+    pub(crate) mcp: RawMcpConfig,
+    #[serde(default)]
+    pub(crate) file: RawFileConfig,
 }
 
 impl From<RawConfig> for Config {
@@ -252,6 +430,8 @@ impl Config {
         let mut bash = CommandRules::from_raw(raw.bash, &[], source.clone());
         let mut powershell = CommandRules::from_raw(raw.powershell, &[], source.clone());
         let mut web_fetch = WebFetchConfig::from_raw(raw.web_fetch, &[], source.clone());
+        let mut mcp = McpConfig::from_raw(raw.mcp, &[], source.clone());
+        let mut file = FileConfig::from_raw(raw.file, &[], source.clone());
 
         for group in raw.group {
             let group_bash = CommandRules::from_raw(group.bash, &group.projects, source.clone());
@@ -268,12 +448,20 @@ impl Config {
             let group_web_fetch =
                 WebFetchConfig::from_raw(group.web_fetch, &group.projects, source.clone());
             web_fetch.rules.extend(group_web_fetch.rules);
+
+            let group_mcp = McpConfig::from_raw(group.mcp, &group.projects, source.clone());
+            mcp.rules.extend(group_mcp.rules);
+
+            let group_file = FileConfig::from_raw(group.file, &group.projects, source.clone());
+            file.rules.extend(group_file.rules);
         }
 
         Config {
             bash,
             powershell,
             web_fetch,
+            mcp,
+            file,
             log: raw.log,
             worktree_protection: WorktreeProtectionConfig {
                 enabled: raw.worktree_protection.enabled,
@@ -283,6 +471,7 @@ impl Config {
                 live_rules: raw.approval.live_rules,
                 state_dir: raw.approval.state_dir,
                 guardrail_commands: raw.approval.guardrail_commands,
+                llm: raw.approval.llm.map(ApprovalLlmConfig::from),
             },
         }
     }
@@ -392,6 +581,8 @@ pub(crate) struct ApprovalConfig {
     pub(crate) live_rules: Option<String>,
     pub(crate) state_dir: Option<String>,
     pub(crate) guardrail_commands: Vec<String>,
+    // Optional LLM auto-approval (Phase 2). None or disabled => the watch never consults a model.
+    pub(crate) llm: Option<ApprovalLlmConfig>,
 }
 
 impl ApprovalConfig {
@@ -404,6 +595,7 @@ impl ApprovalConfig {
             live_rules: other.live_rules.or(self.live_rules),
             state_dir: other.state_dir.or(self.state_dir),
             guardrail_commands: self.guardrail_commands,
+            llm: other.llm.or(self.llm),
         }
     }
 
@@ -425,6 +617,71 @@ pub(crate) struct RawApprovalConfig {
     pub(crate) state_dir: Option<String>,
     #[serde(default)]
     pub(crate) guardrail_commands: Vec<String>,
+    pub(crate) llm: Option<RawApprovalLlmConfig>,
+}
+
+// Runtime LLM auto-approval (Phase 2). When `enabled` and the watch is running, a passthrough
+// request the operator hasn't touched after `queue_wait_ms` is sent to the model; a confident
+// `safe` becomes a proposal that auto-applies after `proposal_wait_ms` if still untouched.
+// Anything else degrades to passthrough. Timings are sized to fit the 50s hook self-timeout.
+pub(crate) struct ApprovalLlmConfig {
+    pub(crate) enabled: bool,
+    pub(crate) model: String,
+    pub(crate) base_url: String,
+    // Name of the env var holding the API key (kept out of config files).
+    pub(crate) api_key_env: String,
+    pub(crate) queue_wait_ms: u64,
+    pub(crate) proposal_wait_ms: u64,
+    pub(crate) timeout_ms: u64,
+    pub(crate) max_attempts: u32,
+    // Prompt override; None => the locked default in llm.rs.
+    pub(crate) system: Option<String>,
+    pub(crate) user: Option<String>,
+    // Which tools the model is allowed to judge. The model is a *shell-command* safety
+    // gate, so this defaults to Bash/PowerShell; file and other tools are never consulted
+    // and ride the operator/timeout fallback instead.
+    pub(crate) tools: Vec<String>,
+}
+
+impl From<RawApprovalLlmConfig> for ApprovalLlmConfig {
+    fn from(r: RawApprovalLlmConfig) -> Self {
+        use crate::llm;
+        ApprovalLlmConfig {
+            enabled: r.enabled,
+            model: r.model.unwrap_or_else(|| llm::DEFAULT_MODEL.to_string()),
+            base_url: r
+                .base_url
+                .unwrap_or_else(|| llm::DEFAULT_BASE_URL.to_string()),
+            api_key_env: r
+                .api_key_env
+                .unwrap_or_else(|| "OPENROUTER_API_KEY".to_string()),
+            queue_wait_ms: r.queue_wait_ms.unwrap_or(10_000),
+            proposal_wait_ms: r.proposal_wait_ms.unwrap_or(5_000),
+            timeout_ms: r.timeout_ms.unwrap_or(llm::DEFAULT_TIMEOUT_MS),
+            max_attempts: r.max_attempts.unwrap_or(llm::DEFAULT_MAX_ATTEMPTS),
+            system: r.system,
+            user: r.user,
+            tools: r
+                .tools
+                .unwrap_or_else(|| vec!["Bash".to_string(), "PowerShell".to_string()]),
+        }
+    }
+}
+
+#[derive(Default, Deserialize)]
+pub(crate) struct RawApprovalLlmConfig {
+    #[serde(default)]
+    pub(crate) enabled: bool,
+    pub(crate) model: Option<String>,
+    pub(crate) base_url: Option<String>,
+    pub(crate) api_key_env: Option<String>,
+    pub(crate) queue_wait_ms: Option<u64>,
+    pub(crate) proposal_wait_ms: Option<u64>,
+    pub(crate) timeout_ms: Option<u64>,
+    pub(crate) max_attempts: Option<u32>,
+    pub(crate) system: Option<String>,
+    pub(crate) user: Option<String>,
+    pub(crate) tools: Option<Vec<String>>,
 }
 
 pub(crate) fn expand_tilde(path: &str) -> PathBuf {
@@ -622,6 +879,8 @@ mod tests {
             log: None,
             worktree_protection: RawWorktreeProtectionConfig::default(),
             approval: RawApprovalConfig::default(),
+            mcp: RawMcpConfig::default(),
+            file: RawFileConfig::default(),
             group: vec![RawGroupConfig {
                 projects: vec!["/home/user/projects/test".into()],
                 bash: RawCommandConfig {
@@ -636,6 +895,8 @@ mod tests {
                 },
                 powershell: RawCommandConfig::default(),
                 web_fetch: RawWebFetchConfig::default(),
+                mcp: RawMcpConfig::default(),
+                file: RawFileConfig::default(),
             }],
         };
         let config = Config::from(raw);
@@ -669,6 +930,8 @@ mod tests {
             log: None,
             worktree_protection: RawWorktreeProtectionConfig::default(),
             approval: RawApprovalConfig::default(),
+            mcp: RawMcpConfig::default(),
+            file: RawFileConfig::default(),
             group: vec![RawGroupConfig {
                 projects: vec!["/home/user/projects/a".into()],
                 bash: RawCommandConfig {
@@ -683,6 +946,8 @@ mod tests {
                 },
                 powershell: RawCommandConfig::default(),
                 web_fetch: RawWebFetchConfig::default(),
+                mcp: RawMcpConfig::default(),
+                file: RawFileConfig::default(),
             }],
         };
         let config = Config::from(raw);
@@ -713,6 +978,8 @@ mod tests {
             log: None,
             worktree_protection: RawWorktreeProtectionConfig::default(),
             approval: RawApprovalConfig::default(),
+            mcp: RawMcpConfig::default(),
+            file: RawFileConfig::default(),
             group: vec![RawGroupConfig {
                 projects: vec!["/home/user/projects/test".into()],
                 bash: RawCommandConfig {
@@ -721,6 +988,8 @@ mod tests {
                 },
                 powershell: RawCommandConfig::default(),
                 web_fetch: RawWebFetchConfig::default(),
+                mcp: RawMcpConfig::default(),
+                file: RawFileConfig::default(),
             }],
         };
         let config = Config::from(raw);
@@ -754,6 +1023,8 @@ mod tests {
             log: None,
             worktree_protection: RawWorktreeProtectionConfig::default(),
             approval: RawApprovalConfig::default(),
+            mcp: RawMcpConfig::default(),
+            file: RawFileConfig::default(),
             group: vec![RawGroupConfig {
                 projects: vec!["/home/user/projects/test".into()],
                 bash: RawCommandConfig::default(),
@@ -766,6 +1037,8 @@ mod tests {
                         projects: vec![],
                     }],
                 },
+                mcp: RawMcpConfig::default(),
+                file: RawFileConfig::default(),
             }],
         };
         let config = Config::from(raw);
@@ -808,6 +1081,8 @@ mod tests {
             log: None,
             worktree_protection: RawWorktreeProtectionConfig::default(),
             approval: RawApprovalConfig::default(),
+            mcp: RawMcpConfig::default(),
+            file: RawFileConfig::default(),
             group: vec![RawGroupConfig {
                 projects: vec!["/home/user/projects/test".into()],
                 bash: RawCommandConfig {
@@ -822,6 +1097,8 @@ mod tests {
                 },
                 powershell: RawCommandConfig::default(),
                 web_fetch: RawWebFetchConfig::default(),
+                mcp: RawMcpConfig::default(),
+                file: RawFileConfig::default(),
             }],
         };
         let config = Config::from(raw);

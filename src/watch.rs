@@ -2,14 +2,15 @@
 // correlating each pre_tool_use with its post_tool_use so you can see in real time what
 // ran, what is awaiting approval, and which command nodes matched no rule.
 
-use crate::config::{expand_tilde, load_config};
-use crate::log::{now_ms, DEFAULT_LOG_PATH};
+use crate::log::now_ms;
 use std::collections::HashMap;
 use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
 
 const WATCH_POLL_MS: u64 = 200;
 const PENDING_TIMEOUT_MS: u64 = 60_000;
+// The watcher tidies the log on open and once an hour while running (best-effort).
+const PRUNE_INTERVAL_MS: u64 = 3_600_000;
 
 struct Palette {
     color: bool,
@@ -35,19 +36,6 @@ struct PendingPre {
     // For an `ask`, the node in the chain that drove the verdict (`command args — reason`).
     // None for `passthrough` (nothing matched, so nothing "triggered" the rejection).
     deciding: Option<String>,
-}
-
-fn resolve_log_path(explicit: Option<&str>) -> PathBuf {
-    if let Some(p) = explicit {
-        return expand_tilde(p);
-    }
-    let config = load_config(None);
-    let path_str = config
-        .log
-        .as_ref()
-        .and_then(|l| l.path.as_deref())
-        .unwrap_or(DEFAULT_LOG_PATH);
-    expand_tilde(path_str)
 }
 
 fn event_target(v: &serde_json::Value) -> String {
@@ -224,6 +212,13 @@ impl Tailer {
         }
     }
 
+    // Skip to the current end of file without emitting anything. Used right after a prune
+    // rewrites the log, so the retained history is not replayed into the live stream.
+    fn resync_to_end(&mut self) {
+        self.offset = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
+        self.carry.clear();
+    }
+
     fn read_new(&mut self) -> Vec<String> {
         use std::io::{Seek, SeekFrom};
         let mut lines = Vec::new();
@@ -270,7 +265,7 @@ pub(crate) fn watch(args: &[String]) {
 }
 
 fn watch_tail(explicit_path: Option<&str>) {
-    let path = resolve_log_path(explicit_path);
+    let path = crate::log::resolve_log_path(explicit_path);
     let palette = Palette {
         color: std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none(),
     };
@@ -280,10 +275,19 @@ fn watch_tail(explicit_path: Option<&str>) {
         "PASS/ASK go to approval; an indented line shows whether they ran. Ctrl-C to stop.\n"
     );
 
-    let mut tailer = Tailer::new(path);
+    // Tidy before tailing so retained history is not printed as if it were new.
+    let _ = crate::log::prune_log_file(&path, crate::log::DEFAULT_RETAIN_DAYS, now_ms());
+    let mut tailer = Tailer::new(path.clone());
     let mut pending: HashMap<String, PendingPre> = HashMap::new();
+    let mut next_prune_ms = now_ms() + PRUNE_INTERVAL_MS;
 
     loop {
+        let now = now_ms();
+        if now >= next_prune_ms {
+            let _ = crate::log::prune_log_file(&path, crate::log::DEFAULT_RETAIN_DAYS, now);
+            tailer.resync_to_end();
+            next_prune_ms = now + PRUNE_INTERVAL_MS;
+        }
         for line in tailer.read_new() {
             handle_line(&palette, &line, &mut pending);
         }
@@ -295,13 +299,19 @@ fn watch_tail(explicit_path: Option<&str>) {
 // The interactive approval TUI: a scrolling decision stream on top, and a pending-approval
 // pane below where the operator rules on the actionable command nodes of each blocked call.
 mod tui {
-    use super::{event_target, resolve_log_path, unmatched_nodes, Tailer};
-    use crate::config::{load_config, ApprovalConfig};
+    use super::{event_target, unmatched_nodes, Tailer, PRUNE_INTERVAL_MS};
+    use crate::config::{load_config, ApprovalConfig, ApprovalLlmConfig};
     use crate::live_rules::{append_rules, live_rules_path, LiveRule};
+    use crate::llm::{
+        judge, parse_judgement, LlmConfig, PromptTemplate, PromptVars, Verdict as LlmVerdict,
+        DEFAULT_BACKOFF_MS, DEFAULT_SYSTEM_PROMPT, DEFAULT_USER_TEMPLATE,
+    };
     use crate::log::now_ms;
+    use crate::log::{log_event, prune_log_file, resolve_log_path, DEFAULT_RETAIN_DAYS};
     use crate::queue::{
         self, write_atomic, write_heartbeat_in, Action, QueueRequest, Verdict, VerdictNode,
     };
+    use crate::scope::{ladder, ScopeRung};
     use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
     use ratatui::layout::{Constraint, Layout, Rect};
     use ratatui::style::{Color, Modifier, Style};
@@ -310,10 +320,13 @@ mod tui {
     use ratatui::{DefaultTerminal, Frame};
     use std::collections::HashMap;
     use std::path::Path;
+    use std::sync::mpsc::{channel, Receiver, Sender};
     use std::time::Duration;
 
     const POLL_MS: u64 = 200;
     const STREAM_CAP: usize = 1000;
+    // The model-activity buffer is low-volume, so a small cap keeps plenty of history.
+    const LLM_STREAM_CAP: usize = 200;
     // A request from a crashed hook (no self-cleanup) is swept after this age.
     const REQ_MAX_AGE_MS: u64 = 120_000;
 
@@ -356,26 +369,61 @@ mod tui {
     struct Pending {
         request: QueueRequest,
         choices: Vec<Choice>,
-        // Per node: whether an *-always rule persists tight (full-args, path-specific)
-        // rather than subcommand-scoped. Defaults true for guardrail commands.
-        tight: Vec<bool>,
+        // Per node: which rung of its scope ladder an *-always rule persists at. `t` cycles
+        // it; the default comes from scope::ladder (tight for guardrail commands and files).
+        scope_idx: Vec<usize>,
         cursor: usize,
     }
 
     impl Pending {
         fn new(request: QueueRequest, approval: &ApprovalConfig) -> Self {
             let choices = vec![Choice::Allow; request.nodes.len()];
-            let tight = request
+            let scope_idx = request
                 .nodes
                 .iter()
-                .map(|n| approval.is_guardrail(&n.command))
+                .map(|n| {
+                    ladder(
+                        &n.shell,
+                        &request.tool,
+                        &n.command,
+                        &n.args,
+                        request.cwd.as_deref(),
+                        approval.is_guardrail(&n.command),
+                    )
+                    .1
+                })
                 .collect();
             Pending {
                 request,
                 choices,
-                tight,
+                scope_idx,
                 cursor: 0,
             }
+        }
+
+        // The scope rungs for node `i` (tightest → broadest). The guardrail flag only sets
+        // the default index at construction, so it is irrelevant here.
+        fn node_rungs(&self, i: usize) -> Vec<ScopeRung> {
+            let n = &self.request.nodes[i];
+            ladder(
+                &n.shell,
+                &self.request.tool,
+                &n.command,
+                &n.args,
+                self.request.cwd.as_deref(),
+                false,
+            )
+            .0
+        }
+
+        // The rung an *-always rule will persist for node `i`, honoring its `t` selection.
+        fn selected_rung(&self, i: usize) -> ScopeRung {
+            let rungs = self.node_rungs(i);
+            let idx = self.scope_idx[i].min(rungs.len().saturating_sub(1));
+            rungs.into_iter().nth(idx).unwrap_or(ScopeRung {
+                target: self.request.nodes[i].command.clone(),
+                args: None,
+            })
         }
     }
 
@@ -422,22 +470,29 @@ mod tui {
 
     struct App {
         stream: Vec<Line<'static>>,
+        // Model-activity lines (consult / verdict / auto-approve) live in their own buffer so the
+        // high-volume decision stream can't bury or evict them — rendered in a dedicated pane.
+        llm_stream: Vec<Line<'static>>,
         pending: Vec<Pending>,
         focus: usize,
         should_quit: bool,
         // Armed by a first Ctrl-C; a second one quits (consistent with Claude Code). Any
         // other key disarms it.
         ctrl_c_armed: bool,
+        // Set to the model name when LLM auto-approval is live, for the footer indicator.
+        llm_status: Option<String>,
     }
 
     impl App {
         fn new() -> Self {
             App {
                 stream: Vec::new(),
+                llm_stream: Vec::new(),
                 pending: Vec::new(),
                 focus: 0,
                 should_quit: false,
                 ctrl_c_armed: false,
+                llm_status: None,
             }
         }
 
@@ -450,39 +505,9 @@ mod tui {
         }
     }
 
-    // Scope a persisted rule to the node's subcommand: the first argument token plus any
-    // trailing args (e.g. "push" -> "push{, **}"). None when the node had no args, which
-    // persists command-wide. This is why allowing `git push` does not bless `git commit`.
-    fn scope_args(args: &str) -> Option<String> {
-        let first = args.split_whitespace().next()?;
-        Some(format!("{first}{{, **}}"))
-    }
-
-    // Tight (path-specific) scope: pin the whole args string, tolerating extra trailing
-    // args. So `rm -rf ./test-results` persists as `-rf ./test-results{, **}` — it can
-    // never match `rm -rf /`. None (command-wide) only when there were no args at all.
-    fn tight_args(args: &str) -> Option<String> {
-        if args.is_empty() {
-            None
-        } else {
-            Some(format!("{args}{{, **}}"))
-        }
-    }
-
-    // The args pattern an *-always rule would persist for a node, honoring its tight flag.
-    fn node_scope(tight: bool, shell: &str, args: &str) -> Option<String> {
-        if shell == "web-fetch" {
-            None
-        } else if tight {
-            tight_args(args)
-        } else {
-            scope_args(args)
-        }
-    }
-
     // Each node resolves by its lane: Allow -> allow, Deny -> deny, Ask -> passthrough
     // (deferred to Claude Code's prompt). The mode picks once vs always; *_always actions
-    // persist a subcommand-scoped rule (web-fetch persists the exact URL). Ask never persists.
+    // persist a rule scoped to the node's currently-selected ladder rung. Ask never persists.
     fn build_verdict(p: &Pending, mode: CommitMode) -> (Verdict, Vec<LiveRule>) {
         let mut nodes = Vec::new();
         let mut live = Vec::new();
@@ -496,10 +521,11 @@ mod tui {
                 (Choice::Ask, _) => Action::Passthrough,
             };
             if matches!(mode, CommitMode::Always) && choice != Choice::Ask {
+                let rung = p.selected_rung(i);
                 live.push(LiveRule {
                     shell: node.shell.clone(),
-                    target: node.command.clone(),
-                    args: node_scope(p.tight[i], &node.shell, &node.args),
+                    target: rung.target,
+                    args: rung.args,
                     allow: choice == Choice::Allow,
                 });
             }
@@ -592,8 +618,12 @@ mod tui {
             }
             Key::ToggleScope => {
                 if let Some(p) = app.focused_mut() {
-                    if let Some(t) = p.tight.get_mut(p.cursor) {
-                        *t = !*t;
+                    let cursor = p.cursor;
+                    let len = p.node_rungs(cursor).len();
+                    if len > 1 {
+                        if let Some(idx) = p.scope_idx.get_mut(cursor) {
+                            *idx = (*idx + 1) % len;
+                        }
                     }
                 }
                 None
@@ -643,15 +673,385 @@ mod tui {
         let _ = out.flush();
     }
 
+    // ---- LLM auto-approval (Phase 2) -----------------------------------------------------
+    //
+    // A passthrough the operator hasn't touched for `queue_wait_ms` is sent to the model on a
+    // worker thread (never blocking the TUI). A confident `safe` becomes a Proposed entry that
+    // auto-applies — as a TIGHT, persisted allow rule — after `proposal_wait_ms` if still
+    // untouched. Any other model outcome (unsafe / malformed / transport error) becomes
+    // Declined and the call simply rides out to the hook's own fallback. The model never
+    // auto-denies. This whole path is inert unless `[approval.llm] enabled` and the key is set.
+
+    // What a worker thread reports back — full detail so every consult is logged, not just the
+    // ones that auto-apply. `kind` is "safe" | "unsafe" | "malformed" | "error"; only a "safe"
+    // is actionable (the model never auto-denies).
+    struct LlmReport {
+        target: String,
+        kind: &'static str,
+        reason: Option<String>,
+        latency_ms: u64,
+        detail: Option<String>,
+    }
+
+    // Per-request state, keyed by request id so it survives sync_pending rebuilding the list.
+    enum LlmPhase {
+        Requested,
+        Proposed { reason: String, at_ms: u64 },
+        Declined,
+    }
+
+    // The fields a worker needs, pulled out so spawning doesn't borrow the pending list.
+    struct SpawnReq {
+        id: String,
+        target: String,
+        tool: String,
+        cwd: Option<String>,
+    }
+
+    struct AutoApprover {
+        cfg: LlmConfig,
+        prompt: PromptTemplate,
+        queue_wait_ms: u64,
+        proposal_wait_ms: u64,
+        // Tools the model is allowed to judge (the LLM-eligibility matcher). The model is a
+        // *shell-command* safety gate, so this is Bash/PowerShell by default; file, MCP, and
+        // WebFetch calls carry no shell command to reason about and skip the model entirely,
+        // riding the operator/hook fallback so they can still be triaged in the TUI.
+        tools: Vec<String>,
+        tx: Sender<(String, LlmReport)>,
+        rx: Receiver<(String, LlmReport)>,
+        state: HashMap<String, LlmPhase>,
+    }
+
+    impl AutoApprover {
+        fn llm_eligible(&self, tool: &str) -> bool {
+            self.tools.iter().any(|t| t == tool)
+        }
+    }
+
+    impl AutoApprover {
+        // Build from config + the API key env var. Err (with a reason to surface) when the key
+        // is unset, so the caller degrades to today's behavior rather than failing.
+        fn from_config(llm: &ApprovalLlmConfig) -> Result<Self, String> {
+            let api_key = std::env::var(&llm.api_key_env)
+                .ok()
+                .filter(|k| !k.is_empty())
+                .ok_or_else(|| format!("${} not set", llm.api_key_env))?;
+            let (tx, rx) = channel();
+            Ok(AutoApprover {
+                cfg: LlmConfig {
+                    model: llm.model.clone(),
+                    base_url: llm.base_url.clone(),
+                    api_key,
+                    timeout_ms: llm.timeout_ms,
+                    max_attempts: llm.max_attempts,
+                    backoff_ms: DEFAULT_BACKOFF_MS,
+                },
+                prompt: PromptTemplate {
+                    name: "runtime".into(),
+                    system: llm
+                        .system
+                        .clone()
+                        .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string()),
+                    user: llm
+                        .user
+                        .clone()
+                        .unwrap_or_else(|| DEFAULT_USER_TEMPLATE.to_string()),
+                },
+                queue_wait_ms: llm.queue_wait_ms,
+                proposal_wait_ms: llm.proposal_wait_ms,
+                tools: llm.tools.clone(),
+                tx,
+                rx,
+                state: HashMap::new(),
+            })
+        }
+
+        fn spawn(&self, s: &SpawnReq) {
+            let rendered = self.prompt.render(&PromptVars {
+                command: &s.target,
+                tool: &s.tool,
+                cwd: s.cwd.as_deref().unwrap_or(""),
+                policy: "",
+            });
+            let cfg = self.cfg.clone();
+            let id = s.id.clone();
+            let target = s.target.clone();
+            let tx = self.tx.clone();
+            std::thread::spawn(move || {
+                let jr = judge(&cfg, &rendered, now_ms);
+                let latency_ms = jr.latency_ms;
+                let report = match jr.result {
+                    Ok(resp) => match parse_judgement(&resp.content) {
+                        Ok(j) => LlmReport {
+                            target,
+                            kind: match j.verdict {
+                                LlmVerdict::Safe => "safe",
+                                LlmVerdict::Unsafe => "unsafe",
+                            },
+                            reason: Some(j.reason),
+                            latency_ms,
+                            detail: None,
+                        },
+                        Err(e) => LlmReport {
+                            target,
+                            kind: "malformed",
+                            reason: None,
+                            latency_ms,
+                            detail: Some(e.to_string()),
+                        },
+                    },
+                    Err(e) => LlmReport {
+                        target,
+                        kind: "error",
+                        reason: None,
+                        latency_ms,
+                        detail: Some(e.to_string()),
+                    },
+                };
+                let _ = tx.send((id, report));
+            });
+        }
+
+        // Advance the state machine once per loop. Ingests worker results, fires new requests
+        // whose queue wait elapsed, and auto-applies proposals whose operator window elapsed
+        // (writing the verdict + persisting a tight allow rule + logging). Mutates app.pending.
+        // Returns whether it changed anything visible (a stream line or the pending list), so
+        // the caller can skip an idle redraw.
+        fn tick(
+            &mut self,
+            app: &mut App,
+            qdir: &Path,
+            live_path: &Path,
+            log_path: &Path,
+            now: u64,
+        ) -> bool {
+            let mut changed = false;
+            while let Ok((id, rep)) = self.rx.try_recv() {
+                changed = true;
+                let proposable = rep.kind == "safe";
+                let note = if proposable {
+                    format!(
+                        "model: SAFE — {} · auto-approve in {}s unless you act",
+                        rep.reason.as_deref().unwrap_or(""),
+                        self.proposal_wait_ms / 1000
+                    )
+                } else {
+                    format!(
+                        "model: {} — {} · passthrough",
+                        rep.kind,
+                        rep.reason
+                            .as_deref()
+                            .or(rep.detail.as_deref())
+                            .unwrap_or("")
+                    )
+                };
+                push_capped(&mut app.llm_stream, stream_note(&note), LLM_STREAM_CAP);
+                if let Some(phase) = self.state.get_mut(&id) {
+                    *phase = if proposable {
+                        LlmPhase::Proposed {
+                            reason: rep.reason.clone().unwrap_or_default(),
+                            at_ms: now,
+                        }
+                    } else {
+                        LlmPhase::Declined
+                    };
+                }
+                log_event(
+                    log_path,
+                    "llm_result",
+                    serde_json::json!({
+                        "id": id,
+                        "model": self.cfg.model,
+                        "target": rep.target,
+                        "verdict": rep.kind,
+                        "reason": rep.reason,
+                        "latency_ms": rep.latency_ms,
+                        "detail": rep.detail,
+                        "will_auto_approve": proposable,
+                    }),
+                );
+            }
+
+            // Forget state for requests the operator resolved or that were swept.
+            let live: std::collections::HashSet<String> =
+                app.pending.iter().map(|p| p.request.id.clone()).collect();
+            self.state.retain(|id, _| live.contains(id));
+
+            let mut to_spawn: Vec<SpawnReq> = Vec::new();
+            let mut to_apply: Vec<usize> = Vec::new();
+            for (i, p) in app.pending.iter().enumerate() {
+                match self.state.get(&p.request.id) {
+                    None if self.llm_eligible(&p.request.tool)
+                        && now.saturating_sub(p.request.ts_ms) >= self.queue_wait_ms =>
+                    {
+                        to_spawn.push(SpawnReq {
+                            id: p.request.id.clone(),
+                            target: p.request.target.clone(),
+                            tool: p.request.tool.clone(),
+                            cwd: p.request.cwd.clone(),
+                        });
+                    }
+                    Some(LlmPhase::Proposed { at_ms, .. })
+                        if now.saturating_sub(*at_ms) >= self.proposal_wait_ms =>
+                    {
+                        to_apply.push(i);
+                    }
+                    _ => {}
+                }
+            }
+
+            changed |= !to_spawn.is_empty();
+            for s in &to_spawn {
+                self.spawn(s);
+                log_event(
+                    log_path,
+                    "llm_consult",
+                    serde_json::json!({
+                        "id": s.id,
+                        "model": self.cfg.model,
+                        "tool": s.tool,
+                        "target": s.target,
+                        "cwd": s.cwd,
+                    }),
+                );
+                push_capped(
+                    &mut app.llm_stream,
+                    stream_note(&format!("consulting model on: {}", s.target)),
+                    LLM_STREAM_CAP,
+                );
+                self.state.insert(s.id.clone(), LlmPhase::Requested);
+            }
+
+            // Apply highest index first so earlier removals don't shift later indices.
+            to_apply.sort_unstable_by(|a, b| b.cmp(a));
+            for i in to_apply {
+                let reason = match self.state.get(&app.pending[i].request.id) {
+                    Some(LlmPhase::Proposed { reason, .. }) => reason.clone(),
+                    _ => continue,
+                };
+                changed = true;
+                let p = &mut app.pending[i];
+                p.choices = vec![Choice::Allow; p.request.nodes.len()];
+                // Auto-approval persists the tightest rung (index 0) — the path/arg-specific rule.
+                p.scope_idx = vec![0; p.request.nodes.len()];
+                let (verdict, live_rules) = build_verdict(p, CommitMode::Always);
+
+                let vpath = qdir.join(format!("{}.verdict.json", verdict.id));
+                if let Ok(j) = serde_json::to_string(&verdict) {
+                    let _ = write_atomic(&vpath, &j);
+                }
+                let _ = append_rules(live_path, &live_rules);
+                log_event(
+                    log_path,
+                    "llm_auto_approve",
+                    serde_json::json!({
+                        "id": p.request.id.clone(),
+                        "tool_name": p.request.tool.clone(),
+                        "target": p.request.target.clone(),
+                        "cwd": p.request.cwd.clone(),
+                        "lk_llm": {
+                            "model": self.cfg.model,
+                            "verdict": "safe",
+                            "reason": reason,
+                            "auto_applied": true,
+                        },
+                    }),
+                );
+                push_capped(
+                    &mut app.llm_stream,
+                    stream_note(&format!(
+                        "auto-approved (model): {} — {reason}",
+                        p.request.target
+                    )),
+                    LLM_STREAM_CAP,
+                );
+
+                let id = p.request.id.clone();
+                app.pending.remove(i);
+                self.state.remove(&id);
+            }
+            if app.focus >= app.pending.len() {
+                app.focus = app.pending.len().saturating_sub(1);
+            }
+            changed
+        }
+    }
+
+    // A dim stream line for model activity, distinct from the gate-decision stream lines.
+    fn stream_note(msg: &str) -> Line<'static> {
+        Line::from(vec![
+            Span::styled(
+                "  llm  ",
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(msg.to_string(), Style::default().fg(Color::DarkGray)),
+        ])
+    }
+
+    // Build the auto-approver if configured + enabled + the key is present. On enabled-but-no-key
+    // it pushes a one-line warning to the stream and returns None (degrade, never fail).
+    fn build_auto(approval: &ApprovalConfig, app: &mut App) -> Option<AutoApprover> {
+        let llm = approval.llm.as_ref()?;
+        if !llm.enabled {
+            return None;
+        }
+        match AutoApprover::from_config(llm) {
+            Ok(a) => {
+                app.stream.push(stream_note(&format!(
+                    "auto-approval on: {} ({}s queue, {}s proposal)",
+                    a.cfg.model,
+                    a.queue_wait_ms / 1000,
+                    a.proposal_wait_ms / 1000
+                )));
+                app.llm_status = Some(a.cfg.model.clone());
+                Some(a)
+            }
+            Err(e) => {
+                app.stream
+                    .push(stream_note(&format!("auto-approval disabled: {e}")));
+                None
+            }
+        }
+    }
+
+    // A cheap hash of everything the TUI body/footer renders from structured state (the
+    // pending list, focus, per-node selections, and the Ctrl-C arming). The two scrolling
+    // buffers are excluded — their content rotates within a fixed cap, so a length/hash can't
+    // see new lines; the loop tracks their changes via explicit flags instead. Lets the loop
+    // skip a redraw when nothing visible moved, so an idle watcher stops feeding the terminal.
+    fn view_revision(app: &App) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        app.pending.len().hash(&mut h);
+        app.focus.hash(&mut h);
+        app.ctrl_c_armed.hash(&mut h);
+        for p in &app.pending {
+            p.request.id.hash(&mut h);
+            p.cursor.hash(&mut h);
+            for c in &p.choices {
+                (*c as u8).hash(&mut h);
+            }
+            p.scope_idx.hash(&mut h);
+        }
+        h.finish()
+    }
+
     pub(crate) fn run(explicit_path: Option<&str>) -> std::io::Result<()> {
         let cfg = load_config(None);
         let state_dir = queue::state_dir(&cfg.approval);
         let qdir = queue::queue_dir_in(&state_dir);
         let live_path = live_rules_path(&cfg.approval);
-        let mut tailer = Tailer::new(resolve_log_path(explicit_path));
+        let log_path = resolve_log_path(explicit_path);
+        // Tidy on open before tailing so retained history is not replayed into the stream.
+        let _ = prune_log_file(&log_path, DEFAULT_RETAIN_DAYS, now_ms());
+        let mut tailer = Tailer::new(log_path.clone());
 
         let mut terminal = ratatui::init();
         let mut app = App::new();
+        let mut auto = build_auto(&cfg.approval, &mut app);
         let result = run_loop(
             &mut terminal,
             &mut app,
@@ -660,6 +1060,8 @@ mod tui {
             &qdir,
             &live_path,
             &cfg.approval,
+            &log_path,
+            &mut auto,
         );
         ratatui::restore();
         clear_attention();
@@ -675,24 +1077,41 @@ mod tui {
         qdir: &Path,
         live_path: &Path,
         approval: &ApprovalConfig,
+        log_path: &Path,
+        auto: &mut Option<AutoApprover>,
     ) -> std::io::Result<()> {
         // usize::MAX forces the first iteration to set the title/taskbar without ringing
         // the bell for approvals that were already waiting when the TUI opened.
         let mut prev_pending = usize::MAX;
+        // Already pruned once on open; schedule the next housekeeping pass an hour out.
+        let mut next_prune_ms = now_ms() + PRUNE_INTERVAL_MS;
+        // The view revision last handed to the terminal; None until the first frame. Redraw
+        // only when the structured view moved or a scrolling buffer gained a line — an idle
+        // watcher then sends the terminal nothing, which is what keeps its memory flat.
+        let mut last_rev: Option<u64> = None;
         loop {
             let _ = write_heartbeat_in(state_dir);
 
+            let now = now_ms();
+            if now >= next_prune_ms {
+                // Best-effort housekeeping; a prune error must never disturb the watch loop.
+                let _ = prune_log_file(log_path, DEFAULT_RETAIN_DAYS, now);
+                tailer.resync_to_end();
+                next_prune_ms = now + PRUNE_INTERVAL_MS;
+            }
+
+            let mut dirty = false;
             for line in tailer.read_new() {
                 if let Some(l) = stream_line(&line) {
-                    app.stream.push(l);
-                    if app.stream.len() > STREAM_CAP {
-                        let drop = app.stream.len() - STREAM_CAP;
-                        app.stream.drain(0..drop);
-                    }
+                    push_capped(&mut app.stream, l, STREAM_CAP);
+                    dirty = true;
                 }
             }
 
             sync_pending(app, qdir, approval);
+            if let Some(a) = auto.as_mut() {
+                dirty |= a.tick(app, qdir, live_path, log_path, now);
+            }
             let count = app.pending.len();
             if count != prev_pending {
                 set_attention(count);
@@ -702,7 +1121,11 @@ mod tui {
                 }
                 prev_pending = count;
             }
-            terminal.draw(|f| ui(f, app))?;
+            let rev = view_revision(app);
+            if dirty || Some(rev) != last_rev {
+                terminal.draw(|f| ui(f, app))?;
+                last_rev = Some(rev);
+            }
 
             if event::poll(Duration::from_millis(POLL_MS))? {
                 if let Event::Key(k) = event::read()? {
@@ -766,17 +1189,17 @@ mod tui {
         }
         found.sort_by_key(|r| r.ts_ms);
 
-        let mut prev: HashMap<String, (Vec<Choice>, Vec<bool>, usize)> = HashMap::new();
+        let mut prev: HashMap<String, (Vec<Choice>, Vec<usize>, usize)> = HashMap::new();
         for p in app.pending.drain(..) {
-            prev.insert(p.request.id.clone(), (p.choices, p.tight, p.cursor));
+            prev.insert(p.request.id.clone(), (p.choices, p.scope_idx, p.cursor));
         }
         app.pending = found
             .into_iter()
             .map(|req| match prev.remove(&req.id) {
-                Some((choices, tight, cur)) if choices.len() == req.nodes.len() => Pending {
+                Some((choices, scope_idx, cur)) if choices.len() == req.nodes.len() => Pending {
                     cursor: cur.min(req.nodes.len().saturating_sub(1)),
                     choices,
-                    tight,
+                    scope_idx,
                     request: req,
                 },
                 _ => Pending::new(req, approval),
@@ -796,19 +1219,46 @@ mod tui {
         } else {
             Constraint::Percentage(55)
         };
-        let [top, mid, help] =
-            Layout::vertical([Constraint::Min(3), body, Constraint::Length(1)]).areas(f.area());
-        render_stream(f, top, app);
-        render_body(f, mid, app);
-        render_help(f, help, app);
+        // The model-activity pane only appears when auto-approval is live; sized to its content
+        // (up to 6 lines) so it never crowds the decision stream or the approval zone.
+        if app.llm_status.is_some() {
+            let model_h = (app.llm_stream.len().min(6) as u16 + 2).max(3);
+            let [top, model, mid, help] = Layout::vertical([
+                Constraint::Min(3),
+                Constraint::Length(model_h),
+                body,
+                Constraint::Length(1),
+            ])
+            .areas(f.area());
+            render_buffer(f, top, "lord-kali — stream", &app.stream);
+            render_buffer(f, model, "model activity", &app.llm_stream);
+            render_body(f, mid, app);
+            render_help(f, help, app);
+        } else {
+            let [top, mid, help] =
+                Layout::vertical([Constraint::Min(3), body, Constraint::Length(1)]).areas(f.area());
+            render_buffer(f, top, "lord-kali — stream", &app.stream);
+            render_body(f, mid, app);
+            render_help(f, help, app);
+        }
     }
 
-    fn render_stream(f: &mut Frame, area: Rect, app: &App) {
+    // Append to a bounded line buffer, dropping the oldest lines once it exceeds `cap`.
+    fn push_capped(buf: &mut Vec<Line<'static>>, line: Line<'static>, cap: usize) {
+        buf.push(line);
+        if buf.len() > cap {
+            let drop = buf.len() - cap;
+            buf.drain(0..drop);
+        }
+    }
+
+    // Render the tail of a line buffer into a bordered box.
+    fn render_buffer(f: &mut Frame, area: Rect, title: &str, buf: &[Line<'static>]) {
         let visible = area.height.saturating_sub(2) as usize;
-        let start = app.stream.len().saturating_sub(visible);
-        let lines: Vec<Line> = app.stream[start..].to_vec();
+        let start = buf.len().saturating_sub(visible);
+        let lines: Vec<Line> = buf[start..].to_vec();
         let para = Paragraph::new(lines)
-            .block(Block::bordered().title("lord-kali — stream"))
+            .block(Block::bordered().title(title.to_string()))
             .wrap(Wrap { trim: false });
         f.render_widget(para, area);
     }
@@ -845,20 +1295,32 @@ mod tui {
                 .unwrap_or_default(),
             Style::new().fg(Color::DarkGray),
         )));
-        // What an *-always commit would persist for the focused node, so the operator sees
-        // the exact (path-specific or subcommand-scoped) rule before pressing a/d.
+        // What an *-always commit would persist for the focused node at its selected ladder
+        // rung, so the operator sees the exact rule before pressing a/d.
         if let Some(fnode) = p.request.nodes.get(p.cursor) {
-            let tight = p.tight[p.cursor];
-            let pat = node_scope(tight, &fnode.shell, &fnode.args)
-                .map(|a| format!("args=\"{a}\""))
-                .unwrap_or_else(|| "any args".into());
-            let mode = if tight { "tight" } else { "scope" };
+            let rungs = p.node_rungs(p.cursor);
+            let idx = p.scope_idx[p.cursor].min(rungs.len().saturating_sub(1));
+            let rule_desc = match fnode.shell.as_str() {
+                "bash" | "powershell" => match &rungs[idx].args {
+                    Some(a) => format!("command=\"{}\" args=\"{}\"", rungs[idx].target, a),
+                    None => format!("command=\"{}\"  (any args)", rungs[idx].target),
+                },
+                "web-fetch" => format!("url=\"{}\"", rungs[idx].target),
+                "file" => format!("path=\"{}\"", rungs[idx].target),
+                _ => format!("tool=\"{}\"", rungs[idx].target),
+            };
+            let cycle = if rungs.len() > 1 {
+                format!("t: rung {}/{} (cycle)", idx + 1, rungs.len())
+            } else {
+                "exact (no t)".to_string()
+            };
             head.push(Line::from(Span::styled(
-                format!(
-                    "→ rule: {} {}   ·  t: {} (toggle)",
-                    fnode.command, pat, mode
-                ),
-                Style::new().fg(if tight { Color::Green } else { Color::Yellow }),
+                format!("→ rule: {rule_desc}   ·  {cycle}"),
+                Style::new().fg(if idx == 0 {
+                    Color::Green
+                } else {
+                    Color::Yellow
+                }),
             )));
         }
         f.render_widget(Paragraph::new(head), header);
@@ -929,13 +1391,18 @@ mod tui {
         } else {
             "space cycle · ←→ lane · ↑↓ node · t scope · ⇥ call · a apply-always · o apply-once · s skip · q quit"
         };
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                text,
+        let mut spans = vec![Span::styled(text, Style::new().fg(Color::DarkGray))];
+        match &app.llm_status {
+            Some(model) => spans.push(Span::styled(
+                format!("   ·   LLM auto-approval active ({model})"),
+                Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+            )),
+            None => spans.push(Span::styled(
+                "   ·   LLM auto-approval off",
                 Style::new().fg(Color::DarkGray),
-            ))),
-            area,
-        );
+            )),
+        }
+        f.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
     fn stream_line(line: &str) -> Option<Line<'static>> {
@@ -1028,29 +1495,33 @@ mod tui {
             }
         }
 
-        // A guardrail command (rm) defaults to tight, path-specific persistence; `t` toggles
-        // it to the broad subcommand scope only when the operator deliberately asks.
+        // A guardrail command (rm) defaults to the tight rung (index 0, full args); `t`
+        // cycles to the broader subcommand rung only when the operator deliberately asks.
         #[test]
         fn guardrail_defaults_tight_and_t_toggles() {
             let mut app = App::new();
             app.pending
                 .push(Pending::new(rm_request(), &ApprovalConfig::default()));
-            assert!(app.focused().unwrap().tight[0], "rm should default tight");
+            assert_eq!(app.focused().unwrap().scope_idx[0], 0, "rm defaults tight");
 
             let (_, live) = apply_key(&mut app, Key::Commit(CommitMode::Always)).expect("commit");
             assert_eq!(live[0].args.as_deref(), Some("-rf ./test-results{, **}"));
 
             apply_key(&mut app, Key::ToggleScope);
-            assert!(!app.focused().unwrap().tight[0]);
+            assert_eq!(app.focused().unwrap().scope_idx[0], 1);
             let (_, live2) = apply_key(&mut app, Key::Commit(CommitMode::Always)).expect("commit");
-            assert_eq!(live2[0].args, scope_args("-rf ./test-results"));
+            assert_eq!(live2[0].args.as_deref(), Some("-rf{, **}"));
         }
 
-        // A non-guardrail command defaults to subcommand scope (not tight).
+        // A non-guardrail command defaults to the subcommand rung (index 1, not tight).
         #[test]
         fn non_guardrail_defaults_to_subcommand_scope() {
             let app = pending_app();
-            assert!(!app.focused().unwrap().tight[0], "gh should not be tight");
+            assert_eq!(
+                app.focused().unwrap().scope_idx[0],
+                1,
+                "gh defaults subcommand"
+            );
         }
 
         #[test]
@@ -1084,7 +1555,7 @@ mod tui {
             assert_eq!(live.len(), 2);
             let gh = live.iter().find(|r| r.target == "gh").unwrap();
             assert!(!gh.allow);
-            assert_eq!(gh.args, scope_args("pr list"));
+            assert_eq!(gh.args.as_deref(), Some("pr{, **}"));
             assert!(live.iter().find(|r| r.target == "jq").unwrap().allow);
         }
 
@@ -1100,6 +1571,67 @@ mod tui {
             assert_eq!(combine_verdict(&verdict.nodes), None);
             assert_eq!(live.len(), 1);
             assert_eq!(live[0].target, "jq");
+        }
+
+        fn mcp_request() -> QueueRequest {
+            QueueRequest {
+                id: "mcp1".into(),
+                ts_ms: 0,
+                cwd: None,
+                tool: "mcp__playwright__browser_fill_form".into(),
+                target: "mcp__playwright__browser_fill_form".into(),
+                nodes: vec![QueueNode {
+                    shell: "mcp".into(),
+                    command: "mcp__playwright__browser_fill_form".into(),
+                    args: r#"{"fields":[{"name":"Password"}]}"#.into(),
+                    decision: "passthrough".into(),
+                }],
+            }
+        }
+
+        // MCP nodes have a single fixed rung keyed on the exact tool name — never args.
+        #[test]
+        fn mcp_node_scope_is_always_none() {
+            let (rungs, def) = ladder(
+                "mcp",
+                "mcp__x__y",
+                "mcp__x__y",
+                r#"{"fields":[]}"#,
+                None,
+                false,
+            );
+            assert_eq!(rungs.len(), 1);
+            assert_eq!(def, 0);
+            assert!(rungs[0].args.is_none());
+            assert_eq!(rungs[0].target, "mcp__x__y");
+        }
+
+        #[test]
+        fn mcp_allow_always_persists_tool_rule_without_args() {
+            let mut app = App::new();
+            app.pending
+                .push(Pending::new(mcp_request(), &ApprovalConfig::default()));
+            let (verdict, live) =
+                apply_key(&mut app, Key::Commit(CommitMode::Always)).expect("commit");
+            assert_eq!(verdict.nodes[0].action, Action::AllowAlways);
+            assert_eq!(live.len(), 1);
+            assert_eq!(live[0].shell, "mcp");
+            assert_eq!(live[0].target, "mcp__playwright__browser_fill_form");
+            assert!(live[0].args.is_none());
+            assert!(live[0].allow);
+        }
+
+        #[test]
+        fn mcp_deny_always_persists_deny_without_args() {
+            let mut app = App::new();
+            app.pending
+                .push(Pending::new(mcp_request(), &ApprovalConfig::default()));
+            apply_key(&mut app, Key::Right); // -> Ask
+            apply_key(&mut app, Key::Right); // -> Deny
+            let (_, live) = apply_key(&mut app, Key::Commit(CommitMode::Always)).expect("commit");
+            assert_eq!(live.len(), 1);
+            assert!(!live[0].allow);
+            assert!(live[0].args.is_none());
         }
 
         #[test]

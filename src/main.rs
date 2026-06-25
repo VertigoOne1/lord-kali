@@ -1,9 +1,12 @@
 mod config;
 mod decision;
+mod eval;
 mod live_rules;
+mod llm;
 mod log;
 mod parse;
 mod queue;
+mod scope;
 mod watch;
 mod worktree;
 
@@ -31,16 +34,46 @@ pub(crate) struct ToolInput {
     pub(crate) url: Option<String>,
     pub(crate) file_path: Option<String>,
     pub(crate) path: Option<String>,
+    // Any remaining input keys (e.g. an MCP tool's structured arguments), captured for the
+    // MCP summary. The typed fields above are pulled out first, so they are NOT here.
+    #[serde(flatten)]
+    pub(crate) extra: serde_json::Map<String, serde_json::Value>,
+}
+
+impl ToolInput {
+    // A compact, truncated one-line view of the structured input, shown to the operator on
+    // MCP nodes. Display only — MCP gating matches the tool name, never this. The typed
+    // fields are folded back in so a tool whose arg is named `url`/`path` still shows it.
+    pub(crate) fn summary(&self) -> String {
+        let mut obj = self.extra.clone();
+        for (k, v) in [
+            ("command", &self.command),
+            ("url", &self.url),
+            ("file_path", &self.file_path),
+            ("path", &self.path),
+        ] {
+            if let Some(val) = v {
+                obj.insert(k.into(), serde_json::Value::String(val.clone()));
+            }
+        }
+        let s = serde_json::Value::Object(obj).to_string();
+        const MAX: usize = 80;
+        if s.chars().count() > MAX {
+            format!("{}…", s.chars().take(MAX).collect::<String>())
+        } else {
+            s
+        }
+    }
 }
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    if args.next().as_deref() == Some("watch") {
-        let rest: Vec<String> = args.collect();
-        watch::watch(&rest);
-        return;
+    match args.next().as_deref() {
+        Some("watch") => watch::watch(&args.collect::<Vec<_>>()),
+        Some("prune-logs") => log::prune_logs_cli(&args.collect::<Vec<_>>()),
+        Some("eval") => eval::eval_cli(&args.collect::<Vec<_>>()),
+        _ => run_hook(),
     }
-    run_hook();
 }
 
 fn run_hook() {
@@ -103,12 +136,7 @@ fn maybe_route_to_approval(
         return trace;
     }
 
-    let target = hook_input
-        .tool_input
-        .command
-        .clone()
-        .or_else(|| hook_input.tool_input.url.clone())
-        .unwrap_or_default();
+    let target = request_target(hook_input);
     let request = QueueRequest {
         id: queue::request_id(hook_input.session_id.as_deref().unwrap_or("")),
         ts_ms: log::now_ms(),
@@ -126,6 +154,19 @@ fn maybe_route_to_approval(
         }
         None => trace,
     }
+}
+
+// The one-line label shown for a queued call: its command, URL, or target path — falling
+// back to the tool name when the call carries none of those.
+fn request_target(hook_input: &HookInput) -> String {
+    hook_input
+        .tool_input
+        .command
+        .clone()
+        .or_else(|| hook_input.tool_input.url.clone())
+        .or_else(|| hook_input.tool_input.file_path.clone())
+        .or_else(|| hook_input.tool_input.path.clone())
+        .unwrap_or_else(|| hook_input.tool_name.clone())
 }
 
 fn print_decision(decision: Decision, reason: &str) {
@@ -166,6 +207,57 @@ mod tests {
         assert_eq!(input.cwd, None);
     }
 
+    #[test]
+    fn summary_folds_typed_url_field() {
+        let ti: ToolInput = serde_json::from_str(r#"{"url":"https://x.test/page"}"#).unwrap();
+        let s = ti.summary();
+        assert!(s.contains("url"));
+        assert!(s.contains("https://x.test/page"));
+    }
+
+    #[test]
+    fn summary_keeps_structured_keys() {
+        let ti: ToolInput =
+            serde_json::from_str(r#"{"fields":[{"name":"Username"},{"name":"Password"}]}"#)
+                .unwrap();
+        assert!(ti.summary().contains("fields"));
+        assert!(ti.summary().contains("Username"));
+    }
+
+    #[test]
+    fn summary_truncates_long_input() {
+        let big = "x".repeat(500);
+        let ti: ToolInput = serde_json::from_str(&format!("{{\"blob\":\"{big}\"}}")).unwrap();
+        let s = ti.summary();
+        assert!(s.chars().count() <= 81, "len was {}", s.chars().count());
+        assert!(s.ends_with('…'));
+    }
+
+    #[test]
+    fn request_target_prefers_command_then_url_then_path() {
+        let mut hi = bash_hook_input("ls -la");
+        assert_eq!(request_target(&hi), "ls -la");
+
+        hi.tool_input.command = None;
+        hi.tool_input.url = Some("https://x.test".into());
+        assert_eq!(request_target(&hi), "https://x.test");
+
+        hi = HookInput {
+            tool_name: "Edit".into(),
+            tool_input: ToolInput {
+                command: None,
+                url: None,
+                file_path: Some("/p/Startup.cs".into()),
+                path: None,
+                extra: Default::default(),
+            },
+            cwd: None,
+            hook_event_name: None,
+            session_id: None,
+        };
+        assert_eq!(request_target(&hi), "/p/Startup.cs");
+    }
+
     fn bash_hook_input(command: &str) -> HookInput {
         HookInput {
             tool_name: "Bash".into(),
@@ -174,6 +266,7 @@ mod tests {
                 url: None,
                 file_path: None,
                 path: None,
+                extra: Default::default(),
             },
             cwd: None,
             hook_event_name: None,
