@@ -1,8 +1,8 @@
 # lord-kali
 
-A Claude Code [PreToolUse hook](https://docs.anthropic.com/en/docs/claude-code/hooks) that filters Bash, PowerShell, WebFetch, MCP, and file-edit tool calls with a more powerful matching system than Claude Code supports natively, and protects worktrees from accidental parent-directory file operations. It can also route everything it would otherwise leave to Claude Code's per-terminal prompt into one central [approval TUI](#central-approval-tui) shared across all your Claude instances.
+A Claude Code [PreToolUse hook](https://docs.anthropic.com/en/docs/claude-code/hooks) that filters Bash, PowerShell, WebFetch, WebSearch, MCP, and file-edit tool calls with a more powerful matching system than Claude Code supports natively, and protects worktrees from accidental parent-directory file operations. It can also route everything it would otherwise leave to Claude Code's per-terminal prompt into one central [approval TUI](#central-approval-tui) shared across all your Claude instances.
 
-Bash commands are parsed with [tree-sitter-bash](https://github.com/tree-sitter/tree-sitter-bash), correctly handling pipelines, `&&`, `||`, `;` chains, subshells, command substitutions (`$(...)`), and `xargs`-wrapped commands. PowerShell commands are parsed with [tree-sitter-powershell](https://github.com/airbus-cert/tree-sitter-powershell), handling pipelines, `;`/newline-separated statements, `&&`/`||` chains, script blocks (`{ ... }`), command substitutions (`$(...)`), the call operator (`& 'C:\path\app.exe'`), and `.exe`/path normalization — and a `pwsh -Command "..."` invocation inside a Bash call is unwrapped and its inner commands matched against the PowerShell rules. WebFetch URLs are matched against configurable glob/regex patterns. Worktree protection automatically denies file reads/writes targeting the parent project when Claude is operating inside a `.claude/worktrees/<name>` directory.
+Bash commands are parsed with [tree-sitter-bash](https://github.com/tree-sitter/tree-sitter-bash), correctly handling pipelines, `&&`, `||`, `;` chains, subshells, command substitutions (`$(...)`), and `xargs`-wrapped commands. PowerShell commands are parsed with [tree-sitter-powershell](https://github.com/airbus-cert/tree-sitter-powershell), handling pipelines, `;`/newline-separated statements, `&&`/`||` chains, script blocks (`{ ... }`), command substitutions (`$(...)`), the call operator (`& 'C:\path\app.exe'`), and `.exe`/path normalization — and a `pwsh -Command "..."` invocation inside a Bash call is unwrapped and its inner commands matched against the PowerShell rules. WebFetch URLs and WebSearch queries are matched against configurable glob/regex patterns. Worktree protection automatically denies file reads/writes targeting the parent project when Claude is operating inside a `.claude/worktrees/<name>` directory.
 
 ## Install
 
@@ -206,6 +206,22 @@ Rules are defined as `[[web-fetch.rules]]` entries. Each rule has:
 
 Rules are evaluated in config file order - the first matching rule wins.
 
+### WebSearch rules
+
+Rules are defined as `[[web-search.rules]]` entries with the **same fields and semantics as WebFetch rules**, except the pattern key is **`query`** (matched against the search query string) instead of `url`. They gate the `WebSearch` tool.
+
+```toml
+# Allow every web search (a search string carries no side effects)
+[[web-search.rules]]
+query = "**"
+decision = "allow"
+
+# ...but keep a specific topic behind a prompt
+[[web-search.rules]]
+query = "*private repo name*"
+decision = "ask"
+```
+
 ### MCP rules
 
 Rules are defined as `[[mcp.rules]]` entries and apply to any tool whose name starts with `mcp__` (the `mcp__<server>__<tool>` convention). Each rule has:
@@ -248,7 +264,7 @@ Rules are first-match-wins and apply to both mutations and reads, so a persisted
 
 ### Per-rule project scoping
 
-Any rule (bash, web-fetch, mcp, or file) can have an optional `projects` array to restrict it to specific directories. A rule with `projects` only applies when the hook's `cwd` is inside one of the listed directories. Rules without `projects` are global (match all cwds). `~` is expanded in project paths.
+Any rule (bash, web-fetch, web-search, mcp, or file) can have an optional `projects` array to restrict it to specific directories. A rule with `projects` only applies when the hook's `cwd` is inside one of the listed directories. Rules without `projects` are global (match all cwds). `~` is expanded in project paths.
 
 ```toml
 [[bash.rules]]
@@ -286,7 +302,7 @@ url = "https://internal.example.com/**"
 decision = "allow"
 ```
 
-Multiple `[[group]]` sections can be defined. Group rules are appended after top-level rules (first-match-wins, definition order). Group `bash`, `powershell`, `web-fetch`, `mcp`, and `file` sections use the same format as the top-level sections.
+Multiple `[[group]]` sections can be defined. Group rules are appended after top-level rules (first-match-wins, definition order). Group `bash`, `powershell`, `web-fetch`, `web-search`, `mcp`, and `file` sections use the same format as the top-level sections.
 
 ### Worktree protection
 
@@ -382,7 +398,15 @@ enabled = true
 # live_rules = "99-live.toml"            # file the TUI appends allow/deny-always rules to
 # state_dir  = "~/.local/state/lord-kali" # queue + heartbeat live here
 # guardrail_commands = ["terraform", "kubectl"]  # extra commands that default to tight scope
+# Timers (ms; omit any to keep the default shown):
+# self_timeout_ms   = 50000  # max wait on the TUI before handing off to Claude Code's prompt
+# heartbeat_fresh_ms = 3000  # heartbeat age past which the gate treats the TUI as dead
+# pending_timeout_ms = 60000 # how long `watch --tail` tracks an un-executed call before flagging it
+# poll_ms            = 200   # blocked-gate queue poll interval
+# watch_poll_ms      = 200   # watch/TUI loop poll interval
 ```
+
+The timers are optional; unset keys fall back to the defaults shown. `self_timeout_ms` is the **max the blocked gate waits on the TUI before it hands the call off** to Claude Code's own prompt — keep it under Claude Code's 60 s hook timeout so lord-kali's own fallback fires first. (The LLM auto-approver's `queue_wait_ms`/`proposal_wait_ms` live under [`[approval.llm]`](#llm-auto-approval) and are consumed within this same window.)
 
 ```sh
 lord-kali watch   # opens the TUI; keep it running while you work
@@ -397,7 +421,7 @@ The TUI has three regions: a scrolling decision **stream** on top, the **approva
 | `←` / `→` | step the focused node one lane toward ALLOW / DENY (ASK is the middle) |
 | `space` | cycle the focused node ALLOW → ASK → DENY |
 | `↑` / `↓` | move between nodes |
-| `t` | cycle the focused node's persisted scope through its ladder (tightest → broadest). Commands: **tight** (full args) ⇄ **subcommand**. File mutations: **full path** → **containing dir** → **cwd subtree** → **`**/*.ext`**. Web/MCP/reads have a single fixed rung (no-op) |
+| `t` | cycle the focused node's persisted scope through its ladder (tightest → broadest). Commands: **tight** (full args) ⇄ **subcommand**. File mutations: **full path** → **containing dir** → **cwd subtree** → **`**/*.ext`**. WebFetch/WebSearch/MCP/reads have a single fixed rung (no-op) |
 | `⇥` (Tab) | switch between pending calls |
 | `a` | **apply-always** — resolve the call by lane and persist a rule for each allowed/denied node |
 | `o` | **apply-once** — same, but for this call only (nothing persisted) |
@@ -406,7 +430,7 @@ The TUI has three regions: a scrolling decision **stream** on top, the **approva
 
 One commit resolves the whole call from the lanes: any node in **DENY** denies the call; a node in **ASK** defers the call to Claude Code's own prompt (a passthrough); only if every node is in **ALLOW** does the call run outright. So you can allow the parts you trust, deny the dangerous ones, and hand the uncertain ones back to the agent — in a single keystroke. `s` is the quick "I'm not deciding this here" for an entire call.
 
-**apply-always** appends an ordinary rule to `~/.config/lord-kali/99-live.toml` for each node (sorted last, so it never shadows your explicit rules). By default a command's scope is **subcommand** (the node's first argument): allowing `git push` writes `command = "git", args = "push{, **}"`, so it does **not** also bless `git commit`. Web-fetch nodes persist the exact URL; MCP nodes persist the exact tool name (no args, no `t` toggle). **File** mutation nodes persist a `[[file.rules]]` `path` rule at the selected ladder rung (`t` cycles full path → containing dir → cwd subtree → `**/*.ext`), defaulting to the tightest (full path); reads persist a single full-path allow. Future matching calls then resolve instantly without reaching the queue — the gap closes as you go.
+**apply-always** appends an ordinary rule to `~/.config/lord-kali/99-live.toml` for each node (sorted last, so it never shadows your explicit rules). By default a command's scope is **subcommand** (the node's first argument): allowing `git push` writes `command = "git", args = "push{, **}"`, so it does **not** also bless `git commit`. WebFetch nodes persist the exact URL and WebSearch nodes the exact query; MCP nodes persist the exact tool name (no args, no `t` toggle). **File** mutation nodes persist a `[[file.rules]]` `path` rule at the selected ladder rung (`t` cycles full path → containing dir → cwd subtree → `**/*.ext`), defaulting to the tightest (full path); reads persist a single full-path allow. Future matching calls then resolve instantly without reaching the queue — the gap closes as you go.
 
 **Guardrail commands and tight scope.** Subcommand scope is wrong for destructive, path-operating commands: a one-off `rm -rf ./test-results` would otherwise persist as a blanket `rm -rf` allow (the first argument is the flag `-rf`, not a subcommand). So a built-in set of destructive commands — `rm`, `rmdir`, `dd`, `mkfs`, `shred`, `truncate`, `del`, `rd`, `Remove-Item`, `Clear-Content` (extend it via `guardrail_commands`) — defaults to **tight** scope instead: the full args are pinned, so `rm -rf ./test-results` persists `args = "-rf ./test-results{, **}"` and can never match `rm -rf /`. Press **`t`** to toggle any node between tight and subcommand scope; the header shows the exact rule that will be written before you commit.
 
@@ -483,7 +507,7 @@ user = "tool: {{tool}}\ncwd: {{cwd}}\ncommand: {{command}}"
 
 ### Timing and the 50s budget
 
-The whole exchange must finish inside Claude Code's hook timeout — lord-kali self-times-out at 50s. The model's slice is bounded by `timeout_ms × max_attempts` and sits between the two operator-grace windows, so keep:
+The whole exchange must finish inside Claude Code's hook timeout — lord-kali self-times-out at `self_timeout_ms` (default 50s, see [`[approval]`](#central-approval-tui)). The model's slice is bounded by `timeout_ms × max_attempts` and sits between the two operator-grace windows, so keep:
 
 ```
 queue_wait_ms + (timeout_ms × max_attempts) + proposal_wait_ms  <  ~45000
@@ -556,9 +580,9 @@ Given the set of commands extracted from a bash string, each command is resolved
 3. **allow** - if ALL commands resolve to allow
 4. **pass-through** - otherwise (no output, defers to Claude Code defaults)
 
-### WebFetch
+### WebFetch / WebSearch
 
-Given a URL, rules are evaluated in config file order:
+Given a URL (WebFetch) or query string (WebSearch), rules are evaluated in config file order:
 
 1. **First matching rule** - its decision (allow/deny/ask) is returned
 2. **pass-through** - if no rule matches (no output, defers to Claude Code defaults)

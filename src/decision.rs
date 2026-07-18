@@ -3,8 +3,8 @@
 // parallel per-node trace (for logging) that never affects the decision.
 
 use crate::config::{
-    CommandRule, CommandRules, Config, FileConfig, McpConfig, MutationScope, Pattern, RuleMeta,
-    WebFetchConfig,
+    CommandRule, CommandRules, Config, FileConfig, McpConfig, MutationScope, Pattern, PatternRules,
+    RuleMeta,
 };
 use crate::parse::{extract_commands, extract_commands_powershell, inner_powershell_script};
 use crate::scope::{is_mutation_tool, is_read_tool};
@@ -157,11 +157,19 @@ pub(crate) fn dispatch(
         },
         "WebFetch" => match &hook_input.tool_input.url {
             Some(url) => InvocationTrace {
-                final_decision: handle_web_fetch(&config.web_fetch, cwd, url),
+                final_decision: handle_pattern(&config.web_fetch, cwd, url),
                 kind: "web_fetch",
-                nodes: vec![trace_web_fetch(&config.web_fetch, cwd, url)],
+                nodes: vec![trace_pattern(&config.web_fetch, cwd, url, "web-fetch")],
             },
             None => empty_trace("web_fetch"),
+        },
+        "WebSearch" => match &hook_input.tool_input.query {
+            Some(query) => InvocationTrace {
+                final_decision: handle_pattern(&config.web_search, cwd, query),
+                kind: "web_search",
+                nodes: vec![trace_pattern(&config.web_search, cwd, query, "web-search")],
+            },
+            None => empty_trace("web_search"),
         },
         name if name.starts_with("mcp__") => {
             let summary = hook_input.tool_input.summary();
@@ -199,24 +207,29 @@ pub(crate) fn rule_matches_cwd(projects: &[std::path::PathBuf], cwd: Option<&str
         })
 }
 
-pub(crate) fn handle_web_fetch(
-    config: &WebFetchConfig,
+pub(crate) fn handle_pattern(
+    config: &PatternRules,
     cwd: Option<&str>,
-    url: &str,
+    text: &str,
 ) -> Option<(Decision, String)> {
     for rule in &config.rules {
-        if rule_matches_cwd(&rule.projects, cwd) && rule.pattern.is_match(url) {
+        if rule_matches_cwd(&rule.projects, cwd) && rule.pattern.is_match(text) {
             return Some((rule.decision.clone(), rule.reason.clone()));
         }
     }
     None
 }
 
-fn trace_web_fetch(config: &WebFetchConfig, cwd: Option<&str>, url: &str) -> NodeTrace {
+fn trace_pattern(
+    config: &PatternRules,
+    cwd: Option<&str>,
+    text: &str,
+    shell: &'static str,
+) -> NodeTrace {
     let matched = config
         .rules
         .iter()
-        .find(|rule| rule_matches_cwd(&rule.projects, cwd) && rule.pattern.is_match(url))
+        .find(|rule| rule_matches_cwd(&rule.projects, cwd) && rule.pattern.is_match(text))
         .map(|rule| {
             (
                 rule.decision.clone(),
@@ -225,8 +238,8 @@ fn trace_web_fetch(config: &WebFetchConfig, cwd: Option<&str>, url: &str) -> Nod
             )
         });
     NodeTrace {
-        shell: "web-fetch",
-        command: url.to_string(),
+        shell,
+        command: text.to_string(),
         args: String::new(),
         matched,
     }
@@ -1042,33 +1055,33 @@ mod tests {
         );
     }
 
-    // --- handle_web_fetch ---
+    // --- handle_pattern ---
 
-    fn test_web_fetch_config() -> WebFetchConfig {
-        WebFetchConfig {
+    fn test_web_fetch_config() -> PatternRules {
+        PatternRules {
             rules: vec![
-                crate::config::WebFetchRule {
+                crate::config::PatternRule {
                     decision: Decision::Deny,
                     pattern: compile_pattern("https://evil.com/**"),
                     reason: "Blocked domain".into(),
                     projects: vec![],
                     meta: RuleMeta::default(),
                 },
-                crate::config::WebFetchRule {
+                crate::config::PatternRule {
                     decision: Decision::Ask,
                     pattern: compile_pattern("/.*\\.internal\\..*/"),
                     reason: "Internal URL, please confirm".into(),
                     projects: vec![],
                     meta: RuleMeta::default(),
                 },
-                crate::config::WebFetchRule {
+                crate::config::PatternRule {
                     decision: Decision::Allow,
                     pattern: compile_pattern("https://docs.rs/**"),
                     reason: "ok".into(),
                     projects: vec![],
                     meta: RuleMeta::default(),
                 },
-                crate::config::WebFetchRule {
+                crate::config::PatternRule {
                     decision: Decision::Allow,
                     pattern: compile_pattern("https://crates.io/**"),
                     reason: "ok".into(),
@@ -1080,7 +1093,7 @@ mod tests {
     }
 
     fn web_fetch_decision(url: &str) -> Option<Decision> {
-        handle_web_fetch(&test_web_fetch_config(), None, url).map(|(d, _)| d)
+        handle_pattern(&test_web_fetch_config(), None, url).map(|(d, _)| d)
     }
 
     #[test]
@@ -1114,16 +1127,16 @@ mod tests {
 
     #[test]
     fn web_fetch_first_match_wins() {
-        let config = WebFetchConfig {
+        let config = PatternRules {
             rules: vec![
-                crate::config::WebFetchRule {
+                crate::config::PatternRule {
                     decision: Decision::Deny,
                     pattern: compile_pattern("https://bad.internal.corp/**"),
                     reason: "Denied".into(),
                     projects: vec![],
                     meta: RuleMeta::default(),
                 },
-                crate::config::WebFetchRule {
+                crate::config::PatternRule {
                     decision: Decision::Ask,
                     pattern: compile_pattern("/.*\\.internal\\..*/"),
                     reason: "Ask".into(),
@@ -1133,11 +1146,11 @@ mod tests {
             ],
         };
         assert_eq!(
-            handle_web_fetch(&config, None, "https://bad.internal.corp/secret").map(|(d, _)| d),
+            handle_pattern(&config, None, "https://bad.internal.corp/secret").map(|(d, _)| d),
             Some(Decision::Deny)
         );
         assert_eq!(
-            handle_web_fetch(&config, None, "https://other.internal.corp/page").map(|(d, _)| d),
+            handle_pattern(&config, None, "https://other.internal.corp/page").map(|(d, _)| d),
             Some(Decision::Ask)
         );
     }
@@ -1263,16 +1276,16 @@ mod tests {
 
     #[test]
     fn web_fetch_rule_with_projects_matches_when_cwd_inside() {
-        let config = WebFetchConfig {
+        let config = PatternRules {
             rules: vec![
-                crate::config::WebFetchRule {
+                crate::config::PatternRule {
                     decision: Decision::Deny,
                     pattern: compile_pattern("https://internal.example.com/**"),
                     reason: "Blocked for this project".into(),
                     projects: vec![PathBuf::from("/home/user/projects/test")],
                     meta: RuleMeta::default(),
                 },
-                crate::config::WebFetchRule {
+                crate::config::PatternRule {
                     decision: Decision::Allow,
                     pattern: compile_pattern("https://internal.example.com/**"),
                     reason: "ok".into(),
@@ -1283,7 +1296,7 @@ mod tests {
         };
 
         assert_eq!(
-            handle_web_fetch(
+            handle_pattern(
                 &config,
                 Some("/home/user/projects/test"),
                 "https://internal.example.com/api"
@@ -1295,16 +1308,16 @@ mod tests {
 
     #[test]
     fn web_fetch_rule_with_projects_skipped_when_cwd_outside() {
-        let config = WebFetchConfig {
+        let config = PatternRules {
             rules: vec![
-                crate::config::WebFetchRule {
+                crate::config::PatternRule {
                     decision: Decision::Deny,
                     pattern: compile_pattern("https://internal.example.com/**"),
                     reason: "Blocked for this project".into(),
                     projects: vec![PathBuf::from("/home/user/projects/test")],
                     meta: RuleMeta::default(),
                 },
-                crate::config::WebFetchRule {
+                crate::config::PatternRule {
                     decision: Decision::Allow,
                     pattern: compile_pattern("https://internal.example.com/**"),
                     reason: "ok".into(),
@@ -1315,7 +1328,7 @@ mod tests {
         };
 
         assert_eq!(
-            handle_web_fetch(
+            handle_pattern(
                 &config,
                 Some("/home/user/projects/other"),
                 "https://internal.example.com/api"
@@ -1568,6 +1581,7 @@ projects = ["/home/user/secret"]
         ToolInput {
             command: None,
             url: None,
+            query: None,
             file_path: Some(file_path.into()),
             path: None,
             extra: Default::default(),

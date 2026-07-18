@@ -16,6 +16,17 @@ path = "~/.local/state/lord-kali/hook.jsonl"
 # Destructive commands (rm, dd, Remove-Item, …) always default to tight, path-specific
 # rules in the TUI; list extra commands here to give them the same treatment.
 # guardrail_commands = ["terraform", "kubectl"]
+# Timers (milliseconds; omit any to keep the built-in default shown). self_timeout_ms is the
+# max the blocked gate waits on the TUI before handing off to Claude Code's own prompt — keep
+# it under Claude Code's 60s hook timeout. heartbeat_fresh_ms is how stale the TUI heartbeat
+# may get before the gate treats it as dead and degrades to pass-through. pending_timeout_ms
+# is how long `watch --tail` tracks an un-executed call before flagging it. poll_ms /
+# watch_poll_ms are the gate and watch/TUI loop poll intervals.
+# self_timeout_ms = 50000
+# poll_ms = 200
+# heartbeat_fresh_ms = 3000
+# pending_timeout_ms = 60000
+# watch_poll_ms = 200
 
 # LLM auto-approval (opt-in; default off). When enabled AND `lord-kali watch` is running, a
 # passthrough the operator hasn't touched for `queue_wait_ms` is sent to a safety model (only
@@ -100,6 +111,11 @@ decision = "allow"
 # allow to fetch any URL without a query parameter
 [[web-fetch.rules]]
 url = "/[^?]*/"
+decision = "allow"
+
+# allow every web search (a search string carries no side effects); the key is `query`
+[[web-search.rules]]
+query = "**"
 decision = "allow"
 
 # MCP tool gating. Rules key on the full tool name (mcp__<server>__<tool>); glob and
