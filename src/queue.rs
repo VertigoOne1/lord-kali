@@ -11,13 +11,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const DEFAULT_STATE_DIR: &str = "~/.local/state/lord-kali";
-// A live TUI rewrites its heartbeat every poll (~200 ms); 3 s tolerates a few missed
-// loops without ever leaving a closed TUI looking alive.
-const HEARTBEAT_FRESH_MS: u64 = 3_000;
-// Kept below Claude Code's default 60 s hook timeout so a slow operator triggers our own
-// fallback (today's behavior) rather than a hard hook timeout.
-pub(crate) const SELF_TIMEOUT_MS: u64 = 50_000;
-pub(crate) const POLL_MS: u64 = 200;
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct QueueRequest {
@@ -114,12 +107,12 @@ pub(crate) fn write_heartbeat_in(dir: &Path) -> std::io::Result<()> {
     write_atomic(&heartbeat_in(dir), &now_ms().to_string())
 }
 
-pub(crate) fn is_tui_live_in(dir: &Path) -> bool {
+pub(crate) fn is_tui_live_in(dir: &Path, heartbeat_fresh_ms: u64) -> bool {
     match std::fs::read_to_string(heartbeat_in(dir)) {
         Ok(s) => s
             .trim()
             .parse::<u64>()
-            .is_ok_and(|ts| now_ms().saturating_sub(ts) <= HEARTBEAT_FRESH_MS),
+            .is_ok_and(|ts| now_ms().saturating_sub(ts) <= heartbeat_fresh_ms),
         Err(_) => false,
     }
 }
@@ -248,20 +241,17 @@ mod tests {
 
     #[test]
     fn heartbeat_live_then_stale_then_absent() {
+        use crate::config::DEFAULT_HEARTBEAT_FRESH_MS as FRESH;
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
-        assert!(!is_tui_live_in(dir), "absent heartbeat is not live");
+        assert!(!is_tui_live_in(dir, FRESH), "absent heartbeat is not live");
 
         write_heartbeat_in(dir).unwrap();
-        assert!(is_tui_live_in(dir), "fresh heartbeat is live");
+        assert!(is_tui_live_in(dir, FRESH), "fresh heartbeat is live");
 
         // Stamp an old timestamp directly to simulate a dead TUI.
-        write_atomic(
-            &heartbeat_in(dir),
-            &(now_ms() - HEARTBEAT_FRESH_MS - 1000).to_string(),
-        )
-        .unwrap();
-        assert!(!is_tui_live_in(dir), "stale heartbeat is not live");
+        write_atomic(&heartbeat_in(dir), &(now_ms() - FRESH - 1000).to_string()).unwrap();
+        assert!(!is_tui_live_in(dir, FRESH), "stale heartbeat is not live");
     }
 
     #[test]

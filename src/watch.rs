@@ -7,8 +7,6 @@ use std::collections::HashMap;
 use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
 
-const WATCH_POLL_MS: u64 = 200;
-const PENDING_TIMEOUT_MS: u64 = 60_000;
 // The watcher tidies the log on open and once an hour while running (best-effort).
 const PRUNE_INTERVAL_MS: u64 = 3_600_000;
 
@@ -40,7 +38,7 @@ struct PendingPre {
 
 fn event_target(v: &serde_json::Value) -> String {
     let ti = &v["tool_input"];
-    for key in ["command", "url", "file_path", "path"] {
+    for key in ["command", "url", "query", "file_path", "path"] {
         if let Some(s) = ti.get(key).and_then(|x| x.as_str()) {
             return s.to_string();
         }
@@ -167,11 +165,11 @@ fn handle_line(p: &Palette, line: &str, pending: &mut HashMap<String, PendingPre
     }
 }
 
-fn sweep_pending(p: &Palette, pending: &mut HashMap<String, PendingPre>) {
+fn sweep_pending(p: &Palette, pending: &mut HashMap<String, PendingPre>, pending_timeout_ms: u64) {
     let now = now_ms();
     let expired: Vec<String> = pending
         .iter()
-        .filter(|(_, pre)| now.saturating_sub(pre.ts_ms) > PENDING_TIMEOUT_MS)
+        .filter(|(_, pre)| now.saturating_sub(pre.ts_ms) > pending_timeout_ms)
         .map(|(k, _)| k.clone())
         .collect();
     for k in expired {
@@ -179,7 +177,7 @@ fn sweep_pending(p: &Palette, pending: &mut HashMap<String, PendingPre>) {
         if pre.final_decision == "passthrough" || pre.final_decision == "ask" {
             let mut msg = format!(
                 "       └ no execution in {}s — rejected or abandoned?  {}: {}",
-                PENDING_TIMEOUT_MS / 1000,
+                pending_timeout_ms / 1000,
                 pre.tool,
                 pre.target
             );
@@ -265,6 +263,9 @@ pub(crate) fn watch(args: &[String]) {
 }
 
 fn watch_tail(explicit_path: Option<&str>) {
+    let approval = crate::config::load_config(None).approval;
+    let pending_timeout_ms = approval.pending_timeout_ms();
+    let watch_poll_ms = approval.watch_poll_ms();
     let path = crate::log::resolve_log_path(explicit_path);
     let palette = Palette {
         color: std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none(),
@@ -291,8 +292,8 @@ fn watch_tail(explicit_path: Option<&str>) {
         for line in tailer.read_new() {
             handle_line(&palette, &line, &mut pending);
         }
-        sweep_pending(&palette, &mut pending);
-        std::thread::sleep(std::time::Duration::from_millis(WATCH_POLL_MS));
+        sweep_pending(&palette, &mut pending, pending_timeout_ms);
+        std::thread::sleep(std::time::Duration::from_millis(watch_poll_ms));
     }
 }
 
@@ -323,7 +324,6 @@ mod tui {
     use std::sync::mpsc::{channel, Receiver, Sender};
     use std::time::Duration;
 
-    const POLL_MS: u64 = 200;
     const STREAM_CAP: usize = 1000;
     // The model-activity buffer is low-volume, so a small cap keeps plenty of history.
     const LLM_STREAM_CAP: usize = 200;
@@ -1089,6 +1089,7 @@ mod tui {
         // only when the structured view moved or a scrolling buffer gained a line — an idle
         // watcher then sends the terminal nothing, which is what keeps its memory flat.
         let mut last_rev: Option<u64> = None;
+        let poll_ms = approval.watch_poll_ms();
         loop {
             let _ = write_heartbeat_in(state_dir);
 
@@ -1127,7 +1128,7 @@ mod tui {
                 last_rev = Some(rev);
             }
 
-            if event::poll(Duration::from_millis(POLL_MS))? {
+            if event::poll(Duration::from_millis(poll_ms))? {
                 if let Event::Key(k) = event::read()? {
                     if k.kind != KeyEventKind::Press {
                         continue;
@@ -1306,6 +1307,7 @@ mod tui {
                     None => format!("command=\"{}\"  (any args)", rungs[idx].target),
                 },
                 "web-fetch" => format!("url=\"{}\"", rungs[idx].target),
+                "web-search" => format!("query=\"{}\"", rungs[idx].target),
                 "file" => format!("path=\"{}\"", rungs[idx].target),
                 _ => format!("tool=\"{}\"", rungs[idx].target),
             };
@@ -1667,6 +1669,60 @@ mod tui {
                 .all(|n| n.action == Action::Passthrough));
             assert!(live.is_empty());
             assert_eq!(combine_verdict(&verdict.nodes), None);
+        }
+
+        fn one_node_request(shell: &str, target: &str) -> QueueRequest {
+            QueueRequest {
+                id: "u1".into(),
+                ts_ms: 0,
+                cwd: None,
+                tool: if shell == "web-search" {
+                    "WebSearch".into()
+                } else {
+                    "WebFetch".into()
+                },
+                target: target.into(),
+                nodes: vec![QueueNode {
+                    shell: shell.into(),
+                    command: target.into(),
+                    args: String::new(),
+                    decision: "passthrough".into(),
+                }],
+            }
+        }
+
+        fn commit_target(shell: &str, target: &str, toggle: bool) -> String {
+            let mut app = App::new();
+            app.pending.push(Pending::new(
+                one_node_request(shell, target),
+                &ApprovalConfig::default(),
+            ));
+            if toggle {
+                apply_key(&mut app, Key::ToggleScope);
+            }
+            let (_, live) = apply_key(&mut app, Key::Commit(CommitMode::Always)).expect("commit");
+            assert_eq!(live.len(), 1);
+            assert!(
+                live[0].args.is_none(),
+                "url/query rules never scope by args"
+            );
+            live[0].target.clone()
+        }
+
+        // Under the ladder, web-fetch and web-search each have a single fixed rung — the exact
+        // target, no args — so `t` is a no-op and persistence is the literal URL/query either way.
+        #[test]
+        fn web_fetch_persists_exact_url() {
+            let url = "https://docs.n8n.io/hosting/logging";
+            assert_eq!(commit_target("web-fetch", url, false), url);
+            assert_eq!(commit_target("web-fetch", url, true), url);
+        }
+
+        #[test]
+        fn web_search_persists_exact_query() {
+            let q = "n8n /healthz/readiness live database query";
+            assert_eq!(commit_target("web-search", q, false), q);
+            assert_eq!(commit_target("web-search", q, true), q);
         }
 
         #[test]

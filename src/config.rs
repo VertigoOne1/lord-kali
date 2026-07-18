@@ -13,7 +13,8 @@ use std::sync::Arc;
 pub(crate) struct Config {
     pub(crate) bash: CommandRules,
     pub(crate) powershell: CommandRules,
-    pub(crate) web_fetch: WebFetchConfig,
+    pub(crate) web_fetch: PatternRules,
+    pub(crate) web_search: PatternRules,
     pub(crate) mcp: McpConfig,
     pub(crate) file: FileConfig,
     pub(crate) log: Option<LogConfig>,
@@ -30,6 +31,7 @@ impl Config {
             self.powershell.rules.entry(cmd).or_default().extend(rules);
         }
         self.web_fetch.rules.extend(other.web_fetch.rules);
+        self.web_search.rules.extend(other.web_search.rules);
         self.mcp.rules.extend(other.mcp.rules);
         self.file = self.file.merge(other.file);
         if other.log.is_some() {
@@ -152,17 +154,17 @@ pub(crate) struct RawCommandRule {
 }
 
 #[derive(Default)]
-pub(crate) struct WebFetchConfig {
-    pub(crate) rules: Vec<WebFetchRule>,
+pub(crate) struct PatternRules {
+    pub(crate) rules: Vec<PatternRule>,
 }
 
-impl WebFetchConfig {
+impl PatternRules {
     pub(crate) fn from_raw(
-        raw: RawWebFetchConfig,
+        raw: RawPatternConfig,
         group_projects: &[String],
         source: Source,
     ) -> Self {
-        WebFetchConfig {
+        PatternRules {
             rules: raw
                 .rules
                 .into_iter()
@@ -171,18 +173,18 @@ impl WebFetchConfig {
                         "allow" => Decision::Allow,
                         "deny" => Decision::Deny,
                         "ask" => Decision::Ask,
-                        other => panic!("Invalid decision '{}' for url '{}'", other, r.url),
+                        other => panic!("Invalid decision '{}' for pattern '{}'", other, r.pattern),
                     };
                     let projects = merge_and_expand_projects(group_projects, &r.projects);
                     let meta = RuleMeta {
                         source_file: source.clone(),
                         rule_kind: RuleKind::Explicit,
-                        rule_command: Some(r.url.clone()),
-                        rule_args: Some(r.url.clone()),
+                        rule_command: Some(r.pattern.clone()),
+                        rule_args: Some(r.pattern.clone()),
                     };
-                    WebFetchRule {
+                    PatternRule {
                         decision,
-                        pattern: compile_pattern(&r.url),
+                        pattern: compile_pattern(&r.pattern),
                         reason: r.reason.unwrap_or_else(|| "ok".into()),
                         projects,
                         meta,
@@ -193,7 +195,7 @@ impl WebFetchConfig {
     }
 }
 
-pub(crate) struct WebFetchRule {
+pub(crate) struct PatternRule {
     pub(crate) decision: Decision,
     pub(crate) pattern: Pattern,
     pub(crate) reason: String,
@@ -202,14 +204,18 @@ pub(crate) struct WebFetchRule {
 }
 
 #[derive(Default, Deserialize)]
-pub(crate) struct RawWebFetchConfig {
+pub(crate) struct RawPatternConfig {
     #[serde(default)]
-    pub(crate) rules: Vec<RawWebFetchRule>,
+    pub(crate) rules: Vec<RawPatternRule>,
 }
 
+// One shared rule shape for single-string pattern gates: web-fetch matches on `url`,
+// web-search on `query`. Both deserialize into `pattern`, so the compilation and
+// matching logic is written once.
 #[derive(Deserialize)]
-pub(crate) struct RawWebFetchRule {
-    pub(crate) url: String,
+pub(crate) struct RawPatternRule {
+    #[serde(alias = "url", alias = "query")]
+    pub(crate) pattern: String,
     pub(crate) decision: String,
     pub(crate) reason: Option<String>,
     #[serde(default)]
@@ -389,7 +395,9 @@ pub(crate) struct RawConfig {
     #[serde(default)]
     pub(crate) powershell: RawCommandConfig,
     #[serde(default, rename = "web-fetch")]
-    pub(crate) web_fetch: RawWebFetchConfig,
+    pub(crate) web_fetch: RawPatternConfig,
+    #[serde(default, rename = "web-search")]
+    pub(crate) web_search: RawPatternConfig,
     #[serde(default)]
     pub(crate) mcp: RawMcpConfig,
     #[serde(default)]
@@ -412,7 +420,9 @@ pub(crate) struct RawGroupConfig {
     #[serde(default)]
     pub(crate) powershell: RawCommandConfig,
     #[serde(default, rename = "web-fetch")]
-    pub(crate) web_fetch: RawWebFetchConfig,
+    pub(crate) web_fetch: RawPatternConfig,
+    #[serde(default, rename = "web-search")]
+    pub(crate) web_search: RawPatternConfig,
     #[serde(default)]
     pub(crate) mcp: RawMcpConfig,
     #[serde(default)]
@@ -429,7 +439,8 @@ impl Config {
     pub(crate) fn from_raw(raw: RawConfig, source: Source) -> Self {
         let mut bash = CommandRules::from_raw(raw.bash, &[], source.clone());
         let mut powershell = CommandRules::from_raw(raw.powershell, &[], source.clone());
-        let mut web_fetch = WebFetchConfig::from_raw(raw.web_fetch, &[], source.clone());
+        let mut web_fetch = PatternRules::from_raw(raw.web_fetch, &[], source.clone());
+        let mut web_search = PatternRules::from_raw(raw.web_search, &[], source.clone());
         let mut mcp = McpConfig::from_raw(raw.mcp, &[], source.clone());
         let mut file = FileConfig::from_raw(raw.file, &[], source.clone());
 
@@ -446,8 +457,12 @@ impl Config {
             }
 
             let group_web_fetch =
-                WebFetchConfig::from_raw(group.web_fetch, &group.projects, source.clone());
+                PatternRules::from_raw(group.web_fetch, &group.projects, source.clone());
             web_fetch.rules.extend(group_web_fetch.rules);
+
+            let group_web_search =
+                PatternRules::from_raw(group.web_search, &group.projects, source.clone());
+            web_search.rules.extend(group_web_search.rules);
 
             let group_mcp = McpConfig::from_raw(group.mcp, &group.projects, source.clone());
             mcp.rules.extend(group_mcp.rules);
@@ -460,6 +475,7 @@ impl Config {
             bash,
             powershell,
             web_fetch,
+            web_search,
             mcp,
             file,
             log: raw.log,
@@ -471,6 +487,11 @@ impl Config {
                 live_rules: raw.approval.live_rules,
                 state_dir: raw.approval.state_dir,
                 guardrail_commands: raw.approval.guardrail_commands,
+                self_timeout_ms: raw.approval.self_timeout_ms,
+                poll_ms: raw.approval.poll_ms,
+                heartbeat_fresh_ms: raw.approval.heartbeat_fresh_ms,
+                pending_timeout_ms: raw.approval.pending_timeout_ms,
+                watch_poll_ms: raw.approval.watch_poll_ms,
                 llm: raw.approval.llm.map(ApprovalLlmConfig::from),
             },
         }
@@ -575,12 +596,32 @@ const DEFAULT_GUARDRAIL: &[&str] = &[
     "Clear-Content",
 ];
 
+// Default approval timers, overridable per `[approval]` key. All in milliseconds.
+// Kept below Claude Code's default 60 s hook timeout so a slow operator triggers our own
+// pass-through fallback rather than a hard hook timeout.
+pub(crate) const DEFAULT_SELF_TIMEOUT_MS: u64 = 50_000;
+// How often the blocked gate polls the queue for the TUI's verdict.
+pub(crate) const DEFAULT_POLL_MS: u64 = 200;
+// A live TUI rewrites its heartbeat every poll; this tolerates a few missed loops without
+// ever leaving a closed TUI looking alive (so the gate degrades to pass-through promptly).
+pub(crate) const DEFAULT_HEARTBEAT_FRESH_MS: u64 = 3_000;
+// How long `watch --tail` tracks a pending call before surfacing it as timed-out (the only
+// trace a rejection leaves), and the tail/TUI loop poll cadence.
+pub(crate) const DEFAULT_PENDING_TIMEOUT_MS: u64 = 60_000;
+pub(crate) const DEFAULT_WATCH_POLL_MS: u64 = 200;
+
 #[derive(Default)]
 pub(crate) struct ApprovalConfig {
     pub(crate) enabled: bool,
     pub(crate) live_rules: Option<String>,
     pub(crate) state_dir: Option<String>,
     pub(crate) guardrail_commands: Vec<String>,
+    // Approval timers; None => the DEFAULT_* above. Resolved via the accessor methods below.
+    pub(crate) self_timeout_ms: Option<u64>,
+    pub(crate) poll_ms: Option<u64>,
+    pub(crate) heartbeat_fresh_ms: Option<u64>,
+    pub(crate) pending_timeout_ms: Option<u64>,
+    pub(crate) watch_poll_ms: Option<u64>,
     // Optional LLM auto-approval (Phase 2). None or disabled => the watch never consults a model.
     pub(crate) llm: Option<ApprovalLlmConfig>,
 }
@@ -595,12 +636,39 @@ impl ApprovalConfig {
             live_rules: other.live_rules.or(self.live_rules),
             state_dir: other.state_dir.or(self.state_dir),
             guardrail_commands: self.guardrail_commands,
+            self_timeout_ms: other.self_timeout_ms.or(self.self_timeout_ms),
+            poll_ms: other.poll_ms.or(self.poll_ms),
+            heartbeat_fresh_ms: other.heartbeat_fresh_ms.or(self.heartbeat_fresh_ms),
+            pending_timeout_ms: other.pending_timeout_ms.or(self.pending_timeout_ms),
+            watch_poll_ms: other.watch_poll_ms.or(self.watch_poll_ms),
             llm: other.llm.or(self.llm),
         }
     }
 
     pub(crate) fn live_rules_file(&self) -> &str {
         self.live_rules.as_deref().unwrap_or("99-live.toml")
+    }
+
+    pub(crate) fn self_timeout_ms(&self) -> u64 {
+        self.self_timeout_ms.unwrap_or(DEFAULT_SELF_TIMEOUT_MS)
+    }
+
+    pub(crate) fn poll_ms(&self) -> u64 {
+        self.poll_ms.unwrap_or(DEFAULT_POLL_MS)
+    }
+
+    pub(crate) fn heartbeat_fresh_ms(&self) -> u64 {
+        self.heartbeat_fresh_ms
+            .unwrap_or(DEFAULT_HEARTBEAT_FRESH_MS)
+    }
+
+    pub(crate) fn pending_timeout_ms(&self) -> u64 {
+        self.pending_timeout_ms
+            .unwrap_or(DEFAULT_PENDING_TIMEOUT_MS)
+    }
+
+    pub(crate) fn watch_poll_ms(&self) -> u64 {
+        self.watch_poll_ms.unwrap_or(DEFAULT_WATCH_POLL_MS)
     }
 
     // Built-in destructive set unioned with the user's additions.
@@ -617,6 +685,11 @@ pub(crate) struct RawApprovalConfig {
     pub(crate) state_dir: Option<String>,
     #[serde(default)]
     pub(crate) guardrail_commands: Vec<String>,
+    pub(crate) self_timeout_ms: Option<u64>,
+    pub(crate) poll_ms: Option<u64>,
+    pub(crate) heartbeat_fresh_ms: Option<u64>,
+    pub(crate) pending_timeout_ms: Option<u64>,
+    pub(crate) watch_poll_ms: Option<u64>,
     pub(crate) llm: Option<RawApprovalLlmConfig>,
 }
 
@@ -757,7 +830,7 @@ pub(crate) fn load_config(cwd: Option<&str>) -> Config {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decision::{handle_bash, handle_web_fetch};
+    use crate::decision::{handle_bash, handle_pattern};
 
     // --- glob patterns ---
 
@@ -875,7 +948,8 @@ mod tests {
         let raw = RawConfig {
             bash: RawCommandConfig::default(),
             powershell: RawCommandConfig::default(),
-            web_fetch: RawWebFetchConfig::default(),
+            web_fetch: RawPatternConfig::default(),
+            web_search: RawPatternConfig::default(),
             log: None,
             worktree_protection: RawWorktreeProtectionConfig::default(),
             approval: RawApprovalConfig::default(),
@@ -894,7 +968,8 @@ mod tests {
                     }],
                 },
                 powershell: RawCommandConfig::default(),
-                web_fetch: RawWebFetchConfig::default(),
+                web_fetch: RawPatternConfig::default(),
+                web_search: RawPatternConfig::default(),
                 mcp: RawMcpConfig::default(),
                 file: RawFileConfig::default(),
             }],
@@ -926,7 +1001,8 @@ mod tests {
         let raw = RawConfig {
             bash: RawCommandConfig::default(),
             powershell: RawCommandConfig::default(),
-            web_fetch: RawWebFetchConfig::default(),
+            web_fetch: RawPatternConfig::default(),
+            web_search: RawPatternConfig::default(),
             log: None,
             worktree_protection: RawWorktreeProtectionConfig::default(),
             approval: RawApprovalConfig::default(),
@@ -945,7 +1021,8 @@ mod tests {
                     }],
                 },
                 powershell: RawCommandConfig::default(),
-                web_fetch: RawWebFetchConfig::default(),
+                web_fetch: RawPatternConfig::default(),
+                web_search: RawPatternConfig::default(),
                 mcp: RawMcpConfig::default(),
                 file: RawFileConfig::default(),
             }],
@@ -974,7 +1051,8 @@ mod tests {
         let raw = RawConfig {
             bash: RawCommandConfig::default(),
             powershell: RawCommandConfig::default(),
-            web_fetch: RawWebFetchConfig::default(),
+            web_fetch: RawPatternConfig::default(),
+            web_search: RawPatternConfig::default(),
             log: None,
             worktree_protection: RawWorktreeProtectionConfig::default(),
             approval: RawApprovalConfig::default(),
@@ -987,7 +1065,8 @@ mod tests {
                     rules: vec![],
                 },
                 powershell: RawCommandConfig::default(),
-                web_fetch: RawWebFetchConfig::default(),
+                web_fetch: RawPatternConfig::default(),
+                web_search: RawPatternConfig::default(),
                 mcp: RawMcpConfig::default(),
                 file: RawFileConfig::default(),
             }],
@@ -1019,7 +1098,8 @@ mod tests {
         let raw = RawConfig {
             bash: RawCommandConfig::default(),
             powershell: RawCommandConfig::default(),
-            web_fetch: RawWebFetchConfig::default(),
+            web_fetch: RawPatternConfig::default(),
+            web_search: RawPatternConfig::default(),
             log: None,
             worktree_protection: RawWorktreeProtectionConfig::default(),
             approval: RawApprovalConfig::default(),
@@ -1029,14 +1109,15 @@ mod tests {
                 projects: vec!["/home/user/projects/test".into()],
                 bash: RawCommandConfig::default(),
                 powershell: RawCommandConfig::default(),
-                web_fetch: RawWebFetchConfig {
-                    rules: vec![RawWebFetchRule {
-                        url: "https://internal.example.com/**".into(),
+                web_fetch: RawPatternConfig {
+                    rules: vec![RawPatternRule {
+                        pattern: "https://internal.example.com/**".into(),
                         decision: "allow".into(),
                         reason: Some("ok".into()),
                         projects: vec![],
                     }],
                 },
+                web_search: RawPatternConfig::default(),
                 mcp: RawMcpConfig::default(),
                 file: RawFileConfig::default(),
             }],
@@ -1044,7 +1125,7 @@ mod tests {
         let config = Config::from(raw);
 
         assert_eq!(
-            handle_web_fetch(
+            handle_pattern(
                 &config.web_fetch,
                 Some("/home/user/projects/test"),
                 "https://internal.example.com/api"
@@ -1053,7 +1134,7 @@ mod tests {
             Some(Decision::Allow)
         );
         assert_eq!(
-            handle_web_fetch(
+            handle_pattern(
                 &config.web_fetch,
                 Some("/home/user/projects/other"),
                 "https://internal.example.com/api"
@@ -1077,7 +1158,8 @@ mod tests {
                 }],
             },
             powershell: RawCommandConfig::default(),
-            web_fetch: RawWebFetchConfig::default(),
+            web_fetch: RawPatternConfig::default(),
+            web_search: RawPatternConfig::default(),
             log: None,
             worktree_protection: RawWorktreeProtectionConfig::default(),
             approval: RawApprovalConfig::default(),
@@ -1096,7 +1178,8 @@ mod tests {
                     }],
                 },
                 powershell: RawCommandConfig::default(),
-                web_fetch: RawWebFetchConfig::default(),
+                web_fetch: RawPatternConfig::default(),
+                web_search: RawPatternConfig::default(),
                 mcp: RawMcpConfig::default(),
                 file: RawFileConfig::default(),
             }],
@@ -1108,8 +1191,7 @@ mod tests {
                 &config.bash,
                 Some("/home/user/projects/test"),
                 "cargo publish"
-            )
-            .map(|(d, r)| (d, r)),
+            ),
             Some((Decision::Deny, "Global deny".into()))
         );
     }
@@ -1171,8 +1253,8 @@ mod tests {
     #[test]
     fn merge_web_fetch_rules() {
         let a = Config {
-            web_fetch: WebFetchConfig {
-                rules: vec![WebFetchRule {
+            web_fetch: PatternRules {
+                rules: vec![PatternRule {
                     decision: Decision::Deny,
                     pattern: compile_pattern("https://evil.com/**"),
                     reason: "blocked".into(),
@@ -1183,8 +1265,8 @@ mod tests {
             ..Config::default()
         };
         let b = Config {
-            web_fetch: WebFetchConfig {
-                rules: vec![WebFetchRule {
+            web_fetch: PatternRules {
+                rules: vec![PatternRule {
                     decision: Decision::Allow,
                     pattern: compile_pattern("https://docs.rs/**"),
                     reason: "ok".into(),
@@ -1223,7 +1305,7 @@ mod tests {
         };
 
         let merged = a.merge(b);
-        assert_eq!(merged.log.as_ref().unwrap().enabled, false);
+        assert!(!merged.log.as_ref().unwrap().enabled);
         assert_eq!(merged.log.as_ref().unwrap().path.as_deref(), Some("/b.log"));
 
         let merged2 = merged.merge(c);
@@ -1351,7 +1433,7 @@ decision = "allow"
         let config = Config::from(raw);
 
         assert_eq!(
-            handle_web_fetch(
+            handle_pattern(
                 &config.web_fetch,
                 Some("/home/user/projects/test"),
                 "https://internal.example.com/api"
@@ -1360,13 +1442,62 @@ decision = "allow"
             Some(Decision::Allow)
         );
         assert_eq!(
-            handle_web_fetch(
+            handle_pattern(
                 &config.web_fetch,
                 Some("/home/user/projects/other"),
                 "https://internal.example.com/api"
             )
             .map(|(d, _)| d),
             None
+        );
+    }
+
+    #[test]
+    fn web_search_rules_parse_via_query_alias() {
+        let toml_str = r#"
+[[web-search.rules]]
+query = "**"
+decision = "allow"
+
+[[web-search.rules]]
+query = "*password*"
+decision = "deny"
+reason = "sensitive"
+"#;
+        let raw: RawConfig = toml::from_str(toml_str).unwrap();
+        let config = Config::from(raw);
+
+        // first-match-wins: the allow-all rule precedes the deny, so it takes effect.
+        assert_eq!(
+            crate::decision::handle_pattern(&config.web_search, None, "anything at all")
+                .map(|(d, _)| d),
+            Some(Decision::Allow)
+        );
+    }
+
+    #[test]
+    fn web_search_deny_when_listed_first() {
+        let toml_str = r#"
+[[web-search.rules]]
+query = "*password*"
+decision = "deny"
+
+[[web-search.rules]]
+query = "**"
+decision = "allow"
+"#;
+        let raw: RawConfig = toml::from_str(toml_str).unwrap();
+        let config = Config::from(raw);
+
+        assert_eq!(
+            crate::decision::handle_pattern(&config.web_search, None, "leak the password now")
+                .map(|(d, _)| d),
+            Some(Decision::Deny)
+        );
+        assert_eq!(
+            crate::decision::handle_pattern(&config.web_search, None, "harmless query")
+                .map(|(d, _)| d),
+            Some(Decision::Allow)
         );
     }
 
@@ -1397,10 +1528,7 @@ reason = "Global allows rm"
 
         let merged = project_config.merge(global_config);
         let result = handle_bash(&merged.bash, None, "rm foo");
-        assert_eq!(
-            result.map(|(d, r)| (d, r)),
-            Some((Decision::Deny, "Project denies rm".into()))
-        );
+        assert_eq!(result, Some((Decision::Deny, "Project denies rm".into())));
     }
 
     // --- find_project_config ---

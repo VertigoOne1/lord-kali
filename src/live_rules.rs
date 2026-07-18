@@ -8,10 +8,10 @@ use crate::queue::write_atomic;
 use std::path::{Path, PathBuf};
 
 pub(crate) struct LiveRule {
-    // "bash", "powershell", "web-fetch", "mcp", or "file" — picks the rules table.
+    // "bash", "powershell", "web-fetch", "web-search", "mcp", or "file" — picks the rules table.
     pub(crate) shell: String,
-    // command basename for bash/powershell, the full URL for web-fetch, the MCP tool name,
-    // or the path pattern for file.
+    // command basename for bash/powershell; the URL/query pattern for web-fetch/web-search;
+    // the MCP tool name, or the path pattern for file.
     pub(crate) target: String,
     // optional args pattern, scoping the rule to a subcommand (e.g. "push{, **}").
     // None means command-wide (any args) — used when the node had no arguments.
@@ -28,6 +28,7 @@ fn render_rule(r: &LiveRule) -> String {
     let value = toml::Value::String(r.target.clone()).to_string();
     let (table, key) = match r.shell.as_str() {
         "web-fetch" => ("web-fetch.rules", "url"),
+        "web-search" => ("web-search.rules", "query"),
         "powershell" => ("powershell.rules", "command"),
         "mcp" => ("mcp.rules", "tool"),
         "file" => ("file.rules", "path"),
@@ -75,7 +76,7 @@ pub(crate) fn append_rules(path: &Path, rules: &[LiveRule]) -> std::io::Result<(
 mod tests {
     use super::*;
     use crate::config::{Config, RawConfig};
-    use crate::decision::{handle_bash, handle_mcp, handle_web_fetch, Decision};
+    use crate::decision::{handle_bash, handle_mcp, handle_pattern, Decision};
 
     fn load(path: &Path) -> Config {
         let content = std::fs::read_to_string(path).unwrap();
@@ -161,6 +162,65 @@ mod tests {
     }
 
     #[test]
+    fn web_search_persists_query() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("99-live.toml");
+        append_rules(
+            &path,
+            &[LiveRule {
+                shell: "web-search".into(),
+                target: "**".into(),
+                args: None,
+                allow: true,
+            }],
+        )
+        .unwrap();
+
+        let config = load(&path);
+        assert_eq!(
+            crate::decision::handle_pattern(&config.web_search, None, "any search at all")
+                .map(|(d, _)| d),
+            Some(Decision::Allow)
+        );
+    }
+
+    // A domain-wildcard web-fetch rule matches every path on the host but no other host.
+    #[test]
+    fn web_fetch_domain_wildcard_matches_host_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("99-live.toml");
+        append_rules(
+            &path,
+            &[LiveRule {
+                shell: "web-fetch".into(),
+                target: "https://docs.n8n.io{,/**}".into(),
+                args: None,
+                allow: true,
+            }],
+        )
+        .unwrap();
+
+        let config = load(&path);
+        assert_eq!(
+            handle_pattern(&config.web_fetch, None, "https://docs.n8n.io").map(|(d, _)| d),
+            Some(Decision::Allow)
+        );
+        assert_eq!(
+            handle_pattern(
+                &config.web_fetch,
+                None,
+                "https://docs.n8n.io/hosting/logging"
+            )
+            .map(|(d, _)| d),
+            Some(Decision::Allow)
+        );
+        assert_eq!(
+            handle_pattern(&config.web_fetch, None, "https://community.n8n.io/t/1"),
+            None
+        );
+    }
+
+    #[test]
     fn web_fetch_persists_url() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("99-live.toml");
@@ -177,7 +237,7 @@ mod tests {
 
         let config = load(&path);
         assert_eq!(
-            handle_web_fetch(&config.web_fetch, None, "https://docs.rs/tokio").map(|(d, _)| d),
+            handle_pattern(&config.web_fetch, None, "https://docs.rs/tokio").map(|(d, _)| d),
             Some(Decision::Allow)
         );
     }
@@ -214,6 +274,7 @@ mod tests {
         let input = ToolInput {
             command: None,
             url: None,
+            query: None,
             file_path: Some("/home/u/proj/src/main.rs".into()),
             path: None,
             extra: Default::default(),

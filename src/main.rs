@@ -32,6 +32,7 @@ pub(crate) struct HookInput {
 pub(crate) struct ToolInput {
     pub(crate) command: Option<String>,
     pub(crate) url: Option<String>,
+    pub(crate) query: Option<String>,
     pub(crate) file_path: Option<String>,
     pub(crate) path: Option<String>,
     // Any remaining input keys (e.g. an MCP tool's structured arguments), captured for the
@@ -127,7 +128,7 @@ fn maybe_route_to_approval(
     }
 
     let dir = queue::state_dir(&config.approval);
-    if !queue::is_tui_live_in(&dir) {
+    if !queue::is_tui_live_in(&dir, config.approval.heartbeat_fresh_ms()) {
         return trace;
     }
 
@@ -146,7 +147,12 @@ fn maybe_route_to_approval(
         nodes,
     };
 
-    match queue::submit_and_wait_in(&dir, &request, queue::SELF_TIMEOUT_MS, queue::POLL_MS) {
+    match queue::submit_and_wait_in(
+        &dir,
+        &request,
+        config.approval.self_timeout_ms(),
+        config.approval.poll_ms(),
+    ) {
         Some(verdict) => {
             let mut trace = trace;
             trace.final_decision = queue::combine_verdict(&verdict.nodes);
@@ -156,14 +162,15 @@ fn maybe_route_to_approval(
     }
 }
 
-// The one-line label shown for a queued call: its command, URL, or target path — falling
-// back to the tool name when the call carries none of those.
+// The one-line label shown for a queued call: its command, URL, search query, or target
+// path — falling back to the tool name when the call carries none of those.
 fn request_target(hook_input: &HookInput) -> String {
     hook_input
         .tool_input
         .command
         .clone()
         .or_else(|| hook_input.tool_input.url.clone())
+        .or_else(|| hook_input.tool_input.query.clone())
         .or_else(|| hook_input.tool_input.file_path.clone())
         .or_else(|| hook_input.tool_input.path.clone())
         .unwrap_or_else(|| hook_input.tool_name.clone())
@@ -247,6 +254,7 @@ mod tests {
             tool_input: ToolInput {
                 command: None,
                 url: None,
+                query: None,
                 file_path: Some("/p/Startup.cs".into()),
                 path: None,
                 extra: Default::default(),
@@ -264,6 +272,7 @@ mod tests {
             tool_input: ToolInput {
                 command: Some(command.into()),
                 url: None,
+                query: None,
                 file_path: None,
                 path: None,
                 extra: Default::default(),

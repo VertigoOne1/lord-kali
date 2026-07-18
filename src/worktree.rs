@@ -125,6 +125,7 @@ mod tests {
         ToolInput {
             command: None,
             url: None,
+            query: None,
             file_path: file_path.map(String::from),
             path: path.map(String::from),
             extra: Default::default(),
