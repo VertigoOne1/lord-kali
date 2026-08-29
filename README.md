@@ -78,14 +78,36 @@ Two things worth knowing, both from the [hooks reference](https://code.claude.co
 
 You can commit a `.claude/lord-kali.toml` file inside your project repository. This file is discovered by walking up from `cwd` until a `.git` directory is found. `cwd` is the working directory that Claude Code passes in the hook's JSON input, reflecting the project directory Claude Code is operating in (not the process working directory of lord-kali itself). Project-local rules have the highest priority and are evaluated before any global rules.
 
+### Settings vs rules
+
+Configuration comes in two halves, and they resolve differently.
+
+**Rules** — `[[bash.rules]]`, `allowed_commands`, `[[group]]`, and the other gating tables — live in the numbered files and merge across them, first-match-wins.
+
+**Settings** — the behaviour switches: `[log]`, `[approval]`, `[approval.llm]`, `[file]`'s `enabled`/`mutation_scope`, `[worktree-protection]`, `[otel]` — resolve from **one file, `settings.toml`**, in the same directory. A section declared there **replaces** the same section in the numbered files rather than merging with it.
+
+That distinction exists because merging settings was unguessable: `[log]` was last-file-wins, `[approval] enabled` ORed across every file, and `guardrail_commands` unioned. Three different rules in one config system — and under the OR and union rules some values could not be turned *off* from any one place, which is exactly what an editor has to be able to do.
+
+Consequences worth knowing:
+
+- **Only the sections `settings.toml` actually declares are replaced**, so a part-migrated setup keeps working. What is still in the numbered files keeps applying until you move it across.
+- **A section declared in both places is reported as a conflict**, not silently combined — `settings.toml` wins, and the TUI names the file still holding the stale copy so you can delete it.
+- **`[file]` is split.** Its `enabled`/`mutation_scope` are settings; `[[file.rules]]` are rules and stay in the numbered files. A `[file]` block holding only rules declares no settings section and is not a conflict.
+- **A malformed `settings.toml` leaves the numbered files in charge** rather than silently resetting every switch to its default. The parse error surfaces in the TUI, where it can be fixed.
+
+Edit it with `m` in `lord-kali watch`, or by hand — the file is plain TOML. Comments outside its header are not preserved when the TUI saves, which is why it holds settings only.
+
 ### Global configuration
 
 All `*.toml` files in `~/.config/lord-kali/` are loaded in lexicographic order and merged. This lets you split config into files like `00-base.toml`, `10-bash.toml`, `20-groups.toml`. If no `.toml` files are found, a default config is used (everything passes through).
 
+> **Where that directory actually is.** lord-kali uses the platform config dir, so `~/.config/lord-kali/` is the Linux/macOS form. On **Windows it is `%APPDATA%\lord-kali\`** (that is, `C:\Users\<you>\AppData\Roaming\lord-kali\`), which is *not* under `~/.config`. State — the log, queue and heartbeat — lives separately under `~/.local/state/lord-kali/` on every platform. The TUI's settings screen prints every resolved path, so you never have to remember this.
+
 Config loading order (highest priority first):
 
 1. `.claude/lord-kali.toml` (project-local, found by walking up from `cwd`)
-2. `~/.config/lord-kali/*.toml` (global, in lexicographic order)
+2. `settings.toml` (global; settings sections only — see [Settings vs rules](#settings-vs-rules))
+3. the other `*.toml` files in the config dir (global rules, in lexicographic order)
 
 Within each file, rules are ordered: top-level rules first, then group rules in definition order. When files are merged, each file's rules are appended after the previous file's. The combined result is evaluated first-match-wins, so rules from earlier files have higher priority. For bash rules sharing the same command key, both files' rules are concatenated (earlier file first). For `[log]`, the last file with a `[log]` section wins.
 
