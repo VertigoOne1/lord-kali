@@ -323,8 +323,7 @@ impl SettingsModal {
                 self.status = Some(("saved".to_string(), false));
                 Outcome::Saved(format!(
                     "settings saved → {} · the hook reads it on its next call; \
-                     watch timers and the model keep running the values this watch started with \
-                     until it is restarted",
+                     this watch reloads what it can now and reports anything that needs a restart",
                     self.paths.settings_file.display()
                 ))
             }

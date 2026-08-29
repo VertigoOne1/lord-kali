@@ -324,6 +324,7 @@ mod tui {
     use ratatui::{DefaultTerminal, Frame};
     use std::collections::HashMap;
     use std::path::Path;
+    use std::path::PathBuf;
     use std::sync::mpsc::{channel, Receiver, Sender};
     use std::time::Duration;
 
@@ -1382,6 +1383,81 @@ mod tui {
         ])
     }
 
+    // Re-apply saved settings to the running watch (docs/C-config-in-tui.md §C4). Returns the
+    // lines to show: what took effect, and — the part that matters — what did not and why.
+    // Silently ignoring an unappliable change is worse than a restart, because the operator
+    // would go on believing the new value is in force.
+    #[allow(clippy::too_many_arguments)]
+    fn reload(
+        app: &mut App,
+        cfg: Config,
+        approval: &mut ApprovalConfig,
+        live_path: &mut PathBuf,
+        log_path: &mut PathBuf,
+        tailer: &mut Tailer,
+        auto: &mut Option<AutoApprover>,
+        otel: &mut Option<OtelPipeline>,
+        state_dir: &Path,
+    ) -> Vec<String> {
+        let mut notes = Vec::new();
+
+        let new_state_dir = queue::state_dir(&cfg.approval);
+        if new_state_dir != state_dir {
+            // Pending requests are addressed in the old directory and agents are blocked on
+            // them right now. Switching would orphan every one.
+            notes.push(format!(
+                "state_dir → {} needs a restart; the queue this watch is serving is still {}",
+                new_state_dir.display(),
+                state_dir.display()
+            ));
+        }
+
+        let new_live = live_rules_path(&cfg.approval);
+        if new_live != *live_path {
+            notes.push(format!("live rules → {}", new_live.display()));
+            *live_path = new_live;
+        }
+
+        let new_log = resolve_log_path(None);
+        if new_log != *log_path {
+            notes.push(format!("log → {} (tailing it now)", new_log.display()));
+            *log_path = new_log.clone();
+            *tailer = Tailer::new(new_log);
+        }
+
+        // Rebuilt rather than mutated, so a newly-named api_key_env is actually read and an
+        // enable/disable takes effect the same way it would on a fresh start.
+        let had_llm = auto.is_some();
+        *auto = build_auto(&cfg.approval, app);
+        match (had_llm, auto.is_some()) {
+            (false, true) => notes.push("auto-approval on".into()),
+            (true, false) => notes.push("auto-approval off".into()),
+            _ => {}
+        }
+
+        let had_otel = otel.is_some();
+        *otel = build_otel(&cfg.otel, app);
+        // A fresh pipeline resumes from the checkpoint, so records written while it was off
+        // are not lost.
+        if let Some(p) = otel.as_mut() {
+            if !had_otel {
+                backfill_otel(p, log_path, app);
+            }
+        }
+        if had_otel && otel.is_none() {
+            notes.push("otel export off".into());
+        }
+
+        *approval = cfg.approval;
+        notes.push(format!(
+            "timers now: self-timeout {}ms · poll {}ms · heartbeat {}ms",
+            approval.self_timeout_ms(),
+            approval.watch_poll_ms(),
+            approval.heartbeat_fresh_ms()
+        ));
+        notes
+    }
+
     // Every key goes to the editor while it is open, which is what keeps `q` from quitting
     // out from under an unsaved edit. Returns the line a save wants in the stream.
     fn settings_key(app: &mut App, code: KeyCode) -> Option<String> {
@@ -1539,9 +1615,9 @@ mod tui {
             &mut tailer,
             &state_dir,
             &qdir,
-            &live_path,
-            &cfg.approval,
-            &log_path,
+            live_path,
+            cfg.approval,
+            log_path,
             &mut auto,
             &mut otel,
         );
@@ -1557,9 +1633,12 @@ mod tui {
         tailer: &mut Tailer,
         state_dir: &Path,
         qdir: &Path,
-        live_path: &Path,
-        approval: &ApprovalConfig,
-        log_path: &Path,
+        // Owned, not borrowed: saving settings rebuilds them in place (docs/C §C4). The
+        // queue directory is deliberately NOT reloadable — pending requests are addressed
+        // there, and moving it mid-run would orphan every agent currently blocked.
+        mut live_path: PathBuf,
+        mut approval: ApprovalConfig,
+        mut log_path: PathBuf,
         auto: &mut Option<AutoApprover>,
         otel: &mut Option<OtelPipeline>,
     ) -> std::io::Result<()> {
@@ -1573,14 +1652,14 @@ mod tui {
         // only when the structured view moved or a scrolling buffer gained a line — an idle
         // watcher then sends the terminal nothing, which is what keeps its memory flat.
         let mut last_rev: Option<u64> = None;
-        let poll_ms = approval.watch_poll_ms();
+        let mut poll_ms = approval.watch_poll_ms();
         loop {
             let _ = write_heartbeat_in(state_dir);
 
             let now = now_ms();
             if now >= next_prune_ms {
                 // Best-effort housekeeping; a prune error must never disturb the watch loop.
-                let _ = prune_log_file(log_path, DEFAULT_RETAIN_DAYS, now);
+                let _ = prune_log_file(&log_path, DEFAULT_RETAIN_DAYS, now);
                 tailer.resync_to_end();
                 // Dedupe markers are only written while this TUI is alive, so this is the
                 // process responsible for clearing them.
@@ -1616,9 +1695,9 @@ mod tui {
                 }
             }
 
-            sync_pending(app, qdir, approval);
+            sync_pending(app, qdir, &approval);
             if let Some(a) = auto.as_mut() {
-                dirty |= a.tick(app, qdir, live_path, log_path, now);
+                dirty |= a.tick(app, qdir, &live_path, &log_path, now);
             }
             let count = app.pending.len();
             if count != prev_pending {
@@ -1652,13 +1731,30 @@ mod tui {
                     if app.settings.is_some() {
                         if let Some(note) = settings_key(app, k.code) {
                             push_capped(&mut app.stream, settings_note(&note), STREAM_CAP);
+                            // Apply what can be applied now, and say plainly what cannot.
+                            let cfg = load_config(None);
+                            for line in reload(
+                                app,
+                                cfg,
+                                &mut approval,
+                                &mut live_path,
+                                &mut log_path,
+                                tailer,
+                                auto,
+                                otel,
+                                state_dir,
+                            ) {
+                                push_capped(&mut app.stream, settings_note(&line), STREAM_CAP);
+                            }
+                            poll_ms = approval.watch_poll_ms();
+                            next_export_ms = now_ms();
                         }
                         continue;
                     }
                     let key = map_key(k.code);
                     if matches!(key, Key::Settings) {
                         app.settings = Some(SettingsModal::open(settings_ui::Paths::resolve(
-                            approval, log_path,
+                            &approval, &log_path,
                         )));
                         continue;
                     }
@@ -1668,9 +1764,9 @@ mod tui {
                         if let Ok(j) = serde_json::to_string(&verdict) {
                             let _ = write_atomic(&vpath, &j);
                         }
-                        let _ = append_rules(live_path, &live);
+                        let _ = append_rules(&live_path, &live);
                         if let Some(mode) = commit_mode {
-                            log_operator_commit(log_path, app, mode, auto.as_ref());
+                            log_operator_commit(&log_path, app, mode, auto.as_ref());
                             // Only an *-always commit writes a rule, so only that can be
                             // shadowed. Checked after the write, against the real config.
                             if mode == "always" {
@@ -2614,6 +2710,113 @@ mod tui {
             assert_eq!(v["lanes"][0]["node"], "gh");
             assert_eq!(v["lk_llm"]["verdict"], "safe");
             assert_eq!(v["lk_llm"]["reason"], "read-only");
+        }
+
+        // ---- C4: hot reload (docs/C-config-in-tui.md) ------------------------------------
+
+        fn reload_with(cfg_src: &str, state_dir: &Path) -> (Vec<String>, App, PathBuf, PathBuf) {
+            let cfg = Config::from(toml::from_str::<crate::config::RawConfig>(cfg_src).unwrap());
+            let mut app = App::new();
+            let mut approval = ApprovalConfig::default();
+            let mut live = PathBuf::from("old-live.toml");
+            let mut log = PathBuf::from("old.jsonl");
+            let mut tailer = Tailer::new(log.clone());
+            let mut auto = None;
+            let mut otel = None;
+            let notes = reload(
+                &mut app,
+                cfg,
+                &mut approval,
+                &mut live,
+                &mut log,
+                &mut tailer,
+                &mut auto,
+                &mut otel,
+                state_dir,
+            );
+            (notes, app, live, log)
+        }
+
+        // Timers are the whole point of editing them mid-session.
+        #[test]
+        fn saved_timers_take_effect_without_a_restart() {
+            let tmp = tempfile::tempdir().unwrap();
+            let (notes, ..) = reload_with(
+                "[approval]\nenabled = true\nself_timeout_ms = 90000\nwatch_poll_ms = 500\n",
+                tmp.path(),
+            );
+            let line = notes.iter().find(|n| n.starts_with("timers now")).unwrap();
+            assert!(line.contains("90000ms"), "{line}");
+            assert!(line.contains("500ms"), "{line}");
+        }
+
+        // The queue is the one thing that must NOT move: agents are blocked on requests
+        // addressed in the current directory, and switching would orphan every one of them.
+        #[test]
+        fn moving_the_state_dir_is_refused_and_said_out_loud() {
+            let tmp = tempfile::tempdir().unwrap();
+            let elsewhere = tmp.path().join("elsewhere");
+            let (notes, ..) = reload_with(
+                &format!(
+                    "[approval]\nenabled = true\nstate_dir = {}\n",
+                    toml::Value::String(elsewhere.display().to_string())
+                ),
+                tmp.path(),
+            );
+            let line = notes
+                .iter()
+                .find(|n| n.starts_with("state_dir"))
+                .expect("an unappliable change must be reported, never silently dropped");
+            assert!(line.contains("needs a restart"), "{line}");
+            assert!(
+                line.contains(&tmp.path().display().to_string()),
+                "it must name the queue it is still serving: {line}"
+            );
+        }
+
+        #[test]
+        fn a_new_live_rules_file_is_adopted() {
+            let tmp = tempfile::tempdir().unwrap();
+            let (notes, _, live, _) = reload_with(
+                "[approval]\nenabled = true\nlive_rules = \"88-mine.toml\"\n",
+                tmp.path(),
+            );
+            assert!(live.ends_with("88-mine.toml"), "{}", live.display());
+            assert!(notes.iter().any(|n| n.starts_with("live rules")));
+        }
+
+        // Turning the model off must actually stop it, not just stop saying it is on.
+        #[test]
+        fn disabling_the_model_tears_the_approver_down() {
+            let tmp = tempfile::tempdir().unwrap();
+            let cfg = Config::from(
+                toml::from_str::<crate::config::RawConfig>("[approval]\nenabled = true\n").unwrap(),
+            );
+            let mut app = App::new();
+            let mut auto = Some(approver(0, 4));
+            let (mut approval, mut live, mut log) = (
+                ApprovalConfig::default(),
+                PathBuf::from("l.toml"),
+                PathBuf::from("l.jsonl"),
+            );
+            let mut tailer = Tailer::new(log.clone());
+            let mut otel = None;
+            let notes = reload(
+                &mut app,
+                cfg,
+                &mut approval,
+                &mut live,
+                &mut log,
+                &mut tailer,
+                &mut auto,
+                &mut otel,
+                tmp.path(),
+            );
+            assert!(
+                auto.is_none(),
+                "the approver must be gone, not merely quiet"
+            );
+            assert!(notes.iter().any(|n| n == "auto-approval off"));
         }
 
         // ---- A3: project scoping (docs/A-persistable-approvals.md) -----------------------

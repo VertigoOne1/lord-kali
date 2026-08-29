@@ -431,6 +431,19 @@ It also correlates each `pre_tool_use` with its `post_tool_use`:
 
 `allow` calls always run, so their `post_tool_use` is not restated. Color is disabled automatically when stdout is not a terminal or when `NO_COLOR` is set.
 
+### Editing settings
+
+Press `m` in `lord-kali watch` for the settings editor: every behaviour value as a row with where it comes from and what it defaults to. Bool and choice fields cycle in place, `d` resets a field to its default, `s` saves, `Esc` closes. It shows the live budget arithmetic, warns about any section still declared in two places, and prints every resolved path — which is most of the answer to "where is my config".
+
+Saving **reloads the running watch in place**: timers, the safety model (including a newly-named `api_key_env`), the OTel exporter, the live-rules file and the log path all take effect immediately. One thing deliberately does not — `state_dir`, because agents are blocked on requests addressed in the current queue directory and moving it would orphan every one of them. That is reported rather than silently ignored:
+
+```
+cfg  state_dir → D:\lk needs a restart; the queue this watch is serving is still C:\Users\me\.local\state\lord-kali
+cfg  timers now: self-timeout 90000ms · poll 500ms · heartbeat 3000ms
+```
+
+The API key row shows the *name* of the environment variable and whether it is currently set. The value is never read, rendered or stored.
+
 ### Pruning the live ruleset
 
 The live file grows with every apply-always and nothing ever removes from it. `lord-kali prune-rules` says which of its rules can still fire:

@@ -8,14 +8,18 @@ the open questions that remain.
 |---|---|---|---|
 | [B](B-ai-first-gating.md) | AI-first gating | **done** | model first (`queue_wait_ms = 0`), verdict cache, concurrency cap, live model status in the approval zone, `operator_commit` records, `eval --from-log` |
 | [D](D-hook-coverage.md) | Hook coverage | **done** | ten events dispatched, `PermissionRequest` gating with `tool_use_id` dedupe, `PostToolUseFailure` + `PermissionDenied` captured, event tags in the TUI |
-| [C](C-config-in-tui.md) | Config in the TUI | **done** | `settings.toml` authoritative (replace, not merge), conflict reporting, `m` settings editor, resolved-paths footer |
+| [C](C-config-in-tui.md) | Config in the TUI | **done** | `settings.toml` authoritative (replace, not merge), conflict reporting, `m` settings editor, resolved-paths footer, hot reload on save |
 | [E](E-otel.md) | OpenTelemetry | **done** | OTLP/HTTP+JSON exporter riding the watch, checkpoint replay, metrics and logs for every event |
-| [A](A-persistable-approvals.md) | Persistable approvals | **mostly** | A2 (flag-scoped rung), A3 (`p` project scoping), A4 (glob escaping), A5 (shadow detection), A6 (`prune-rules`) done. A7 open — see below |
+| [A](A-persistable-approvals.md) | Persistable approvals | **done** | A2 (flag-scoped rung), A3 (`p` project scoping), A4 (glob escaping), A5 (shadow detection), A6 (`prune-rules`), A7 (provenance) |
 
 ## Still open
 
-- **A7 — provenance on persisted rules** (`operator` vs `llm <model>`). `reason` is a uniform `"approval-tui"` today, so `prune-rules` cannot yet distinguish a rule you approved from one the model auto-applied.
-- **C4 — hot reload.** Deliberately not built. The save note says the running watch keeps its current timers and model until restarted, rather than implying otherwise.
+Nothing from the original five docs. Remaining ideas, none of them started:
+
+- **Auto-run `prune-rules` inside `watch`** (doc A open question 3) — deliberately not built; removing rules you approved deserves to stay a decision you make.
+- **Multiline prompt editing** for `[approval.llm] system`/`user` in the settings screen (doc C open question 4).
+- **Traces** (doc E §7) — metrics and logs only today.
+
 Resolved: the `sed -i` policy. A scoped `-i **` allow for `~/lord-kali` and `~/coflo` now sits above the catch-all in `00-base.toml`, so in-place edits run silently in those trees and still confirm everywhere else. `sed w`/`W`/`e` stays guarded throughout.
 
 ## Original order (for reference)
