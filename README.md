@@ -456,7 +456,7 @@ enabled = true
 # watch_poll_ms      = 200   # watch/TUI loop poll interval
 ```
 
-The timers are optional; unset keys fall back to the defaults shown. `self_timeout_ms` is the **max the blocked gate waits on the TUI before it hands the call off** to Claude Code's own prompt — keep it under Claude Code's 60 s hook timeout so lord-kali's own fallback fires first. (The LLM auto-approver's `queue_wait_ms`/`proposal_wait_ms` live under [`[approval.llm]`](#llm-auto-approval) and are consumed within this same window.)
+The timers are optional; unset keys fall back to the defaults shown. `self_timeout_ms` is the **max the blocked gate waits on the TUI before it hands the call off** to Claude Code's own prompt — keep it under the `timeout` you set on the hook registration (Claude Code's default is 600 s) so lord-kali's own fallback fires first. (The LLM auto-approver's `queue_wait_ms`/`proposal_wait_ms` live under [`[approval.llm]`](#llm-auto-approval) and are consumed within this same window.)
 
 ```sh
 lord-kali watch   # opens the TUI; keep it running while you work

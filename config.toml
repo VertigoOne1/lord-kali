@@ -23,7 +23,7 @@ path = "~/.local/state/lord-kali/hook.jsonl"
 # guardrail_commands = ["terraform", "kubectl"]
 # Timers (milliseconds; omit any to keep the built-in default shown). self_timeout_ms is the
 # max the blocked gate waits on the TUI before handing off to Claude Code's own prompt — keep
-# it under Claude Code's 60s hook timeout. heartbeat_fresh_ms is how stale the TUI heartbeat
+# it under the `timeout` you set on the hook registration (Claude Code's default is 600s). heartbeat_fresh_ms is how stale the TUI heartbeat
 # may get before the gate treats it as dead and degrades to pass-through. pending_timeout_ms
 # is how long `watch --tail` tracks an un-executed call before flagging it. poll_ms /
 # watch_poll_ms are the gate and watch/TUI loop poll intervals.
