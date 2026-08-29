@@ -38,6 +38,10 @@ pub(crate) const LLM_TOKENS: &str = "lordkali.llm.tokens";
 pub(crate) const LLM_AGREEMENT: &str = "lordkali.llm.agreement";
 pub(crate) const RULES_PERSISTED: &str = "lordkali.rules.persisted";
 pub(crate) const RULES_ACTIVE: &str = "lordkali.rules.active";
+// Claude Code's own denials of calls lord-kali passed through — including auto mode's
+// classifier, which is otherwise invisible to the gate.
+pub(crate) const CLAUDE_DENIED: &str = "lordkali.claude.denied";
+pub(crate) const TOOL_FAILURES: &str = "lordkali.tool.failures";
 
 pub(crate) const DEFAULT_ENDPOINT: &str = "http://localhost:4318";
 pub(crate) const DEFAULT_PROTOCOL: &str = "http/json";
@@ -625,6 +629,11 @@ impl OtelPipeline {
             "llm_consult" => self.map_llm_consult(record),
             "llm_result" => self.map_llm_result(record),
             "llm_auto_approve" => self.map_llm_auto_approve(record),
+            "llm_cache_hit" => self.map_llm_cache_hit(record),
+            "operator_commit" => self.map_operator_commit(record),
+            "permission_request" => self.map_pre_tool_use(record),
+            "permission_denied" => self.map_permission_denied(record),
+            "post_tool_use_failure" => self.map_post_tool_use_failure(record),
             _ => return false,
         };
         let ts_ms = record.get("ts_ms").and_then(Value::as_u64).unwrap_or(0);
@@ -940,6 +949,189 @@ impl OtelPipeline {
 
         let body = field(llm, "reason").unwrap_or("auto-approved").to_string();
         (Severity::Info, body, attrs)
+    }
+
+    // A verdict reused from cache resolved a call without a call. Counted under the same
+    // instrument with `cached="true"`, so consult volume stays comparable to spend.
+    fn map_llm_cache_hit(&mut self, r: &Value) -> (Severity, String, Attributes) {
+        let model = r.get("model").and_then(Value::as_str).unwrap_or("");
+        let verdict = r.get("verdict").and_then(Value::as_str).unwrap_or("");
+        self.count(
+            LLM_CONSULTS,
+            &[("model", model), ("verdict", verdict), ("cached", "true")],
+            1,
+        );
+        let mut attrs: Attributes = Vec::new();
+        push_str_attr(
+            &mut attrs,
+            "lordkali.llm.id",
+            r.get("id").and_then(Value::as_str),
+        );
+        push_str_attr(&mut attrs, "lordkali.llm.model", Some(model));
+        push_str_attr(&mut attrs, "lordkali.llm.verdict", Some(verdict));
+        attrs.push(("lordkali.llm.cached".to_string(), AttrValue::Bool(true)));
+        self.push_command(
+            &mut attrs,
+            "lordkali.command",
+            r.get("target").and_then(Value::as_str),
+        );
+        (
+            Severity::Info,
+            "verdict reused from cache".to_string(),
+            attrs,
+        )
+    }
+
+    // What the operator decided, and — when the model had already answered — whether they
+    // agreed with it. This is the only record carrying both, so it is the only source for
+    // the operator half of the agreement table (docs/B-ai-first-gating.md §B6).
+    fn map_operator_commit(&mut self, r: &Value) -> (Severity, String, Attributes) {
+        let mode = r.get("mode").and_then(Value::as_str).unwrap_or("once");
+        let lanes = r.get("lanes").and_then(Value::as_array);
+        let dominant = dominant_lane(lanes);
+        let outcome = format!("operator_{mode}");
+        self.count(
+            APPROVAL_RESOLUTIONS,
+            &[("outcome", &outcome), ("lane", dominant)],
+            1,
+        );
+
+        // A verdict is attributed only when the model had reached one; acting before it
+        // answered is not a disagreement and must not be scored as one.
+        if let Some(verdict) = r.pointer("/lk_llm/verdict").and_then(Value::as_str) {
+            let operator_outcome = match dominant {
+                "allow" => "allowed",
+                "deny" => "denied",
+                _ => "asked",
+            };
+            self.count(
+                LLM_AGREEMENT,
+                &[("verdict", verdict), ("operator_outcome", operator_outcome)],
+                1,
+            );
+        }
+
+        // Only an *-always commit persists rules, and only for the lanes that took a side.
+        if mode == "always" {
+            for lane in lanes.into_iter().flatten() {
+                let l = lane.get("lane").and_then(Value::as_str).unwrap_or("");
+                if l != "allow" && l != "deny" {
+                    continue;
+                }
+                let shell = lane.get("shell").and_then(Value::as_str).unwrap_or("");
+                let rung = lane
+                    .get("scope_rung")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+                    .to_string();
+                self.count(
+                    RULES_PERSISTED,
+                    &[("source", "operator"), ("shell", shell), ("rung", &rung)],
+                    1,
+                );
+            }
+        }
+
+        let mut attrs: Attributes = Vec::new();
+        push_str_attr(&mut attrs, "lordkali.approval.mode", Some(mode));
+        push_str_attr(&mut attrs, "lordkali.approval.lane", Some(dominant));
+        push_str_attr(
+            &mut attrs,
+            "lordkali.llm.verdict",
+            r.pointer("/lk_llm/verdict").and_then(Value::as_str),
+        );
+        push_str_attr(
+            &mut attrs,
+            "lordkali.tool",
+            r.get("tool_name").and_then(Value::as_str),
+        );
+        push_str_attr(
+            &mut attrs,
+            "lordkali.cwd",
+            r.get("cwd").and_then(Value::as_str),
+        );
+        self.push_command(
+            &mut attrs,
+            "lordkali.command",
+            r.get("target").and_then(Value::as_str),
+        );
+        (
+            Severity::Info,
+            format!("operator {mode}: {dominant}"),
+            attrs,
+        )
+    }
+
+    // Claude Code denied a call lord-kali had passed through — including auto mode's
+    // classifier. Nothing else records that this happened.
+    fn map_permission_denied(&mut self, r: &Value) -> (Severity, String, Attributes) {
+        let by = r.get("denied_by").and_then(Value::as_str).unwrap_or("");
+        self.count(CLAUDE_DENIED, &[("denied_by", by)], 1);
+
+        let mut attrs: Attributes = Vec::new();
+        push_str_attr(&mut attrs, "lordkali.denied_by", Some(by));
+        push_str_attr(
+            &mut attrs,
+            "lordkali.classifier_verdict",
+            r.get("classifier_verdict").and_then(Value::as_str),
+        );
+        push_str_attr(
+            &mut attrs,
+            "lordkali.tool",
+            r.get("tool_name").and_then(Value::as_str),
+        );
+        self.push_command(
+            &mut attrs,
+            "lordkali.command",
+            r.pointer("/tool_input/command").and_then(Value::as_str),
+        );
+        let body = r
+            .get("classifier_verdict")
+            .and_then(Value::as_str)
+            .unwrap_or("denied by Claude Code")
+            .to_string();
+        (Severity::Warn, body, attrs)
+    }
+
+    // A failed call fires this, not post_tool_use. Without it, "ran" and "did not run" are
+    // indistinguishable in the record.
+    fn map_post_tool_use_failure(&mut self, r: &Value) -> (Severity, String, Attributes) {
+        let tool = r.get("tool_name").and_then(Value::as_str).unwrap_or("");
+        self.count(TOOL_FAILURES, &[("tool", tool)], 1);
+
+        let mut attrs: Attributes = Vec::new();
+        push_str_attr(&mut attrs, "lordkali.tool", Some(tool));
+        self.push_command(
+            &mut attrs,
+            "lordkali.command",
+            r.pointer("/tool_input/command").and_then(Value::as_str),
+        );
+        let body = r
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("tool call failed")
+            .to_string();
+        (Severity::Error, body, attrs)
+    }
+}
+
+// The most restrictive lane the operator assigned, which is what the call as a whole did:
+// any deny denies it, else any ask defers it, else it ran.
+fn dominant_lane(lanes: Option<&Vec<Value>>) -> &'static str {
+    let Some(lanes) = lanes else {
+        return "allow";
+    };
+    let has = |want: &str| {
+        lanes
+            .iter()
+            .any(|l| l.get("lane").and_then(Value::as_str) == Some(want))
+    };
+    if has("deny") {
+        "deny"
+    } else if has("ask") {
+        "ask"
+    } else {
+        "allow"
     }
 }
 
@@ -1493,6 +1685,192 @@ mod tests {
         assert!(p.ingest(&record));
         assert!(p.metrics().is_empty());
         assert_eq!(p.pending_logs()[0].severity, Severity::Info);
+    }
+
+    // ---- events from workstreams B and D ------------------------------------------------
+
+    fn commit(mode: &str, lanes: Value, llm: Value) -> Value {
+        serde_json::json!({
+            "lk_event": "operator_commit", "ts_ms": TS,
+            "tool_name": "Bash", "target": "gh pr list", "cwd": "/p",
+            "mode": mode, "lanes": lanes, "lk_llm": llm,
+        })
+    }
+
+    fn lane(l: &str, shell: &str, rung: u64) -> Value {
+        serde_json::json!({ "lane": l, "shell": shell, "scope_rung": rung, "node": "gh" })
+    }
+
+    // The expensive cell: the model said safe and the operator overrode it.
+    #[test]
+    fn an_operator_override_of_a_safe_verdict_is_scored_as_disagreement() {
+        let mut p = pipeline(OtelConfig::default());
+        assert!(p.ingest(&commit(
+            "once",
+            serde_json::json!([lane("allow", "bash", 1), lane("deny", "bash", 0)]),
+            serde_json::json!({ "model": "m", "verdict": "safe" }),
+        )));
+        assert_eq!(
+            p.metrics().counter(
+                LLM_AGREEMENT,
+                &[("verdict", "safe"), ("operator_outcome", "denied")]
+            ),
+            1
+        );
+        assert_eq!(
+            p.metrics().counter(
+                APPROVAL_RESOLUTIONS,
+                &[("outcome", "operator_once"), ("lane", "deny")]
+            ),
+            1
+        );
+    }
+
+    // Acting before the model answered is not a disagreement and must not be scored.
+    #[test]
+    fn a_commit_with_no_model_verdict_scores_no_agreement() {
+        let mut p = pipeline(OtelConfig::default());
+        assert!(p.ingest(&commit(
+            "always",
+            serde_json::json!([lane("allow", "bash", 1)]),
+            Value::Null,
+        )));
+        assert_eq!(
+            p.metrics().counter(
+                LLM_AGREEMENT,
+                &[("verdict", "safe"), ("operator_outcome", "allowed")]
+            ),
+            0
+        );
+        assert_eq!(
+            p.metrics().counter(
+                APPROVAL_RESOLUTIONS,
+                &[("outcome", "operator_always"), ("lane", "allow")]
+            ),
+            1
+        );
+    }
+
+    // Only an *-always commit persists rules, and only for lanes that took a side.
+    #[test]
+    fn rules_are_counted_only_for_always_commits_and_decided_lanes() {
+        let mut p = pipeline(OtelConfig::default());
+        p.ingest(&commit(
+            "always",
+            serde_json::json!([lane("allow", "bash", 1), lane("ask", "bash", 0)]),
+            Value::Null,
+        ));
+        assert_eq!(
+            p.metrics().counter(
+                RULES_PERSISTED,
+                &[("source", "operator"), ("shell", "bash"), ("rung", "1")]
+            ),
+            1
+        );
+        assert_eq!(
+            p.metrics().counter(
+                RULES_PERSISTED,
+                &[("source", "operator"), ("shell", "bash"), ("rung", "0")]
+            ),
+            0,
+            "an ASK lane persists nothing"
+        );
+
+        p.ingest(&commit(
+            "once",
+            serde_json::json!([lane("allow", "bash", 1)]),
+            Value::Null,
+        ));
+        assert_eq!(
+            p.metrics().counter(
+                RULES_PERSISTED,
+                &[("source", "operator"), ("shell", "bash"), ("rung", "1")]
+            ),
+            1,
+            "an apply-once must not count as a persisted rule"
+        );
+    }
+
+    #[test]
+    fn a_skip_is_recorded_as_its_own_outcome() {
+        let mut p = pipeline(OtelConfig::default());
+        p.ingest(&commit(
+            "skip",
+            serde_json::json!([lane("allow", "bash", 1)]),
+            Value::Null,
+        ));
+        assert_eq!(
+            p.metrics().counter(
+                APPROVAL_RESOLUTIONS,
+                &[("outcome", "operator_skip"), ("lane", "allow")]
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn a_cached_verdict_counts_as_a_consult_marked_cached() {
+        let mut p = pipeline(OtelConfig::default());
+        assert!(p.ingest(&serde_json::json!({
+            "lk_event": "llm_cache_hit", "ts_ms": TS,
+            "model": "m", "verdict": "safe", "target": "ls",
+        })));
+        assert_eq!(
+            p.metrics().counter(
+                LLM_CONSULTS,
+                &[("model", "m"), ("verdict", "safe"), ("cached", "true")]
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn a_claude_code_denial_is_counted_and_logged_as_a_warning() {
+        let mut p = pipeline(OtelConfig::default());
+        assert!(p.ingest(&serde_json::json!({
+            "lk_event": "permission_denied", "ts_ms": TS,
+            "tool_name": "Bash", "tool_input": { "command": "rm -rf /" },
+            "denied_by": "classifier", "classifier_verdict": "destructive",
+        })));
+        assert_eq!(
+            p.metrics()
+                .counter(CLAUDE_DENIED, &[("denied_by", "classifier")]),
+            1
+        );
+        let rec = &p.pending_logs()[0];
+        assert_eq!(rec.severity, Severity::Warn);
+        assert_eq!(rec.body, "destructive");
+    }
+
+    #[test]
+    fn a_tool_failure_is_counted_and_logged_as_an_error() {
+        let mut p = pipeline(OtelConfig::default());
+        assert!(p.ingest(&serde_json::json!({
+            "lk_event": "post_tool_use_failure", "ts_ms": TS,
+            "tool_name": "Bash", "tool_input": { "command": "ls /nope" },
+            "error": "No such file",
+        })));
+        assert_eq!(p.metrics().counter(TOOL_FAILURES, &[("tool", "Bash")]), 1);
+        assert_eq!(p.pending_logs()[0].severity, Severity::Error);
+    }
+
+    // PermissionRequest is a gate decision with the same shape as PreToolUse, so it feeds
+    // the same instruments rather than a parallel set.
+    #[test]
+    fn a_permission_request_decision_feeds_the_gate_instruments() {
+        let mut p = pipeline(OtelConfig::default());
+        let mut r = pre_tool_use_record();
+        r["lk_event"] = serde_json::json!("permission_request");
+        assert!(p.ingest(&r));
+        assert!(!p.metrics().is_empty());
+        assert_eq!(
+            p.pending_logs()[0]
+                .attributes
+                .iter()
+                .find(|(k, _)| k == "lordkali.event")
+                .map(|(_, v)| v.clone()),
+            Some(AttrValue::Str("permission_request".into()))
+        );
     }
 
     #[test]
