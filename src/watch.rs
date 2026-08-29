@@ -309,6 +309,7 @@ mod tui {
     };
     use crate::log::now_ms;
     use crate::log::{log_event, prune_log_file, resolve_log_path, DEFAULT_RETAIN_DAYS};
+    use crate::otel::OtelPipeline;
     use crate::queue::{
         self, write_atomic, write_heartbeat_in, Action, QueueRequest, Verdict, VerdictNode,
     };
@@ -1262,6 +1263,73 @@ mod tui {
         }
     }
 
+    // ---- OTLP export (docs/E-otel.md) ----------------------------------------------------
+    //
+    // The gate never exports: it is one short-lived process per tool call, with no batching,
+    // no retry and no connection to reuse, so an export there would put a dead collector on
+    // the path of every command. It writes the JSONL record — already the source of truth —
+    // and this long-lived watch tails it.
+    //
+    // A collector that was down therefore loses nothing: the checkpoint records the last
+    // exported ts_ms, and the next open replays from there.
+
+    fn build_otel(cfg: &crate::otel::OtelConfig, app: &mut App) -> Option<OtelPipeline> {
+        if !cfg.enabled {
+            return None;
+        }
+        match OtelPipeline::new(cfg.clone(), now_ms()) {
+            Ok(p) => {
+                app.stream.push(stream_note(&format!(
+                    "otel on: {} every {}s",
+                    cfg.endpoint,
+                    cfg.export_interval_ms / 1000
+                )));
+                Some(p)
+            }
+            // A misconfigured exporter must not stop the gate from running.
+            Err(e) => {
+                app.stream.push(stream_note(&format!("otel disabled: {e}")));
+                None
+            }
+        }
+    }
+
+    // Replay whatever was written since the last successful export. Bounded by the log's own
+    // retention, so this is at most a few days of records, and it runs before the tail starts
+    // so a record is never both replayed and tailed.
+    fn backfill_otel(pipeline: &mut OtelPipeline, log_path: &Path, app: &mut App) {
+        let checkpoint = crate::otel::checkpoint_path(pipeline.config());
+        let since = match crate::otel::read_checkpoint(&checkpoint) {
+            Ok(Some(ts)) => ts,
+            Ok(None) => return,
+            Err(e) => {
+                app.stream
+                    .push(stream_note(&format!("otel checkpoint unreadable: {e}")));
+                return;
+            }
+        };
+        let Ok(content) = std::fs::read_to_string(log_path) else {
+            return;
+        };
+        let mut replayed = 0usize;
+        for line in content.lines() {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            if v.get("ts_ms").and_then(serde_json::Value::as_u64) <= Some(since) {
+                continue;
+            }
+            if pipeline.ingest(&v) {
+                replayed += 1;
+            }
+        }
+        if replayed > 0 {
+            app.stream.push(stream_note(&format!(
+                "otel: replayed {replayed} record(s) written since the last export"
+            )));
+        }
+    }
+
     // Build the auto-approver if configured + enabled + the key is present. On enabled-but-no-key
     // it pushes a one-line warning to the stream and returns None (degrade, never fail).
     fn build_auto(approval: &ApprovalConfig, app: &mut App) -> Option<AutoApprover> {
@@ -1325,8 +1393,13 @@ mod tui {
         let _ = prune_log_file(&log_path, DEFAULT_RETAIN_DAYS, now_ms());
         let mut tailer = Tailer::new(log_path.clone());
 
-        let mut terminal = ratatui::init();
         let mut app = App::new();
+        let mut otel = build_otel(&cfg.otel, &mut app);
+        if let Some(p) = otel.as_mut() {
+            backfill_otel(p, &log_path, &mut app);
+        }
+
+        let mut terminal = ratatui::init();
         let mut auto = build_auto(&cfg.approval, &mut app);
         let result = run_loop(
             &mut terminal,
@@ -1338,6 +1411,7 @@ mod tui {
             &cfg.approval,
             &log_path,
             &mut auto,
+            &mut otel,
         );
         ratatui::restore();
         clear_attention();
@@ -1355,12 +1429,14 @@ mod tui {
         approval: &ApprovalConfig,
         log_path: &Path,
         auto: &mut Option<AutoApprover>,
+        otel: &mut Option<OtelPipeline>,
     ) -> std::io::Result<()> {
         // usize::MAX forces the first iteration to set the title/taskbar without ringing
         // the bell for approvals that were already waiting when the TUI opened.
         let mut prev_pending = usize::MAX;
         // Already pruned once on open; schedule the next housekeeping pass an hour out.
         let mut next_prune_ms = now_ms() + PRUNE_INTERVAL_MS;
+        let mut next_export_ms = now_ms();
         // The view revision last handed to the terminal; None until the first frame. Redraw
         // only when the structured view moved or a scrolling buffer gained a line — an idle
         // watcher then sends the terminal nothing, which is what keeps its memory flat.
@@ -1382,9 +1458,29 @@ mod tui {
 
             let mut dirty = false;
             for line in tailer.read_new() {
+                if let Some(p) = otel.as_mut() {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                        p.ingest(&v);
+                    }
+                }
                 if let Some(l) = stream_line(&line) {
                     push_capped(&mut app.stream, l, STREAM_CAP);
                     dirty = true;
+                }
+            }
+            if let Some(p) = otel.as_mut() {
+                if now >= next_export_ms {
+                    // Reported, never swallowed: a collector that has gone away is the
+                    // operator's problem to see, and the JSONL still holds every record.
+                    if let Err(e) = p.export(now) {
+                        push_capped(
+                            &mut app.stream,
+                            stream_note(&format!("otel export failed: {e}")),
+                            STREAM_CAP,
+                        );
+                        dirty = true;
+                    }
+                    next_export_ms = now + p.config().export_interval_ms.max(1_000);
                 }
             }
 
