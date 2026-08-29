@@ -471,7 +471,8 @@ The TUI has three regions: a scrolling decision **stream** on top, the **approva
 | `←` / `→` | step the focused node one lane toward ALLOW / DENY (ASK is the middle) |
 | `space` | cycle the focused node ALLOW → ASK → DENY |
 | `↑` / `↓` | move between nodes |
-| `t` | cycle the focused node's persisted scope through its ladder (tightest → broadest). Commands: **tight** (full args) ⇄ **subcommand**. File mutations: **full path** → **containing dir** → **cwd subtree** → **`**/*.ext`**. WebFetch/WebSearch/MCP/reads have a single fixed rung (no-op) |
+| `t` | cycle the focused node's persisted scope through its ladder (tightest → broadest). Commands: **tight** (full args) → **flag-scoped** (flags kept, operands wildcarded) → **subcommand** → **command-wide**. File mutations: **full path** → **containing dir** → **cwd subtree** → **`**/*.ext`**. WebFetch/WebSearch/MCP/reads have a single fixed rung (no-op) |
+| `p` | confine the focused node's persisted rule to **this project** (the repository root the call came from). This is what makes a broad rung safe to pick: broad in what it matches, narrow in where it applies |
 | `⇥` (Tab) | switch between pending calls |
 | `a` | **apply-always** — resolve the call by lane and persist a rule for each allowed/denied node |
 | `o` | **apply-once** — same, but for this call only (nothing persisted) |
@@ -481,6 +482,18 @@ The TUI has three regions: a scrolling decision **stream** on top, the **approva
 One commit resolves the whole call from the lanes: any node in **DENY** denies the call; a node in **ASK** defers the call to Claude Code's own prompt (a passthrough); only if every node is in **ALLOW** does the call run outright. So you can allow the parts you trust, deny the dangerous ones, and hand the uncertain ones back to the agent — in a single keystroke. `s` is the quick "I'm not deciding this here" for an entire call.
 
 **apply-always** appends an ordinary rule to `~/.config/lord-kali/99-live.toml` for each node (sorted last, so it never shadows your explicit rules). By default a command's scope is **subcommand** (the node's first argument): allowing `git push` writes `command = "git", args = "push{, **}"`, so it does **not** also bless `git commit`. WebFetch nodes persist the exact URL and WebSearch nodes the exact query; MCP nodes persist the exact tool name (no args, no `t` toggle). **File** mutation nodes persist a `[[file.rules]]` `path` rule at the selected ladder rung (`t` cycles full path → containing dir → cwd subtree → `**/*.ext`), defaulting to the tightest (full path); reads persist a single full-path allow. Future matching calls then resolve instantly without reaching the queue — the gap closes as you go.
+
+**Flag-first commands.** The subcommand heuristic takes the node's first argument, which for a command like `sed -i '<script>' <file>` is the flag `-i` — it says nothing about what the command does. Tight scope is no better there: it pins the entire sed script, so the rule can never match a second time. That is why a burst of one-shot `sed` rules can pile up in the live file without ever making the prompt go away. The **flag-scoped** rung keeps the leading run of flags and wildcards the operands — `-i **` — and is the default when the first token is a flag. Pair it with `p` to confine it to one repository.
+
+**Persisted rules are escaped.** Argument text is literal text going into a *glob*, and real commands contain `*`, `[`, `{`. A sed script like `/^[[:space:]]*x/d` would otherwise persist as a live character class, and `{staging,qa}` as brace alternation — matching considerably more than the command it came from.
+
+**If a rule cannot take effect, the TUI says so.** Precedence is deliberately firewall-like: an earlier `ask`/`deny` outranks a later `allow` regardless of which file it sits in, and the live ruleset loads last. So an apply-always can write a perfectly well-formed rule that can never match. After writing, the call is re-resolved against the freshly merged config, and if the answer is not what you just committed the stream says which file and rule outranks it:
+
+```
+SHADOWED: rule saved but still resolves to ask — 00-base.toml decides first (sed -i **). Edit that file to change it.
+```
+
+The remedy is a config edit rather than an override — that *is* the precedence model — so the message names the file to go and change.
 
 **Guardrail commands and tight scope.** Subcommand scope is wrong for destructive, path-operating commands: a one-off `rm -rf ./test-results` would otherwise persist as a blanket `rm -rf` allow (the first argument is the flag `-rf`, not a subcommand). So a built-in set of destructive commands — `rm`, `rmdir`, `dd`, `mkfs`, `shred`, `truncate`, `del`, `rd`, `Remove-Item`, `Clear-Content` (extend it via `guardrail_commands`) — defaults to **tight** scope instead: the full args are pinned, so `rm -rf ./test-results` persists `args = "-rf ./test-results{, **}"` and can never match `rm -rf /`. Press **`t`** to toggle any node between tight and subcommand scope; the header shows the exact rule that will be written before you commit.
 

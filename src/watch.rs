@@ -301,7 +301,8 @@ fn watch_tail(explicit_path: Option<&str>) {
 // pane below where the operator rules on the actionable command nodes of each blocked call.
 mod tui {
     use super::{event_target, unmatched_nodes, Tailer, PRUNE_INTERVAL_MS};
-    use crate::config::{load_config, ApprovalConfig, ApprovalLlmConfig};
+    use crate::config::{load_config, ApprovalConfig, ApprovalLlmConfig, Config};
+    use crate::decision::Decision;
     use crate::live_rules::{append_rules, live_rules_path, LiveRule};
     use crate::llm::{
         judge, parse_judgement, LlmConfig, PromptTemplate, PromptVars, Verdict as LlmVerdict,
@@ -374,6 +375,9 @@ mod tui {
         // Per node: which rung of its scope ladder an *-always rule persists at. `t` cycles
         // it; the default comes from scope::ladder (tight for guardrail commands and files).
         scope_idx: Vec<usize>,
+        // Per node: whether an *-always rule is confined to this call's project. Paired with
+        // the scope ladder — a broad args pattern is fine when its blast radius is one repo.
+        project_scoped: Vec<bool>,
         cursor: usize,
     }
 
@@ -395,10 +399,12 @@ mod tui {
                     .1
                 })
                 .collect();
+            let project_scoped = vec![false; request.nodes.len()];
             Pending {
                 request,
                 choices,
                 scope_idx,
+                project_scoped,
                 cursor: 0,
             }
         }
@@ -416,6 +422,21 @@ mod tui {
                 false,
             )
             .0
+        }
+
+        // The directory an *-always rule is confined to when `p` is on: the repository root
+        // the call came from, else its cwd. A git worktree has a `.git` *file* rather than a
+        // directory, and resolving to the worktree is right — that is the checkout the
+        // operator was looking at.
+        fn project_root(&self) -> Option<String> {
+            let cwd = self.request.cwd.as_deref()?;
+            let mut dir = Path::new(cwd);
+            loop {
+                if dir.join(".git").exists() {
+                    return Some(dir.display().to_string());
+                }
+                dir = dir.parent()?;
+            }
         }
 
         // The rung an *-always rule will persist for node `i`, honoring its `t` selection.
@@ -447,6 +468,7 @@ mod tui {
         PrevReq,
         NextReq,
         ToggleScope,
+        ToggleProject,
         Commit(CommitMode),
         SkipCall,
         Settings,
@@ -464,6 +486,7 @@ mod tui {
             KeyCode::Tab => Key::NextReq,
             KeyCode::BackTab => Key::PrevReq,
             KeyCode::Char('t') => Key::ToggleScope,
+            KeyCode::Char('p') => Key::ToggleProject,
             KeyCode::Char('a') => Key::Commit(CommitMode::Always),
             KeyCode::Char('o') => Key::Commit(CommitMode::Once),
             KeyCode::Char('s') => Key::SkipCall,
@@ -541,6 +564,10 @@ mod tui {
                     target: rung.target,
                     args: rung.args,
                     allow: choice == Choice::Allow,
+                    projects: match p.project_scoped[i] {
+                        true => p.project_root().into_iter().collect(),
+                        false => Vec::new(),
+                    },
                 });
             }
             nodes.push(VerdictNode {
@@ -637,6 +664,18 @@ mod tui {
                     if len > 1 {
                         if let Some(idx) = p.scope_idx.get_mut(cursor) {
                             *idx = (*idx + 1) % len;
+                        }
+                    }
+                }
+                None
+            }
+            Key::ToggleProject => {
+                if let Some(p) = app.focused_mut() {
+                    let cursor = p.cursor;
+                    // Only meaningful when the call has a project to be confined to.
+                    if p.project_root().is_some() {
+                        if let Some(v) = p.project_scoped.get_mut(cursor) {
+                            *v = !*v;
                         }
                     }
                 }
@@ -1150,6 +1189,93 @@ mod tui {
         }
     }
 
+    // ---- A5: did the rule we just wrote actually take effect? --------------------------
+    //
+    // Rule precedence is deliberately firewall-like: an earlier `ask`/`deny` outranks a later
+    // `allow` regardless of which file it sits in, and the live ruleset loads last. So the TUI
+    // can persist a perfectly well-formed rule that can never match, and reporting success
+    // there is silent failure. After writing, the call is re-resolved against the freshly
+    // merged config; if the answer is not what was just committed, say which rule outranks it.
+    //
+    // The remedy is a config edit, not an override — that is the point of the precedence
+    // model — so the message names the file and rule to go and change.
+    fn shadow_warning(
+        config: &Config,
+        request: &QueueRequest,
+        committed: Decision,
+    ) -> Option<String> {
+        let trace = crate::decision::dispatch(
+            config,
+            &request_as_hook_input(request),
+            request.cwd.as_deref(),
+        );
+        match &trace.final_decision {
+            // It resolves the way the operator asked; the rule is live.
+            Some((d, _)) if *d == committed => None,
+            other => {
+                let deciding = crate::decision::deciding_index(&trace.nodes)
+                    .map(|i| trace.nodes[i].to_json())
+                    .unwrap_or(serde_json::Value::Null);
+                let file = deciding["source_file"]
+                    .as_str()
+                    .and_then(|p| p.rsplit(['/', '\\']).next())
+                    .unwrap_or("another rule");
+                let rule = match (
+                    deciding["rule_command"].as_str(),
+                    deciding["rule_args"].as_str(),
+                ) {
+                    (Some(c), Some(a)) => format!("{c} {a}"),
+                    (Some(c), None) => c.to_string(),
+                    _ => "an earlier rule".to_string(),
+                };
+                let still = match other {
+                    Some((d, _)) => d.as_str(),
+                    None => "passthrough",
+                };
+                Some(format!(
+                    "SHADOWED: rule saved but still resolves to {still} — {file} decides first ({rule}). Edit that file to change it.",
+                ))
+            }
+        }
+    }
+
+    // Rebuild the tool call a queued request came from, so the shadow check re-runs the very
+    // same dispatch the gate will run next time rather than a reimplementation of it.
+    fn request_as_hook_input(request: &QueueRequest) -> crate::HookInput {
+        let target = request.target.clone();
+        let mut input = crate::ToolInput::default();
+        match request.tool.as_str() {
+            "Bash" | "PowerShell" => input.command = Some(target),
+            "WebFetch" => input.url = Some(target),
+            "WebSearch" => input.query = Some(target),
+            _ => input.file_path = Some(target),
+        }
+        crate::HookInput {
+            tool_name: request.tool.clone(),
+            tool_input: input,
+            cwd: request.cwd.clone(),
+            hook_event_name: Some(request.hook_event.clone()),
+            session_id: None,
+            tool_use_id: None,
+            permission_mode: request.permission_mode.clone(),
+            agent_type: request.agent_type.clone(),
+        }
+    }
+
+    // What the lanes just committed the whole call to, paired with its request id. `None`
+    // when a node was left in ASK: the call still defers, so there is nothing to verify.
+    fn committed_decision(p: &Pending) -> Option<(String, Decision)> {
+        if p.choices.contains(&Choice::Ask) {
+            return None;
+        }
+        let decision = if p.choices.contains(&Choice::Deny) {
+            Decision::Deny
+        } else {
+            Decision::Allow
+        };
+        Some((p.request.id.clone(), decision))
+    }
+
     // The commit kind a key represents, or None for keys that don't resolve a call.
     fn commit_label(key: &Key) -> Option<&'static str> {
         match key {
@@ -1539,6 +1665,34 @@ mod tui {
                         let _ = append_rules(live_path, &live);
                         if let Some(mode) = commit_mode {
                             log_operator_commit(log_path, app, mode, auto.as_ref());
+                            // Only an *-always commit writes a rule, so only that can be
+                            // shadowed. Checked after the write, against the real config.
+                            if mode == "always" {
+                                if let Some(warning) = app
+                                    .focused()
+                                    .and_then(committed_decision)
+                                    .and_then(|(req_id, d)| {
+                                        app.pending
+                                            .iter()
+                                            .find(|p| p.request.id == req_id)
+                                            .and_then(|p| {
+                                                let config = load_config(p.request.cwd.as_deref());
+                                                shadow_warning(&config, &p.request, d)
+                                            })
+                                    })
+                                {
+                                    push_capped(
+                                        &mut app.stream,
+                                        Line::from(Span::styled(
+                                            warning,
+                                            Style::new()
+                                                .fg(Color::Yellow)
+                                                .add_modifier(Modifier::BOLD),
+                                        )),
+                                        STREAM_CAP,
+                                    );
+                                }
+                            }
                         }
                         if app.focus < app.pending.len() {
                             app.pending.remove(app.focus);
@@ -1554,6 +1708,10 @@ mod tui {
             }
         }
     }
+
+    // What the operator has set up for one pending call, carried across a rebuild of the
+    // pending list so a queue rescan never resets a half-made decision.
+    type Selection = (Vec<Choice>, Vec<usize>, Vec<bool>, usize);
 
     // Reconcile the in-memory pending list with the request files on disk, preserving each
     // item's selection/cursor by id and sweeping requests from hooks that died mid-wait.
@@ -1582,19 +1740,27 @@ mod tui {
         }
         found.sort_by_key(|r| r.ts_ms);
 
-        let mut prev: HashMap<String, (Vec<Choice>, Vec<usize>, usize)> = HashMap::new();
+        let mut prev: HashMap<String, Selection> = HashMap::new();
         for p in app.pending.drain(..) {
-            prev.insert(p.request.id.clone(), (p.choices, p.scope_idx, p.cursor));
+            prev.insert(
+                p.request.id.clone(),
+                (p.choices, p.scope_idx, p.project_scoped, p.cursor),
+            );
         }
         app.pending = found
             .into_iter()
             .map(|req| match prev.remove(&req.id) {
-                Some((choices, scope_idx, cur)) if choices.len() == req.nodes.len() => Pending {
-                    cursor: cur.min(req.nodes.len().saturating_sub(1)),
-                    choices,
-                    scope_idx,
-                    request: req,
-                },
+                Some((choices, scope_idx, project_scoped, cur))
+                    if choices.len() == req.nodes.len() =>
+                {
+                    Pending {
+                        cursor: cur.min(req.nodes.len().saturating_sub(1)),
+                        choices,
+                        scope_idx,
+                        project_scoped,
+                        request: req,
+                    }
+                }
                 _ => Pending::new(req, approval),
             })
             .collect();
@@ -1747,9 +1913,22 @@ mod tui {
             } else {
                 "exact (no t)".to_string()
             };
+            // The `projects` clause is part of the rule about to be written, so it belongs in
+            // the same line the operator reads before committing — not somewhere else.
+            let scoped = p.project_scoped.get(p.cursor).copied().unwrap_or(false);
+            let project = match (scoped, p.project_root()) {
+                (true, Some(root)) => format!(" projects=[\"{root}\"]"),
+                (false, Some(_)) => String::new(),
+                (_, None) => String::new(),
+            };
+            let project_hint = match (scoped, p.project_root()) {
+                (true, Some(_)) => "p: this project only",
+                (false, Some(_)) => "p: scope to this project",
+                (_, None) => "p: n/a (no project)",
+            };
             head.push(Line::from(Span::styled(
-                format!("→ rule: {rule_desc}   ·  {cycle}"),
-                Style::new().fg(if idx == 0 {
+                format!("→ rule: {rule_desc}{project}   ·  {cycle}  ·  {project_hint}"),
+                Style::new().fg(if idx == 0 || scoped {
                     Color::Green
                 } else {
                     Color::Yellow
@@ -1822,7 +2001,7 @@ mod tui {
         let text = if app.pending.is_empty() {
             "m settings · q quit · waiting for approvals…"
         } else {
-            "space cycle · ←→ lane · ↑↓ node · t scope · ⇥ call · a apply-always · o apply-once · s skip · m settings · q quit"
+            "space cycle · ←→ lane · ↑↓ node · t scope · p project · ⇥ call · a apply-always · o apply-once · s skip · m settings · q quit"
         };
         let mut spans = vec![Span::styled(text, Style::new().fg(Color::DarkGray))];
         match &app.llm_status {
@@ -2429,6 +2608,220 @@ mod tui {
             assert_eq!(v["lanes"][0]["node"], "gh");
             assert_eq!(v["lk_llm"]["verdict"], "safe");
             assert_eq!(v["lk_llm"]["reason"], "read-only");
+        }
+
+        // ---- A3: project scoping (docs/A-persistable-approvals.md) -----------------------
+
+        fn in_repo(dir: &Path, cwd_sub: &str) -> QueueRequest {
+            std::fs::create_dir_all(dir.join(".git")).unwrap();
+            let cwd = dir.join(cwd_sub);
+            std::fs::create_dir_all(&cwd).unwrap();
+            QueueRequest {
+                cwd: Some(cwd.display().to_string()),
+                ..req()
+            }
+        }
+
+        // The repo root, not the cwd the call happened to run in — a rule scoped to a
+        // subdirectory would stop applying the moment the agent moved.
+        #[test]
+        fn project_root_walks_up_to_the_repository() {
+            let tmp = tempfile::tempdir().unwrap();
+            let p = Pending::new(in_repo(tmp.path(), "src/deep"), &ApprovalConfig::default());
+            assert_eq!(
+                p.project_root().map(|r| r.replace('\\', "/")),
+                Some(tmp.path().display().to_string().replace('\\', "/"))
+            );
+        }
+
+        #[test]
+        fn a_call_outside_any_repository_has_no_project() {
+            let tmp = tempfile::tempdir().unwrap();
+            let request = QueueRequest {
+                cwd: Some(tmp.path().display().to_string()),
+                ..req()
+            };
+            let p = Pending::new(request, &ApprovalConfig::default());
+            assert_eq!(p.project_root(), None);
+        }
+
+        // `p` is what makes a broad args pattern acceptable: broad in what it matches,
+        // narrow in where it applies.
+        #[test]
+        fn p_confines_the_persisted_rule_to_the_project() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut app = App::new();
+            app.pending.push(Pending::new(
+                in_repo(tmp.path(), "src"),
+                &ApprovalConfig::default(),
+            ));
+
+            let (_, before) = apply_key(&mut app, Key::Commit(CommitMode::Always)).expect("commit");
+            assert!(before[0].projects.is_empty(), "global by default");
+
+            apply_key(&mut app, Key::ToggleProject);
+            let (_, after) = apply_key(&mut app, Key::Commit(CommitMode::Always)).expect("commit");
+            assert_eq!(after[0].projects.len(), 1);
+            assert_eq!(
+                after[0].projects[0].replace('\\', "/"),
+                tmp.path().display().to_string().replace('\\', "/")
+            );
+        }
+
+        // It applies per node, so one command in a chain can be confined without confining
+        // the rest of them.
+        #[test]
+        fn project_scoping_is_per_node() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut app = App::new();
+            app.pending.push(Pending::new(
+                in_repo(tmp.path(), "src"),
+                &ApprovalConfig::default(),
+            ));
+            apply_key(&mut app, Key::ToggleProject); // node 0 only
+            let (_, live) = apply_key(&mut app, Key::Commit(CommitMode::Always)).expect("commit");
+            assert_eq!(live[0].projects.len(), 1);
+            assert!(live[1].projects.is_empty());
+        }
+
+        // With no project to confine to, the key must not pretend it did something.
+        #[test]
+        fn p_is_inert_without_a_project() {
+            let mut app = pending_app(); // cwd: None
+            apply_key(&mut app, Key::ToggleProject);
+            let (_, live) = apply_key(&mut app, Key::Commit(CommitMode::Always)).expect("commit");
+            assert!(live[0].projects.is_empty());
+        }
+
+        // ---- A5: shadow detection --------------------------------------------------------
+
+        // The sed case that started all of this: an earlier `ask` outranks the live allow, so
+        // the rule is written, is well-formed, and can never match. Reporting success there
+        // would be silent failure. Resolved against a config built here, not the machine's.
+        #[test]
+        fn a_rule_an_earlier_ask_outranks_is_reported_as_shadowed() {
+            let config = config_from(
+                "[[bash.rules]]
+command = \"sed\"
+args = \"-i **\"
+decision = \"ask\"
+                 reason = \"in-place edits need confirming\"
+                 [[bash.rules]]
+command = \"sed\"
+args = \"-i s/a/b/ x.md{, **}\"
+decision = \"allow\"
+",
+            );
+            let w = shadow_warning(&config, &sed_request(), Decision::Allow)
+                .expect("an allow that still resolves to ask must be reported");
+            assert!(w.starts_with("SHADOWED:"), "{w}");
+            assert!(w.contains("still resolves to ask"), "{w}");
+            assert!(w.contains("decides first"), "{w}");
+            assert!(w.contains("Edit that file"), "{w}");
+        }
+
+        // The same rule with nothing outranking it resolves the way it was committed, and
+        // must not be reported.
+        #[test]
+        fn a_rule_nothing_outranks_is_not_reported() {
+            let config = config_from(
+                "[[bash.rules]]
+command = \"sed\"
+args = \"-i **\"
+decision = \"allow\"
+",
+            );
+            assert_eq!(
+                shadow_warning(&config, &sed_request(), Decision::Allow),
+                None
+            );
+        }
+
+        // A deny the operator committed must also actually deny.
+        #[test]
+        fn a_shadowed_deny_is_reported_too() {
+            let config = config_from(
+                "[[bash.rules]]
+command = \"sed\"
+args = \"-i **\"
+decision = \"allow\"
+",
+            );
+            let w = shadow_warning(&config, &sed_request(), Decision::Deny)
+                .expect("a deny that resolves to allow must be reported");
+            assert!(w.contains("still resolves to allow"), "{w}");
+        }
+
+        fn config_from(toml_src: &str) -> Config {
+            Config::from(toml::from_str::<crate::config::RawConfig>(toml_src).unwrap())
+        }
+
+        fn sed_request() -> QueueRequest {
+            QueueRequest {
+                cwd: None,
+                tool: "Bash".into(),
+                target: "sed -i s/a/b/ x.md".into(),
+                nodes: vec![QueueNode {
+                    shell: "bash".into(),
+                    command: "sed".into(),
+                    args: "-i s/a/b/ x.md".into(),
+                    decision: "ask".into(),
+                }],
+                ..req()
+            }
+        }
+
+        #[test]
+        fn a_call_left_partly_in_ask_has_nothing_to_verify() {
+            let mut app = pending_app();
+            apply_key(&mut app, Key::Right); // node 0 -> ASK
+            assert_eq!(
+                committed_decision(app.focused().unwrap()),
+                None,
+                "the call still defers, so no rule outcome was committed"
+            );
+        }
+
+        #[test]
+        fn committed_decision_reports_deny_when_any_node_is_denied() {
+            let mut app = pending_app();
+            apply_key(&mut app, Key::Right);
+            apply_key(&mut app, Key::Right); // node 0 -> DENY
+            assert_eq!(
+                committed_decision(app.focused().unwrap()).map(|(_, d)| d),
+                Some(Decision::Deny)
+            );
+        }
+
+        // The check re-runs the gate's own dispatch, so the request it rebuilds must carry
+        // the command back to the right field for its tool.
+        #[test]
+        fn the_rebuilt_hook_input_routes_the_target_by_tool() {
+            let bash = request_as_hook_input(&req());
+            assert_eq!(
+                bash.tool_input.command.as_deref(),
+                Some("gh pr list | jq .")
+            );
+
+            let web = QueueRequest {
+                tool: "WebFetch".into(),
+                target: "https://x.test/a".into(),
+                ..req()
+            };
+            assert_eq!(
+                request_as_hook_input(&web).tool_input.url.as_deref(),
+                Some("https://x.test/a")
+            );
+
+            let edit = QueueRequest {
+                tool: "Edit".into(),
+                target: "/p/x.rs".into(),
+                ..req()
+            };
+            assert_eq!(
+                request_as_hook_input(&edit).tool_input.file_path.as_deref(),
+                Some("/p/x.rs")
+            );
         }
 
         // ---- Hook event labelling (docs/D-hook-coverage.md §D8) --------------------------

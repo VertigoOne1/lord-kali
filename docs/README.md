@@ -10,16 +10,14 @@ the open questions that remain.
 | [D](D-hook-coverage.md) | Hook coverage | **done** | ten events dispatched, `PermissionRequest` gating with `tool_use_id` dedupe, `PostToolUseFailure` + `PermissionDenied` captured, event tags in the TUI |
 | [C](C-config-in-tui.md) | Config in the TUI | **done** | `settings.toml` authoritative (replace, not merge), conflict reporting, `m` settings editor, resolved-paths footer |
 | [E](E-otel.md) | OpenTelemetry | **done** | OTLP/HTTP+JSON exporter riding the watch, checkpoint replay, metrics and logs for every event |
-| [A](A-persistable-approvals.md) | Persistable approvals | **partly** | A2 (flag-scoped rung) and A4 (glob escaping) done. A3, A5, A6, A7 open — see below |
+| [A](A-persistable-approvals.md) | Persistable approvals | **mostly** | A2 (flag-scoped rung), A3 (`p` project scoping), A4 (glob escaping), A5 (shadow detection) done. A6, A7 open — see below |
 
 ## Still open
 
-- **A3 — persist `projects` scope from the TUI.** A2 made the broad rungs reachable; A3 is what makes choosing one comfortable (broad in arguments, narrow in blast radius).
-- **A5 — shadow detection.** Under firewall precedence the TUI can still persist a rule that provably cannot match, and reports success. This matters *more* now, not less, because the only remedy is a config edit.
 - **A6 — `prune-rules`.** `99-live.toml` is ~7,800 lines with 95 dead `sed` rules in it.
 - **A7 — provenance on persisted rules** (`operator` vs `llm <model>`), which A6 needs to prune by source.
 - **C4 — hot reload.** Deliberately not built. The save note says the running watch keeps its current timers and model until restarted, rather than implying otherwise.
-- **The `sed -i` policy decision itself.** Precedence is unchanged by design, so `00-base.toml`'s unconditional `sed -i → ask` still wins over anything the TUI persists. The remedy is a scoped exception placed above it — a deliberate, reviewable line in the config. That is a policy call, not a code change.
+Resolved: the `sed -i` policy. A scoped `-i **` allow for `~/lord-kali` and `~/coflo` now sits above the catch-all in `00-base.toml`, so in-place edits run silently in those trees and still confirm everywhere else. `sed w`/`W`/`e` stays guarded throughout.
 
 ## Original order (for reference)
 

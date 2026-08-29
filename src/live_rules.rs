@@ -17,6 +17,9 @@ pub(crate) struct LiveRule {
     // None means command-wide (any args) — used when the node had no arguments.
     pub(crate) args: Option<String>,
     pub(crate) allow: bool,
+    // Directories this rule is confined to. Empty means global. This is what makes a broad
+    // args pattern acceptable: broad in what it matches, narrow in where it applies.
+    pub(crate) projects: Vec<String>,
 }
 
 pub(crate) fn live_rules_path(approval: &ApprovalConfig) -> PathBuf {
@@ -38,6 +41,17 @@ fn render_rule(r: &LiveRule) -> String {
     if let Some(args) = &r.args {
         let av = toml::Value::String(args.clone()).to_string();
         block.push_str(&format!("args = {av}\n"));
+    }
+    // Confines the rule to the directories the operator chose with `p`. This is what makes a
+    // broad args pattern acceptable — broad in what it matches, narrow in where it applies.
+    if !r.projects.is_empty() {
+        let list = toml::Value::Array(
+            r.projects
+                .iter()
+                .map(|p| toml::Value::String(p.clone()))
+                .collect(),
+        );
+        block.push_str(&format!("projects = {list}\n"));
     }
     block.push_str(&format!(
         "decision = \"{decision}\"\nreason = \"approval-tui\"\n"
@@ -90,6 +104,7 @@ mod tests {
             target: target.into(),
             args: args.map(String::from),
             allow,
+            projects: Vec::new(),
         }
     }
 
@@ -168,6 +183,7 @@ mod tests {
         append_rules(
             &path,
             &[LiveRule {
+                projects: Vec::new(),
                 shell: "web-search".into(),
                 target: "**".into(),
                 args: None,
@@ -192,6 +208,7 @@ mod tests {
         append_rules(
             &path,
             &[LiveRule {
+                projects: Vec::new(),
                 shell: "web-fetch".into(),
                 target: "https://docs.n8n.io{,/**}".into(),
                 args: None,
@@ -227,6 +244,7 @@ mod tests {
         append_rules(
             &path,
             &[LiveRule {
+                projects: Vec::new(),
                 shell: "web-fetch".into(),
                 target: "https://docs.rs/tokio".into(),
                 args: None,
@@ -251,6 +269,7 @@ mod tests {
         append_rules(
             &path,
             &[LiveRule {
+                projects: Vec::new(),
                 shell: "file".into(),
                 target: "/home/u/proj/**".into(),
                 args: None,
@@ -292,6 +311,7 @@ mod tests {
         append_rules(
             &path,
             &[LiveRule {
+                projects: Vec::new(),
                 shell: "mcp".into(),
                 target: "mcp__playwright__browser_fill_form".into(),
                 args: None,
