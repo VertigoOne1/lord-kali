@@ -456,11 +456,7 @@ impl Settings {
     // `[file]` carries rules as well as settings, so a `[file]` table holding only `rules`
     // does not count as a declared settings section.
     fn section_is_meaningful(&self, section: &str) -> bool {
-        match self.table.get(section) {
-            Some(toml::Value::Table(t)) if section == "file" => t.keys().any(|k| k != "rules"),
-            Some(_) => true,
-            None => false,
-        }
+        declares(&self.table, section)
     }
 
     pub(crate) fn as_table(&self) -> &toml::value::Table {
@@ -491,15 +487,49 @@ pub(crate) struct Conflict {
     pub(crate) file: String,
 }
 
-// Scan the rule files for settings sections. `settings.toml` itself is excluded. Files that
-// cannot be read or parsed are skipped — this reports overlap, it does not validate configs.
-pub(crate) fn find_conflicts(config_dir: &Path, settings: &Settings) -> Vec<Conflict> {
-    let declared = settings.declared_sections();
-    if declared.is_empty() {
-        return Vec::new();
+// Where one settings section currently resolves from. A section absent from `settings.toml`
+// still applies from whatever rule file declares it, so this is what stops the editor
+// claiming "default" for a value the gate is actually taking from somewhere else.
+pub(crate) struct SectionOrigin {
+    pub(crate) section: &'static str,
+    pub(crate) in_settings: bool,
+    // Rule files declaring it, in load order.
+    pub(crate) rule_files: Vec<String>,
+}
+
+impl SectionOrigin {
+    // What to show as the source of a value nobody has set in `settings.toml`.
+    pub(crate) fn fallback(&self) -> Option<&str> {
+        self.rule_files.first().map(String::as_str)
     }
+}
+
+// Does this table declare `section` as a *settings* section? `[[file.rules]]` is a rule, so a
+// `[file]` table holding only rules declares nothing.
+fn declares(table: &toml::value::Table, section: &str) -> bool {
+    match table.get(section) {
+        Some(toml::Value::Table(t)) if section == "file" => t.keys().any(|k| k != "rules"),
+        Some(_) => true,
+        None => false,
+    }
+}
+
+// Scan the rule files for settings sections. `settings.toml` itself is excluded. Files that
+// cannot be read or parsed are skipped — this reports where things come from, it does not
+// validate configs.
+pub(crate) fn section_origins(config_dir: &Path, settings: &Settings) -> Vec<SectionOrigin> {
+    let declared = settings.declared_sections();
+    let mut origins: Vec<SectionOrigin> = SECTIONS
+        .iter()
+        .map(|s| SectionOrigin {
+            section: s,
+            in_settings: declared.contains(s),
+            rule_files: Vec::new(),
+        })
+        .collect();
+
     let Ok(entries) = std::fs::read_dir(config_dir) else {
-        return Vec::new();
+        return origins;
     };
     let mut paths: Vec<PathBuf> = entries
         .flatten()
@@ -511,7 +541,6 @@ pub(crate) fn find_conflicts(config_dir: &Path, settings: &Settings) -> Vec<Conf
         .collect();
     paths.sort();
 
-    let mut out = Vec::new();
     for path in paths {
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
@@ -519,27 +548,36 @@ pub(crate) fn find_conflicts(config_dir: &Path, settings: &Settings) -> Vec<Conf
         let Ok(table) = toml::from_str::<toml::value::Table>(&text) else {
             continue;
         };
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default()
-            .to_string();
-        for section in &declared {
-            let present = match table.get(*section) {
-                // Same carve-out as above: `[[file.rules]]` alone is not a settings section.
-                Some(toml::Value::Table(t)) if *section == "file" => t.keys().any(|k| k != "rules"),
-                Some(_) => true,
-                None => false,
-            };
-            if present {
-                out.push(Conflict {
-                    section,
-                    file: name.clone(),
-                });
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        for origin in origins.iter_mut() {
+            if declares(&table, origin.section) {
+                origin.rule_files.push(name.to_string());
             }
         }
     }
-    out
+    origins
+}
+
+// A section declared in both places. Derived from the same scan as the source column, so the
+// two can never disagree about where a value comes from.
+pub(crate) fn conflicts_from(origins: &[SectionOrigin]) -> Vec<Conflict> {
+    origins
+        .iter()
+        .filter(|o| o.in_settings)
+        .flat_map(|o| {
+            o.rule_files.iter().map(move |file| Conflict {
+                section: o.section,
+                file: file.clone(),
+            })
+        })
+        .collect()
+}
+
+// The settings section a dotted field key belongs to.
+pub(crate) fn section_of(key: &str) -> &str {
+    key.split('.').next().unwrap_or(key)
 }
 
 pub(crate) fn mutation_scope_str(scope: MutationScope) -> &'static str {
@@ -733,7 +771,7 @@ mod tests {
         let with_setting = s(&[("file.enabled", toml::Value::Boolean(true))]);
         assert_eq!(with_setting.declared_sections(), vec!["file"]);
         assert!(
-            find_conflicts(tmp.path(), &with_setting).is_empty(),
+            conflicts_from(&section_origins(tmp.path(), &with_setting)).is_empty(),
             "a rules-only [file] section is not a settings conflict"
         );
     }
@@ -758,7 +796,7 @@ mod tests {
             ("log.enabled", toml::Value::Boolean(true)),
             ("approval.enabled", toml::Value::Boolean(true)),
         ]);
-        let found = find_conflicts(tmp.path(), &st);
+        let found = conflicts_from(&section_origins(tmp.path(), &st));
         let pairs: Vec<(&str, &str)> = found.iter().map(|c| (c.section, c.file.as_str())).collect();
         assert_eq!(
             pairs,
@@ -770,7 +808,7 @@ mod tests {
     fn nothing_declared_means_nothing_to_conflict_with() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("00-base.toml"), "[log]\nenabled = true\n").unwrap();
-        assert!(find_conflicts(tmp.path(), &Settings::default()).is_empty());
+        assert!(conflicts_from(&section_origins(tmp.path(), &Settings::default())).is_empty());
     }
 
     // An unparseable rule file must not take the conflict scan down with it.
@@ -780,7 +818,7 @@ mod tests {
         std::fs::write(tmp.path().join("00-broken.toml"), "= =").unwrap();
         std::fs::write(tmp.path().join("10-log.toml"), "[log]\nenabled = true\n").unwrap();
         let st = s(&[("log.enabled", toml::Value::Boolean(true))]);
-        let found = find_conflicts(tmp.path(), &st);
+        let found = conflicts_from(&section_origins(tmp.path(), &st));
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].file, "10-log.toml");
     }

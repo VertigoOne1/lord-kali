@@ -313,6 +313,7 @@ mod tui {
         self, write_atomic, write_heartbeat_in, Action, QueueRequest, Verdict, VerdictNode,
     };
     use crate::scope::{ladder, ScopeRung};
+    use crate::settings_ui::{self, Outcome, SettingsModal};
     use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
     use ratatui::layout::{Constraint, Layout, Rect};
     use ratatui::style::{Color, Modifier, Style};
@@ -447,6 +448,7 @@ mod tui {
         ToggleScope,
         Commit(CommitMode),
         SkipCall,
+        Settings,
         Ignore,
     }
 
@@ -464,6 +466,7 @@ mod tui {
             KeyCode::Char('a') => Key::Commit(CommitMode::Always),
             KeyCode::Char('o') => Key::Commit(CommitMode::Once),
             KeyCode::Char('s') => Key::SkipCall,
+            KeyCode::Char('m') => Key::Settings,
             _ => Key::Ignore,
         }
     }
@@ -485,6 +488,10 @@ mod tui {
         // where the model got to. The AutoApprover owns the state machine; this is its
         // rendering projection, which keeps `ui` a pure function of `App`.
         llm_labels: HashMap<String, String>,
+        // The settings editor (docs/C-config-in-tui.md). While it is Some it owns every key
+        // — and nothing else: the heartbeat, the queue sync and the auto-approver all keep
+        // running behind it, so the gate never degrades while config is being edited.
+        settings: Option<SettingsModal>,
     }
 
     impl App {
@@ -498,6 +505,7 @@ mod tui {
                 ctrl_c_armed: false,
                 llm_status: None,
                 llm_labels: HashMap::new(),
+                settings: None,
             }
         }
 
@@ -635,6 +643,8 @@ mod tui {
             }
             Key::Commit(mode) => app.focused().map(|p| build_verdict(p, mode)),
             Key::SkipCall => app.focused().map(|p| (build_skip(p), Vec::new())),
+            // Opened by `run_loop`, which owns the paths the editor's footer resolves from.
+            Key::Settings => None,
             Key::Ignore => None,
         }
     }
@@ -1227,6 +1237,31 @@ mod tui {
         ])
     }
 
+    fn settings_note(msg: &str) -> Line<'static> {
+        Line::from(vec![
+            Span::styled(
+                "  cfg  ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(msg.to_string(), Style::default().fg(Color::DarkGray)),
+        ])
+    }
+
+    // Every key goes to the editor while it is open, which is what keeps `q` from quitting
+    // out from under an unsaved edit. Returns the line a save wants in the stream.
+    fn settings_key(app: &mut App, code: KeyCode) -> Option<String> {
+        match app.settings.as_mut()?.handle_key(code) {
+            Outcome::Stay => None,
+            Outcome::Close => {
+                app.settings = None;
+                None
+            }
+            Outcome::Saved(note) => Some(note),
+        }
+    }
+
     // Build the auto-approver if configured + enabled + the key is present. On enabled-but-no-key
     // it pushes a one-line warning to the stream and returns None (degrade, never fail).
     fn build_auto(approval: &ApprovalConfig, app: &mut App) -> Option<AutoApprover> {
@@ -1264,6 +1299,8 @@ mod tui {
         app.pending.len().hash(&mut h);
         app.focus.hash(&mut h);
         app.ctrl_c_armed.hash(&mut h);
+        // The editor is a full-screen overlay, so its every keystroke has to reach the frame.
+        app.settings.as_ref().map(|m| m.revision()).hash(&mut h);
         for p in &app.pending {
             p.request.id.hash(&mut h);
             p.cursor.hash(&mut h);
@@ -1384,7 +1421,19 @@ mod tui {
                         continue;
                     }
                     app.ctrl_c_armed = false;
+                    if app.settings.is_some() {
+                        if let Some(note) = settings_key(app, k.code) {
+                            push_capped(&mut app.stream, settings_note(&note), STREAM_CAP);
+                        }
+                        continue;
+                    }
                     let key = map_key(k.code);
+                    if matches!(key, Key::Settings) {
+                        app.settings = Some(SettingsModal::open(settings_ui::Paths::resolve(
+                            approval, log_path,
+                        )));
+                        continue;
+                    }
                     let commit_mode = commit_label(&key);
                     if let Some((verdict, live)) = apply_key(app, key) {
                         let vpath = qdir.join(format!("{}.verdict.json", verdict.id));
@@ -1462,6 +1511,12 @@ mod tui {
     // while there is work), and a help line locked to its own row at the very bottom so a
     // long node list can never push it off-screen.
     fn ui(f: &mut Frame, app: &App) {
+        // A full-screen overlay: nothing behind it stays visible, so nothing behind it can be
+        // mistaken for something a keystroke would still reach.
+        if let Some(m) = &app.settings {
+            settings_ui::render(f, f.area(), m);
+            return;
+        }
         let body = if app.pending.is_empty() {
             Constraint::Length(3)
         } else {
@@ -1669,9 +1724,9 @@ mod tui {
             return;
         }
         let text = if app.pending.is_empty() {
-            "q quit · waiting for approvals…"
+            "m settings · q quit · waiting for approvals…"
         } else {
-            "space cycle · ←→ lane · ↑↓ node · t scope · ⇥ call · a apply-always · o apply-once · s skip · q quit"
+            "space cycle · ←→ lane · ↑↓ node · t scope · ⇥ call · a apply-always · o apply-once · s skip · m settings · q quit"
         };
         let mut spans = vec![Span::styled(text, Style::new().fg(Color::DarkGray))];
         match &app.llm_status {
@@ -2056,6 +2111,56 @@ mod tui {
             let q = "n8n /healthz/readiness live database query";
             assert_eq!(commit_target("web-search", q, false), q);
             assert_eq!(commit_target("web-search", q, true), q);
+        }
+
+        fn modal_paths(dir: &Path) -> settings_ui::Paths {
+            settings_ui::Paths {
+                config_dir: dir.to_path_buf(),
+                settings_file: dir.join("settings.toml"),
+                live_rules: dir.join("99-live.toml"),
+                state_dir: dir.join("state"),
+                log: dir.join("hook.jsonl"),
+            }
+        }
+
+        // While the editor is open every key belongs to it, so `q` cannot quit out from under
+        // an unsaved edit. The same key still quits once it is closed.
+        #[test]
+        fn the_settings_editor_swallows_quit_while_open() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut app = App::new();
+            assert!(matches!(map_key(KeyCode::Char('m')), Key::Settings));
+            app.settings = Some(SettingsModal::open(modal_paths(tmp.path())));
+
+            assert!(settings_key(&mut app, KeyCode::Char('q')).is_none());
+            assert!(!app.should_quit, "q must not quit while the editor is open");
+            assert!(app.settings.is_some());
+
+            assert!(settings_key(&mut app, KeyCode::Esc).is_none());
+            assert!(app.settings.is_none(), "Esc closes a clean editor");
+            assert!(!app.should_quit);
+
+            apply_key(&mut app, map_key(KeyCode::Char('q')));
+            assert!(app.should_quit);
+        }
+
+        #[test]
+        fn the_settings_editor_takes_over_the_frame_and_drives_redraws() {
+            use ratatui::backend::TestBackend;
+            use ratatui::Terminal;
+            let tmp = tempfile::tempdir().unwrap();
+            let mut app = pending_app();
+            app.stream.push(Line::raw("ALLOW  Bash: ls"));
+            let closed_rev = view_revision(&app);
+
+            app.settings = Some(SettingsModal::open(modal_paths(tmp.path())));
+            let mut terminal = Terminal::new(TestBackend::new(160, 44)).unwrap();
+            terminal.draw(|f| ui(f, &app)).unwrap();
+            assert_ne!(closed_rev, view_revision(&app));
+
+            let open_rev = view_revision(&app);
+            settings_key(&mut app, KeyCode::Down);
+            assert_ne!(open_rev, view_revision(&app), "a keystroke must redraw");
         }
 
         #[test]

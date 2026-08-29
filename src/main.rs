@@ -9,6 +9,7 @@ mod parse;
 mod queue;
 mod scope;
 mod settings;
+mod settings_ui;
 mod watch;
 mod worktree;
 
