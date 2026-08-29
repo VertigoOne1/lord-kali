@@ -20,6 +20,7 @@ pub(crate) struct Config {
     pub(crate) log: Option<LogConfig>,
     pub(crate) worktree_protection: WorktreeProtectionConfig,
     pub(crate) approval: ApprovalConfig,
+    pub(crate) otel: crate::otel::OtelConfig,
 }
 
 impl Config {
@@ -39,6 +40,9 @@ impl Config {
         }
         self.worktree_protection = other.worktree_protection.merge(self.worktree_protection);
         self.approval = self.approval.merge(other.approval);
+        if other.otel.enabled {
+            self.otel = other.otel;
+        }
         self
     }
 }
@@ -304,6 +308,14 @@ pub(crate) enum MutationScope {
     OutsideCwd,
 }
 
+pub(crate) fn mutation_scope_from(raw: Option<&str>) -> MutationScope {
+    match raw {
+        None | Some("all") => MutationScope::All,
+        Some("outside_cwd") => MutationScope::OutsideCwd,
+        Some(other) => panic!("Invalid mutation_scope '{other}' (use \"all\" or \"outside_cwd\")"),
+    }
+}
+
 impl FileConfig {
     // Opt-in feature: enabling anywhere enables. The scope follows whichever config first
     // turned it on (self is higher priority); rules concatenate, first-match-wins.
@@ -322,13 +334,7 @@ impl FileConfig {
     }
 
     fn from_raw(raw: RawFileConfig, group_projects: &[String], source: Source) -> Self {
-        let mutation_scope = match raw.mutation_scope.as_deref() {
-            None | Some("all") => MutationScope::All,
-            Some("outside_cwd") => MutationScope::OutsideCwd,
-            Some(other) => {
-                panic!("Invalid mutation_scope '{other}' (use \"all\" or \"outside_cwd\")")
-            }
-        };
+        let mutation_scope = mutation_scope_from(raw.mutation_scope.as_deref());
         FileConfig {
             enabled: raw.enabled,
             mutation_scope,
@@ -408,6 +414,8 @@ pub(crate) struct RawConfig {
     #[serde(default)]
     pub(crate) approval: RawApprovalConfig,
     #[serde(default)]
+    pub(crate) otel: crate::otel::OtelConfig,
+    #[serde(default)]
     pub(crate) group: Vec<RawGroupConfig>,
 }
 
@@ -482,18 +490,8 @@ impl Config {
             worktree_protection: WorktreeProtectionConfig {
                 enabled: raw.worktree_protection.enabled,
             },
-            approval: ApprovalConfig {
-                enabled: raw.approval.enabled,
-                live_rules: raw.approval.live_rules,
-                state_dir: raw.approval.state_dir,
-                guardrail_commands: raw.approval.guardrail_commands,
-                self_timeout_ms: raw.approval.self_timeout_ms,
-                poll_ms: raw.approval.poll_ms,
-                heartbeat_fresh_ms: raw.approval.heartbeat_fresh_ms,
-                pending_timeout_ms: raw.approval.pending_timeout_ms,
-                watch_poll_ms: raw.approval.watch_poll_ms,
-                llm: raw.approval.llm.map(ApprovalLlmConfig::from),
-            },
+            approval: ApprovalConfig::from(raw.approval),
+            otel: raw.otel,
         }
     }
 }
@@ -624,6 +622,23 @@ pub(crate) struct ApprovalConfig {
     pub(crate) watch_poll_ms: Option<u64>,
     // Optional LLM auto-approval (Phase 2). None or disabled => the watch never consults a model.
     pub(crate) llm: Option<ApprovalLlmConfig>,
+}
+
+impl From<RawApprovalConfig> for ApprovalConfig {
+    fn from(raw: RawApprovalConfig) -> Self {
+        ApprovalConfig {
+            enabled: raw.enabled,
+            live_rules: raw.live_rules,
+            state_dir: raw.state_dir,
+            guardrail_commands: raw.guardrail_commands,
+            self_timeout_ms: raw.self_timeout_ms,
+            poll_ms: raw.poll_ms,
+            heartbeat_fresh_ms: raw.heartbeat_fresh_ms,
+            pending_timeout_ms: raw.pending_timeout_ms,
+            watch_poll_ms: raw.watch_poll_ms,
+            llm: raw.llm.map(ApprovalLlmConfig::from),
+        }
+    }
 }
 
 impl ApprovalConfig {
@@ -834,10 +849,59 @@ pub(crate) fn load_config(cwd: Option<&str>) -> Config {
         .collect();
     paths.sort();
 
-    paths
+    // settings.toml is not a rule file. It is resolved after the merge and REPLACES the
+    // sections it declares, because merging is what made settings unguessable: `[log]` was
+    // last-wins, `[approval] enabled` ORed, `guardrail_commands` unioned — so some values
+    // could not be turned off from any one place. See src/settings.rs.
+    let settings_file = config_dir.join(crate::settings::SETTINGS_FILE);
+    paths.retain(|p| p != &settings_file);
+
+    let merged = paths
         .into_iter()
         .map(|path| parse_config_file(&path))
-        .fold(initial, Config::merge)
+        .fold(initial, Config::merge);
+
+    apply_settings_file(merged, &settings_file)
+}
+
+// Overlay the settings file onto a merged rule config. Only sections the file actually
+// declares are replaced, so a partly-migrated setup keeps working: what is still in the rule
+// files keeps applying until it is moved across (and is reported as a conflict meanwhile).
+fn apply_settings_file(mut config: Config, settings_file: &Path) -> Config {
+    let Ok(settings) = crate::settings::Settings::load_from(settings_file) else {
+        // A malformed settings file must not silently reset every behaviour switch. The rule
+        // files still apply; the TUI surfaces the parse error, which is where it can be fixed.
+        return config;
+    };
+    let declared = settings.declared_sections();
+    if declared.is_empty() {
+        return config;
+    }
+    let raw: RawConfig = match toml::Value::Table(settings.as_table().clone()).try_into() {
+        Ok(raw) => raw,
+        Err(_) => return config,
+    };
+    let has = |name: &str| declared.contains(&name);
+    if has("log") {
+        config.log = raw.log;
+    }
+    if has("worktree-protection") {
+        config.worktree_protection = WorktreeProtectionConfig {
+            enabled: raw.worktree_protection.enabled,
+        };
+    }
+    if has("approval") {
+        config.approval = ApprovalConfig::from(raw.approval);
+    }
+    // Only the settings half of `[file]`; `[[file.rules]]` stay with the rule files.
+    if has("file") {
+        config.file.enabled = raw.file.enabled;
+        config.file.mutation_scope = mutation_scope_from(raw.file.mutation_scope.as_deref());
+    }
+    if has("otel") {
+        config.otel = raw.otel;
+    }
+    config
 }
 
 #[cfg(test)]
@@ -959,6 +1023,7 @@ mod tests {
     #[test]
     fn group_projects_applied_to_rules() {
         let raw = RawConfig {
+            otel: Default::default(),
             bash: RawCommandConfig::default(),
             powershell: RawCommandConfig::default(),
             web_fetch: RawPatternConfig::default(),
@@ -1012,6 +1077,7 @@ mod tests {
     #[test]
     fn group_projects_union_with_rule_projects() {
         let raw = RawConfig {
+            otel: Default::default(),
             bash: RawCommandConfig::default(),
             powershell: RawCommandConfig::default(),
             web_fetch: RawPatternConfig::default(),
@@ -1062,6 +1128,7 @@ mod tests {
     #[test]
     fn group_allowed_commands_get_group_projects() {
         let raw = RawConfig {
+            otel: Default::default(),
             bash: RawCommandConfig::default(),
             powershell: RawCommandConfig::default(),
             web_fetch: RawPatternConfig::default(),
@@ -1109,6 +1176,7 @@ mod tests {
     #[test]
     fn group_web_fetch_rules_get_group_projects() {
         let raw = RawConfig {
+            otel: Default::default(),
             bash: RawCommandConfig::default(),
             powershell: RawCommandConfig::default(),
             web_fetch: RawPatternConfig::default(),
@@ -1160,6 +1228,7 @@ mod tests {
     #[test]
     fn top_level_rules_before_group_rules() {
         let raw = RawConfig {
+            otel: Default::default(),
             bash: RawCommandConfig {
                 allowed_commands: vec![],
                 rules: vec![RawCommandRule {
@@ -1626,5 +1695,120 @@ enabled = false
         };
         let merged = a.merge(b);
         assert!(!merged.worktree_protection.enabled);
+    }
+
+    // ---- settings.toml overlay (docs/C-config-in-tui.md) --------------------------------
+
+    fn rules_config(toml_src: &str) -> Config {
+        Config::from(toml::from_str::<RawConfig>(toml_src).unwrap())
+    }
+
+    fn overlay(rules: &str, settings: &str) -> Config {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(crate::settings::SETTINGS_FILE);
+        std::fs::write(&path, settings).unwrap();
+        apply_settings_file(rules_config(rules), &path)
+    }
+
+    // The whole point: a value the rule files turned on must be switchable off from one
+    // place. Under the old merge semantics `[approval] enabled` ORed and this was impossible.
+    #[test]
+    fn settings_can_turn_off_what_a_rule_file_turned_on() {
+        let c = overlay(
+            "[approval]\nenabled = true\n",
+            "[approval]\nenabled = false\n",
+        );
+        assert!(!c.approval.enabled);
+    }
+
+    // Replace, not merge: guardrail_commands unioned across files before, so an entry could
+    // never be removed.
+    #[test]
+    fn a_declared_section_replaces_rather_than_merges() {
+        let c = overlay(
+            "[approval]\nenabled = true\nguardrail_commands = [\"terraform\"]\nself_timeout_ms = 9\n",
+            "[approval]\nenabled = true\nguardrail_commands = [\"kubectl\"]\n",
+        );
+        assert!(c.approval.is_guardrail("kubectl"));
+        assert!(
+            !c.approval.is_guardrail("terraform"),
+            "the rule file's entry must not survive a replace"
+        );
+        assert_eq!(
+            c.approval.self_timeout_ms(),
+            DEFAULT_SELF_TIMEOUT_MS,
+            "an omitted key inside a declared section falls back to its default"
+        );
+    }
+
+    // Migration safety: a section the settings file says nothing about keeps working from
+    // wherever it is declared today.
+    #[test]
+    fn undeclared_sections_are_left_alone() {
+        let c = overlay(
+            "[log]\nenabled = true\npath = \"/x.jsonl\"\n[approval]\nenabled = true\n",
+            "[approval]\nenabled = false\n",
+        );
+        assert!(!c.approval.enabled);
+        assert_eq!(c.log.as_ref().unwrap().path.as_deref(), Some("/x.jsonl"));
+    }
+
+    // `[file]` is split: its switches are settings, its rules are rules.
+    #[test]
+    fn the_file_section_overlay_keeps_the_rules_from_the_rule_files() {
+        let c = overlay(
+            "[file]\nenabled = true\nmutation_scope = \"all\"\n\
+             [[file.rules]]\npath = \"**/*.md\"\ndecision = \"allow\"\n",
+            "[file]\nenabled = true\nmutation_scope = \"outside_cwd\"\n",
+        );
+        assert_eq!(c.file.mutation_scope, MutationScope::OutsideCwd);
+        assert_eq!(
+            c.file.rules.len(),
+            1,
+            "rules must survive the settings overlay"
+        );
+    }
+
+    // A `[file]` block holding only rules is not a settings declaration, so it must not
+    // reset `enabled`/`mutation_scope` out from under the rule files.
+    #[test]
+    fn a_rules_only_file_section_in_settings_declares_nothing() {
+        let c = overlay(
+            "[file]\nenabled = true\nmutation_scope = \"outside_cwd\"\n",
+            "[[file.rules]]\npath = \"**/*.rs\"\ndecision = \"allow\"\n",
+        );
+        assert!(c.file.enabled);
+        assert_eq!(c.file.mutation_scope, MutationScope::OutsideCwd);
+    }
+
+    // A broken settings file must not silently reset every behaviour switch to its default.
+    #[test]
+    fn a_malformed_settings_file_leaves_the_rule_files_in_charge() {
+        let c = overlay("[approval]\nenabled = true\n", "= = not toml");
+        assert!(
+            c.approval.enabled,
+            "an unreadable settings file must not disable the gate"
+        );
+    }
+
+    #[test]
+    fn a_missing_settings_file_changes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let c = apply_settings_file(
+            rules_config("[approval]\nenabled = true\n"),
+            &tmp.path().join("absent.toml"),
+        );
+        assert!(c.approval.enabled);
+    }
+
+    #[test]
+    fn otel_settings_resolve_from_the_settings_file() {
+        let c = overlay(
+            "",
+            "[otel]\nenabled = true\nendpoint = \"http://collector:4318\"\ninclude_command = false\n",
+        );
+        assert!(c.otel.enabled);
+        assert_eq!(c.otel.endpoint, "http://collector:4318");
+        assert!(!c.otel.include_command);
     }
 }

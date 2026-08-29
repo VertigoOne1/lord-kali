@@ -8,6 +8,7 @@ mod otel;
 mod parse;
 mod queue;
 mod scope;
+mod settings;
 mod watch;
 mod worktree;
 
