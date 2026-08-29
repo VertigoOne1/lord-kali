@@ -4,15 +4,24 @@ Five workstreams, scoped separately so they can be taken one at a time. Each doc
 problem with evidence from this machine, the decisions already taken, a proposed design, and
 the open questions that remain.
 
-| doc | area | status | one-line problem |
+| doc | area | status | what landed |
 |---|---|---|---|
-| [B](B-ai-first-gating.md) | AI-first gating | approved | The operator is forced to move before the model has an opinion — swap the two turns |
-| [D](D-hook-coverage.md) | Hook coverage | approved | Claude Code exposes 31 hook events; lord-kali uses 2, and auto-mode denials are invisible to it |
-| [C](C-config-in-tui.md) | Config in the TUI | approved | Behaviour settings are scattered across 21 files in a directory that is not where the README says it is |
-| [E](E-otel.md) | OpenTelemetry | approved | No metrics or standard-format logs; lord-kali adopts OTel as its own producer |
-| [A](A-persistable-approvals.md) | Persistable approvals | scoped down, last | `sed -i` is a config error, not a code error — but flag-first commands still have no usable scope rung |
+| [B](B-ai-first-gating.md) | AI-first gating | **done** | model first (`queue_wait_ms = 0`), verdict cache, concurrency cap, live model status in the approval zone, `operator_commit` records, `eval --from-log` |
+| [D](D-hook-coverage.md) | Hook coverage | **done** | ten events dispatched, `PermissionRequest` gating with `tool_use_id` dedupe, `PostToolUseFailure` + `PermissionDenied` captured, event tags in the TUI |
+| [C](C-config-in-tui.md) | Config in the TUI | **done** | `settings.toml` authoritative (replace, not merge), conflict reporting, `m` settings editor, resolved-paths footer |
+| [E](E-otel.md) | OpenTelemetry | **done** | OTLP/HTTP+JSON exporter riding the watch, checkpoint replay, metrics and logs for every event |
+| [A](A-persistable-approvals.md) | Persistable approvals | **partly** | A2 (flag-scoped rung) and A4 (glob escaping) done. A3, A5, A6, A7 open — see below |
 
-## Order
+## Still open
+
+- **A3 — persist `projects` scope from the TUI.** A2 made the broad rungs reachable; A3 is what makes choosing one comfortable (broad in arguments, narrow in blast radius).
+- **A5 — shadow detection.** Under firewall precedence the TUI can still persist a rule that provably cannot match, and reports success. This matters *more* now, not less, because the only remedy is a config edit.
+- **A6 — `prune-rules`.** `99-live.toml` is ~7,800 lines with 95 dead `sed` rules in it.
+- **A7 — provenance on persisted rules** (`operator` vs `llm <model>`), which A6 needs to prune by source.
+- **C4 — hot reload.** Deliberately not built. The save note says the running watch keeps its current timers and model until restarted, rather than implying otherwise.
+- **The `sed -i` policy decision itself.** Precedence is unchanged by design, so `00-base.toml`'s unconditional `sed -i → ask` still wins over anything the TUI persists. The remedy is a scoped exception placed above it — a deliberate, reviewable line in the config. That is a policy call, not a code change.
+
+## Original order (for reference)
 
 1. **B** — smallest change, largest daily effect. `queue_wait_ms = 0` plus the TUI
    `consulting` state, a verdict cache and a concurrency cap for five concurrent sessions.
