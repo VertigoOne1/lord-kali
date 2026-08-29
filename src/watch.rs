@@ -1830,10 +1830,16 @@ mod tui {
             let (_, live) = apply_key(&mut app, Key::Commit(CommitMode::Always)).expect("commit");
             assert_eq!(live[0].args.as_deref(), Some("-rf ./test-results{, **}"));
 
+            // `t` steps to the flag-scoped rung: flags kept, the path wildcarded. Broader
+            // than tight, which is why a guardrail command never defaults to it.
             apply_key(&mut app, Key::ToggleScope);
             assert_eq!(app.focused().unwrap().scope_idx[0], 1);
             let (_, live2) = apply_key(&mut app, Key::Commit(CommitMode::Always)).expect("commit");
-            assert_eq!(live2[0].args.as_deref(), Some("-rf{, **}"));
+            assert_eq!(live2[0].args.as_deref(), Some("-rf **"));
+
+            apply_key(&mut app, Key::ToggleScope);
+            let (_, live3) = apply_key(&mut app, Key::Commit(CommitMode::Always)).expect("commit");
+            assert_eq!(live3[0].args.as_deref(), Some("-rf{, **}"));
         }
 
         // A non-guardrail command defaults to the subcommand rung (index 1, not tight).
