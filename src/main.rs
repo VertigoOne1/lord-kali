@@ -4,6 +4,7 @@ mod eval;
 mod live_rules;
 mod llm;
 mod log;
+mod otel;
 mod parse;
 mod queue;
 mod scope;

@@ -695,6 +695,9 @@ mod tui {
         kind: &'static str,
         reason: Option<String>,
         latency_ms: u64,
+        // Present only on a reply that reached us; logged so spend is measurable per model
+        // rather than inferred from the consult count.
+        total_tokens: Option<u64>,
         detail: Option<String>,
     }
 
@@ -828,30 +831,36 @@ mod tui {
                 let jr = judge(&cfg, &rendered, now_ms);
                 let latency_ms = jr.latency_ms;
                 let report = match jr.result {
-                    Ok(resp) => match parse_judgement(&resp.content) {
-                        Ok(j) => LlmReport {
-                            target,
-                            kind: match j.verdict {
-                                LlmVerdict::Safe => "safe",
-                                LlmVerdict::Unsafe => "unsafe",
+                    Ok(resp) => {
+                        let total_tokens = resp.total_tokens;
+                        match parse_judgement(&resp.content) {
+                            Ok(j) => LlmReport {
+                                target,
+                                kind: match j.verdict {
+                                    LlmVerdict::Safe => "safe",
+                                    LlmVerdict::Unsafe => "unsafe",
+                                },
+                                reason: Some(j.reason),
+                                latency_ms,
+                                total_tokens,
+                                detail: None,
                             },
-                            reason: Some(j.reason),
-                            latency_ms,
-                            detail: None,
-                        },
-                        Err(e) => LlmReport {
-                            target,
-                            kind: "malformed",
-                            reason: None,
-                            latency_ms,
-                            detail: Some(e.to_string()),
-                        },
-                    },
+                            Err(e) => LlmReport {
+                                target,
+                                kind: "malformed",
+                                reason: None,
+                                latency_ms,
+                                total_tokens,
+                                detail: Some(e.to_string()),
+                            },
+                        }
+                    }
                     Err(e) => LlmReport {
                         target,
                         kind: "error",
                         reason: None,
                         latency_ms,
+                        total_tokens: None,
                         detail: Some(e.to_string()),
                     },
                 };
@@ -924,6 +933,7 @@ mod tui {
                         "verdict": rep.kind,
                         "reason": rep.reason,
                         "latency_ms": rep.latency_ms,
+                        "total_tokens": rep.total_tokens,
                         "detail": rep.detail,
                         "will_auto_approve": proposable,
                     }),
