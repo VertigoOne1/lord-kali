@@ -55,8 +55,22 @@ pub(crate) fn log_invocation(
     input: &str,
     trace: &InvocationTrace,
     hook_event: &str,
+    timing: GateTiming,
 ) {
-    append_log_line(log_config, timestamped_log_line(input, trace, hook_event));
+    append_log_line(
+        log_config,
+        timestamped_log_line(input, trace, hook_event, timing),
+    );
+}
+
+// How long the gate took, and how much of that was waiting on the approval queue. Recorded
+// because neither is recoverable afterwards: the hook process is gone, and a wait that
+// timed out looks identical to one that was never made.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct GateTiming {
+    pub(crate) duration_ms: u64,
+    // None when the call never reached the queue.
+    pub(crate) queue_wait_ms: Option<u64>,
 }
 
 // Events lord-kali observes but never gates — PostToolUse, PostToolUseFailure,
@@ -235,9 +249,21 @@ fn decision_breakdown(trace: &InvocationTrace) -> serde_json::Value {
     serde_json::Value::Object(obj)
 }
 
-fn timestamped_log_line(input: &str, trace: &InvocationTrace, hook_event: &str) -> String {
+fn timestamped_log_line(
+    input: &str,
+    trace: &InvocationTrace,
+    hook_event: &str,
+    timing: GateTiming,
+) -> String {
     shape_log_line(input, &event_key(hook_event), |map| {
         map.insert("lk_decision".to_string(), decision_breakdown(trace));
+        map.insert(
+            "lk_duration_ms".to_string(),
+            serde_json::json!(timing.duration_ms),
+        );
+        if let Some(w) = timing.queue_wait_ms {
+            map.insert("lk_queue_wait_ms".to_string(), serde_json::json!(w));
+        }
     })
 }
 
@@ -260,6 +286,7 @@ mod tests {
             r#"{"tool_name":"Bash","tool_input":{"command":"ls"},"cwd":"/x"}"#,
             &empty_invocation_trace(),
             "PreToolUse",
+            GateTiming::default(),
         );
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(v["tool_name"], "Bash");
@@ -272,7 +299,12 @@ mod tests {
     #[test]
     fn timestamped_log_line_passes_through_non_object() {
         assert_eq!(
-            timestamped_log_line("not json", &empty_invocation_trace(), "PreToolUse"),
+            timestamped_log_line(
+                "not json",
+                &empty_invocation_trace(),
+                "PreToolUse",
+                GateTiming::default()
+            ),
             "not json"
         );
     }
@@ -342,7 +374,7 @@ mod tests {
     fn pre_tool_use_line_marks_event() {
         let input = r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"ls"},"cwd":"/x"}"#;
         let trace = empty_trace("command_chain");
-        let line = timestamped_log_line(input, &trace, "PreToolUse");
+        let line = timestamped_log_line(input, &trace, "PreToolUse", GateTiming::default());
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(v["lk_event"], serde_json::json!("pre_tool_use"));
         assert!(v.get("lk_decision").is_some());

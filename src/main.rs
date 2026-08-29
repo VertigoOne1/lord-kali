@@ -14,7 +14,7 @@ mod worktree;
 
 use config::{load_config, Config};
 use decision::{dispatch, Decision, InvocationTrace};
-use log::{log_invocation, log_observed_event};
+use log::{log_invocation, log_observed_event, GateTiming};
 use queue::QueueRequest;
 use serde::Deserialize;
 use std::io::Read;
@@ -145,17 +145,29 @@ fn run_hook() {
 }
 
 fn gate(config: &Config, hook_input: &HookInput, raw: &str, event: GateEvent) {
+    let started = std::time::Instant::now();
     let cwd = hook_input.cwd.as_deref();
     let trace = dispatch(config, hook_input, cwd);
-    let trace = maybe_route_to_approval(config, hook_input, trace, event);
+    let (trace, queue_wait_ms) = maybe_route_to_approval(config, hook_input, trace, event);
 
+    // Print before logging: the decision is what Claude Code is waiting on, and logging is
+    // best-effort by design.
     if let Some((decision, reason)) = &trace.final_decision {
         print_decision(event, decision.clone(), reason);
     }
 
     if let Some(log) = &config.log {
         if log.enabled {
-            log_invocation(log, raw, &trace, event.name());
+            log_invocation(
+                log,
+                raw,
+                &trace,
+                event.name(),
+                GateTiming {
+                    duration_ms: started.elapsed().as_millis() as u64,
+                    queue_wait_ms,
+                },
+            );
         }
     }
 }
@@ -169,22 +181,22 @@ fn maybe_route_to_approval(
     hook_input: &HookInput,
     trace: InvocationTrace,
     event: GateEvent,
-) -> InvocationTrace {
+) -> (InvocationTrace, Option<u64>) {
     if !config.approval.enabled {
-        return trace;
+        return (trace, None);
     }
     if !matches!(&trace.final_decision, None | Some((Decision::Ask, _))) {
-        return trace;
+        return (trace, None);
     }
 
     let dir = queue::state_dir(&config.approval);
     if !queue::is_tui_live_in(&dir, config.approval.heartbeat_fresh_ms()) {
-        return trace;
+        return (trace, None);
     }
 
     let nodes = trace.actionable_nodes();
     if nodes.is_empty() {
-        return trace;
+        return (trace, None);
     }
 
     // One tool call reaches the gate twice when Claude Code goes on to prompt for it. The
@@ -194,7 +206,7 @@ fn maybe_route_to_approval(
     let marker_age = config.approval.self_timeout_ms() * 2;
     match (event, hook_input.tool_use_id.as_deref()) {
         (GateEvent::PermissionRequest, Some(id)) if queue::was_queued_in(&qdir, id, marker_age) => {
-            return trace;
+            return (trace, None);
         }
         (GateEvent::PreToolUse, Some(id)) => queue::mark_queued_in(&qdir, id),
         _ => {}
@@ -213,6 +225,7 @@ fn maybe_route_to_approval(
         nodes,
     };
 
+    let waited = std::time::Instant::now();
     match queue::submit_and_wait_in(
         &dir,
         &request,
@@ -222,9 +235,11 @@ fn maybe_route_to_approval(
         Some(verdict) => {
             let mut trace = trace;
             trace.final_decision = queue::combine_verdict(&verdict.nodes);
-            trace
+            (trace, Some(waited.elapsed().as_millis() as u64))
         }
-        None => trace,
+        // A timeout is still a wait, and the one worth seeing — it means the operator never
+        // ruled and the call fell back to Claude Code's own prompt.
+        None => (trace, Some(waited.elapsed().as_millis() as u64)),
     }
 }
 
@@ -389,12 +404,13 @@ mod tests {
             kind: "command_chain",
             nodes: Vec::new(),
         };
-        let out = maybe_route_to_approval(
+        let (out, waited) = maybe_route_to_approval(
             &config,
             &bash_hook_input("rm foo"),
             trace,
             GateEvent::PreToolUse,
         );
+        assert_eq!(waited, None, "a disabled gate never waits");
         assert_eq!(
             out.final_decision.map(|(d, _)| d),
             Some(Decision::Ask),

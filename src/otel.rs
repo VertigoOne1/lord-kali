@@ -766,6 +766,12 @@ impl OtelPipeline {
         if blocked {
             self.count(APPROVAL_REQUESTS, &[("tool", tool), ("kind", kind)], 1);
         }
+        // Present only when the call actually reached the queue. The outcome is the verdict
+        // it came back with — a passthrough here means the wait timed out and the call fell
+        // back to Claude Code's own prompt, which is the case worth seeing.
+        if let Some(ms) = r.get("lk_queue_wait_ms").and_then(Value::as_f64) {
+            self.observe(APPROVAL_WAIT, &[("outcome", final_decision)], ms);
+        }
 
         let mut attrs: Attributes = Vec::new();
         push_str_attr(&mut attrs, "lordkali.tool", Some(tool));
@@ -1685,6 +1691,50 @@ mod tests {
         assert!(p.ingest(&record));
         assert!(p.metrics().is_empty());
         assert_eq!(p.pending_logs()[0].severity, Severity::Info);
+    }
+
+    // A call that reached the queue records how long it waited, keyed on what it came back
+    // with — here, an operator deny.
+    #[test]
+    fn a_queue_wait_is_observed_against_its_outcome() {
+        let mut p = pipeline(OtelConfig::default());
+        let mut r = pre_tool_use_record();
+        r["lk_queue_wait_ms"] = serde_json::json!(4200);
+        assert!(p.ingest(&r));
+        let h = p
+            .metrics()
+            .histogram(APPROVAL_WAIT, &[("outcome", "deny")])
+            .expect("wait observed");
+        assert_eq!(h.count, 1);
+        assert_eq!(h.sum, 4200.0);
+    }
+
+    // A wait that ends in passthrough is a timeout — the operator never ruled and the call
+    // fell back to Claude Code's own prompt. That is the one worth being able to alert on.
+    #[test]
+    fn a_timed_out_wait_is_distinguishable_from_a_ruling() {
+        let mut p = pipeline(OtelConfig::default());
+        let mut r = pre_tool_use_record();
+        r["lk_decision"]["final"] = serde_json::json!("passthrough");
+        r["lk_queue_wait_ms"] = serde_json::json!(50_000);
+        assert!(p.ingest(&r));
+        assert_eq!(
+            p.metrics()
+                .histogram(APPROVAL_WAIT, &[("outcome", "passthrough")])
+                .map(|h| h.sum),
+            Some(50_000.0)
+        );
+    }
+
+    // A call that never reached the queue must not contribute a zero to the wait histogram.
+    #[test]
+    fn a_call_that_never_queued_records_no_wait() {
+        let mut p = pipeline(OtelConfig::default());
+        assert!(p.ingest(&pre_tool_use_record()));
+        assert!(p
+            .metrics()
+            .histogram(APPROVAL_WAIT, &[("outcome", "deny")])
+            .is_none());
     }
 
     // ---- events from workstreams B and D ------------------------------------------------
