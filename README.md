@@ -431,6 +431,37 @@ It also correlates each `pre_tool_use` with its `post_tool_use`:
 
 `allow` calls always run, so their `post_tool_use` is not restated. Color is disabled automatically when stdout is not a terminal or when `NO_COLOR` is set.
 
+### Pruning the live ruleset
+
+The live file grows with every apply-always and nothing ever removes from it. `lord-kali prune-rules` says which of its rules can still fire:
+
+```sh
+lord-kali prune-rules                 # report only (the default)
+lord-kali prune-rules --apply         # remove shadowed + subsumed, after a backup
+lord-kali prune-rules --apply --cold  # also remove rules the log has never seen decide
+lord-kali prune-rules --days 30       # widen the window "cold" is judged against
+```
+
+Each rule is categorised by **witness** — a concrete call reconstructed from the rule itself, then resolved through the gate's own decision path, so the report and the real outcome cannot disagree:
+
+| category | meaning | removed by `--apply`? |
+|---|---|---|
+| **live** | it decided a real call inside the log window | no |
+| **shadowed** | another file's rule decides first — reported with the winning file and rule | yes |
+| **subsumed** | an earlier rule in the live file already covers it | yes |
+| **cold** | reachable, but never seen deciding in the log window | only with `--cold` |
+| **unanalysable** | the witness could not be derived, or the rule does not match the call it was read back as | **never** |
+
+`unanalysable` is the important one. Rules persisted before argument text was escaped contain live `[`, `{` and `\` — they do not say what they look like, and some cannot match even the command they came from. A rule that fails to match its own originating call is precisely what must not be assumed dead, so it is always kept and counted.
+
+Safety, in order of how much it matters:
+
+- **Report-only by default**, and only the live file is ever written.
+- **`--apply` backs up first** to `<file>.bak-<timestamp>` and says where.
+- **`cold` needs `--cold`.** A three-day log window is not evidence a rule is useless. An absent or narrowed log makes *nothing* cold rather than treating an empty scan as proof everything is dead.
+- **Behaviour preservation.** Before writing, the pruned config is staged and every *kept* rule's witness re-resolved. If any outcome changed, it aborts and writes nothing.
+- Rewriting is by text block, so the file header and any comments you have added survive.
+
 ## Central approval TUI
 
 By default, an `ask` rule or a pass-through (no rule matched) defers to Claude Code's own permission prompt, which appears in whichever terminal that Claude instance owns. With several Claude instances running, there is no single place to triage approvals.
