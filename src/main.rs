@@ -7,6 +7,7 @@ mod log;
 mod otel;
 mod parse;
 mod queue;
+mod rules_audit;
 mod scope;
 mod settings;
 mod settings_ui;
@@ -94,6 +95,7 @@ fn main() {
     match args.next().as_deref() {
         Some("watch") => watch::watch(&args.collect::<Vec<_>>()),
         Some("prune-logs") => log::prune_logs_cli(&args.collect::<Vec<_>>()),
+        Some("prune-rules") => rules_audit::prune_rules_cli(&args.collect::<Vec<_>>()),
         Some("eval") => eval::eval_cli(&args.collect::<Vec<_>>()),
         _ => run_hook(),
     }

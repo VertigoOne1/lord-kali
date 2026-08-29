@@ -824,14 +824,19 @@ pub(crate) fn lord_kali_config_dir() -> PathBuf {
 }
 
 pub(crate) fn load_config(cwd: Option<&str>) -> Config {
+    load_config_in(&lord_kali_config_dir(), cwd)
+}
+
+// The loader, parameterised on the config directory. `load_config` is this with the real
+// one; `prune-rules` and its tests point it at a directory they own, so an audit never
+// depends on whatever happens to be installed on the machine running it.
+pub(crate) fn load_config_in(config_dir: &Path, cwd: Option<&str>) -> Config {
     let initial = cwd
         .and_then(find_project_config)
         .map(|p| parse_config_file(&p))
         .unwrap_or_default();
 
-    let config_dir = lord_kali_config_dir();
-
-    let entries = match std::fs::read_dir(&config_dir) {
+    let entries = match std::fs::read_dir(config_dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return initial,
         Err(e) => panic!("Failed to read config dir {}: {}", config_dir.display(), e),
