@@ -693,10 +693,11 @@ pub(crate) struct RawApprovalConfig {
     pub(crate) llm: Option<RawApprovalLlmConfig>,
 }
 
-// Runtime LLM auto-approval (Phase 2). When `enabled` and the watch is running, a passthrough
-// request the operator hasn't touched after `queue_wait_ms` is sent to the model; a confident
-// `safe` becomes a proposal that auto-applies after `proposal_wait_ms` if still untouched.
-// Anything else degrades to passthrough. Timings are sized to fit the 50s hook self-timeout.
+// Runtime LLM auto-approval. The model goes FIRST: `queue_wait_ms` defaults to 0, so a
+// passthrough reaching the queue is sent to the model immediately and the operator reviews a
+// stated opinion during `proposal_wait_ms` instead of pre-empting one that does not exist yet.
+// A confident `safe` auto-applies when that window elapses untouched; anything else degrades
+// to passthrough. The operator wins at any point, and the model never auto-denies.
 pub(crate) struct ApprovalLlmConfig {
     pub(crate) enabled: bool,
     pub(crate) model: String,
@@ -714,6 +715,14 @@ pub(crate) struct ApprovalLlmConfig {
     // gate, so this defaults to Bash/PowerShell; file and other tools are never consulted
     // and ride the operator/timeout fallback instead.
     pub(crate) tools: Vec<String>,
+    // How long a verdict stays reusable for an identical (tool, command, cwd). With the model
+    // on every passthrough and several Claude sessions sharing one watch, the same command
+    // recurs constantly; 0 disables the cache.
+    pub(crate) cache_ttl_ms: u64,
+    // Ceiling on simultaneous in-flight consults. Bursts from parallel sessions would
+    // otherwise become rate-limit errors, and a rate-limit error is a passthrough — the gate
+    // would silently weaken exactly when it is busiest.
+    pub(crate) max_concurrent: usize,
 }
 
 impl From<RawApprovalLlmConfig> for ApprovalLlmConfig {
@@ -728,7 +737,7 @@ impl From<RawApprovalLlmConfig> for ApprovalLlmConfig {
             api_key_env: r
                 .api_key_env
                 .unwrap_or_else(|| "OPENROUTER_API_KEY".to_string()),
-            queue_wait_ms: r.queue_wait_ms.unwrap_or(10_000),
+            queue_wait_ms: r.queue_wait_ms.unwrap_or(0),
             proposal_wait_ms: r.proposal_wait_ms.unwrap_or(5_000),
             timeout_ms: r.timeout_ms.unwrap_or(llm::DEFAULT_TIMEOUT_MS),
             max_attempts: r.max_attempts.unwrap_or(llm::DEFAULT_MAX_ATTEMPTS),
@@ -737,6 +746,8 @@ impl From<RawApprovalLlmConfig> for ApprovalLlmConfig {
             tools: r
                 .tools
                 .unwrap_or_else(|| vec!["Bash".to_string(), "PowerShell".to_string()]),
+            cache_ttl_ms: r.cache_ttl_ms.unwrap_or(3_600_000),
+            max_concurrent: r.max_concurrent.unwrap_or(4).max(1),
         }
     }
 }
@@ -755,6 +766,8 @@ pub(crate) struct RawApprovalLlmConfig {
     pub(crate) system: Option<String>,
     pub(crate) user: Option<String>,
     pub(crate) tools: Option<Vec<String>>,
+    pub(crate) cache_ttl_ms: Option<u64>,
+    pub(crate) max_concurrent: Option<usize>,
 }
 
 pub(crate) fn expand_tilde(path: &str) -> PathBuf {

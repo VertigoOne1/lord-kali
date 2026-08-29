@@ -2,3 +2,5 @@
 .env
 *.env
 /eval/reports
+# agent worktrees are transient
+.claude/worktrees/

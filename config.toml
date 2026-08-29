@@ -29,18 +29,23 @@ path = "~/.local/state/lord-kali/hook.jsonl"
 # watch_poll_ms = 200
 
 # LLM auto-approval (opt-in; default off). When enabled AND `lord-kali watch` is running, a
-# passthrough the operator hasn't touched for `queue_wait_ms` is sent to a safety model (only
-# Bash/PowerShell calls — MCP and WebFetch skip it). A "safe" verdict becomes a proposal that auto-applies as a TIGHT allow rule after
-# `proposal_wait_ms` if still untouched. Anything else (unsafe/malformed/error) just passes
-# through — the model never auto-denies. The key is read from the named env var, never config.
+# passthrough is sent to a safety model (only Bash/PowerShell calls — MCP and WebFetch skip it).
+# The model goes FIRST: `queue_wait_ms` defaults to 0, so it answers immediately and you review
+# a stated opinion during `proposal_wait_ms` rather than pre-empting one that doesn't exist yet.
+# A "safe" verdict auto-applies as a TIGHT allow rule when that window elapses untouched.
+# Anything else (unsafe/malformed/error) just passes through — the model never auto-denies, and
+# acting on a call at any point cancels the model path. The key is read from the named env var,
+# never config.
 # [approval.llm]
 # enabled = true
 # model = "mistralai/mistral-small-3.2-24b-instruct"  # dense non-reasoning 24B; glm-4-32b (eval winner) was delisted
 # api_key_env = "OPENROUTER_API_KEY"
-# queue_wait_ms = 10000             # operator grace before consulting the model
-# proposal_wait_ms = 5000           # operator grace after a proposal before auto-applying
-# timeout_ms = 8000                 # per-attempt; with 2 attempts fits the 50s hook budget
-# max_attempts = 2
+# queue_wait_ms = 0                 # operator grace BEFORE the model; 0 = the model answers first
+# proposal_wait_ms = 5000           # your window to override the model before it auto-applies
+# timeout_ms = 8000                 # per-attempt
+# max_attempts = 1                  # a transient failure escalates to you rather than retrying
+# cache_ttl_ms = 3600000            # reuse a verdict for an identical (tool, command, cwd); 0 disables
+# max_concurrent = 4                # in-flight consults; the excess queues instead of hitting rate limits
 # base_url = "https://openrouter.ai/api/v1/chat/completions"
 # The prompt defaults to the locked taxonomy in code; override here to tune without rebuilding.
 # system = "..."

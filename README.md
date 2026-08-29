@@ -446,20 +446,26 @@ The TUI is strictly opt-in and never a single point of failure:
 
 When the operator is away, lord-kali can ask a safety model to triage **passthrough** calls (the ones no rule had an opinion on) and auto-approve those it is confident are safe. It is opt-in, layered on top of the [central approval TUI](#central-approval-tui), and **only ever auto-approves — it never auto-denies.**
 
+**The model goes first.** `queue_wait_ms` defaults to `0`, so a passthrough reaching the queue is judged immediately and you review a *stated opinion* during `proposal_wait_ms` — instead of being asked to pre-empt an opinion that does not exist yet. The operator still wins at any point.
+
 ```
-hook: passthrough  ──queue──▶  watch shows it as pending
+hook: passthrough  ──queue──▶  watch shows it as pending, marked "consulting model…"
                                    │   (operator can act at any point — this pre-empts the model)
-        no operator action for queue_wait_ms (10s)
+        queue_wait_ms (0s — immediate)
                                    │
         model judges on a background thread (the TUI never blocks)
+        · a cached verdict for an identical (tool, command, cwd) skips the call
+        · at most max_concurrent consults run at once; the rest queue
                                    │
    a "safe" verdict ──▶ proposal shown ──▶ no action for proposal_wait_ms (5s) ──▶ auto-apply:
-                                   │                                                  write allow verdict,
+                                   │       with a live countdown on the row              write allow verdict,
    anything else ──────────────────┘                                                 persist a TIGHT allow rule,
    (unsafe · malformed · error · non-shell tool)                                     log `llm_auto_approve`
                                    │
-        passthrough (today's fallback — Claude Code's own prompt)
+        passthrough (fallback — Claude Code's own prompt)
 ```
+
+Whatever you press then writes an `operator_commit` record carrying both your lane assignments and the model's standing verdict — the two are observable together only there, and their disagreement is what tunes the prompt (see [Mining your own decisions](#mining-your-own-decisions)).
 
 ### Prerequisites
 
@@ -486,10 +492,12 @@ Defaults cover everything else: the key is read from `OPENROUTER_API_KEY`, the e
 | `model` | string | `mistralai/mistral-small-3.2-24b-instruct` | Model id. Dense, non-reasoning 24B chosen after the eval winner `glm-4-32b` was delisted and the GLM family went reasoning-only; re-run the sweeps to formally re-lock. |
 | `base_url` | string | OpenRouter chat-completions URL | Any OpenAI-compatible endpoint (point it at a local server). |
 | `api_key_env` | string | `OPENROUTER_API_KEY` | Env var the watch reads the key from — the key never lives in config. |
-| `queue_wait_ms` | u64 | `10000` | Operator grace before the model is consulted. |
-| `proposal_wait_ms` | u64 | `5000` | Operator grace after a proposal before auto-applying. |
+| `queue_wait_ms` | u64 | `0` | Operator grace *before* the model is consulted. `0` means the model answers first. |
+| `proposal_wait_ms` | u64 | `5000` | Your window to override the model's proposal before it auto-applies. |
 | `timeout_ms` | u64 | `8000` | Per-attempt request timeout. |
-| `max_attempts` | u32 | `2` | Total attempts; only transient errors (timeout / 429 / 5xx) retry. |
+| `max_attempts` | u32 | `2` | Total attempts; only transient errors (timeout / 429 / 5xx) retry. Set `1` to escalate to the operator instead of retrying on the hot path. |
+| `cache_ttl_ms` | u64 | `3600000` | How long a verdict is reused for an identical `(tool, command, cwd)`. With the model on every passthrough and several sessions sharing one watch, the same command recurs constantly. `0` disables the cache. |
+| `max_concurrent` | usize | `4` | Ceiling on in-flight consults; the excess waits. Bursts from parallel sessions would otherwise become rate-limit errors — and a rate-limit error is a passthrough, so the gate would weaken exactly when it is busiest. |
 | `system` | string | locked taxonomy | System-prompt override. |
 | `user` | string | `tool: {{tool}}\ncwd: {{cwd}}\ncommand: {{command}}` | User-template override. |
 | `tools` | array | `["Bash", "PowerShell"]` | Which tools the model may judge. The model is a shell-command gate, so file/MCP/WebFetch calls are excluded — they ride the operator/timeout path and can be triaged in the TUI. |
@@ -505,15 +513,38 @@ system = "You are a shell-command safety gate. Decide if this command is safe to
 user = "tool: {{tool}}\ncwd: {{cwd}}\ncommand: {{command}}"
 ```
 
-### Timing and the 50s budget
+### Timing and the budget
 
-The whole exchange must finish inside Claude Code's hook timeout — lord-kali self-times-out at `self_timeout_ms` (default 50s, see [`[approval]`](#central-approval-tui)). The model's slice is bounded by `timeout_ms × max_attempts` and sits between the two operator-grace windows, so keep:
+The whole exchange must finish inside lord-kali's own `self_timeout_ms` (default 50s, see [`[approval]`](#central-approval-tui)), which is set below Claude Code's hook timeout so lord-kali's fallback fires first. The model's slice is bounded by `timeout_ms × max_attempts`, so keep:
 
 ```
 queue_wait_ms + (timeout_ms × max_attempts) + proposal_wait_ms  <  ~45000
 ```
 
-The defaults leave headroom: `10000 + (8000 × 2) + 5000 = 31000 ms`. Raise the timeout or the waits and you eat into it — a model that routinely answers slower than `timeout_ms` will simply time out and pass through.
+With the model going first the defaults leave a wide margin: `0 + (8000 × 2) + 5000 = 21000 ms`, and `max_attempts = 1` halves the model's slice again. Raise the timeout or the waits and you eat into it — a model that routinely answers slower than `timeout_ms` will simply time out and pass through.
+
+### Mining your own decisions
+
+Every commit in the TUI writes an `operator_commit` record holding your lane assignments *and* the model's standing verdict. Four cells fall out of it, and they are the signal for tuning the prompt:
+
+| model said | you did | meaning |
+|---|---|---|
+| safe | allowed (or let it auto-apply) | agreement — the prompt is working |
+| **safe** | **denied / asked** | **false-safe — the expensive error class** |
+| unsafe | allowed | over-caution — the source of unnecessary prompts |
+| unsafe | denied / skipped | agreement |
+
+`lord-kali eval --from-log` turns those records into a labelled case file in the format [`--cases`](#safety-model-evaluation-experimental) already consumes — real traffic, labelled by the person whose judgement the gate exists to reproduce:
+
+```sh
+lord-kali eval --from-log                                  # → eval/cases/observed.jsonl
+lord-kali eval --from-log --log /path/to.jsonl --out my-cases.jsonl
+lord-kali eval --cases eval/cases/observed.jsonl --env-file .env   # then sweep prompts against it
+```
+
+It reports how often the model agreed, how often you overrode it, and how many commits had no model verdict yet. A repeated command contributes one case (latest wins) rather than skewing the score by its frequency, and a `skip` commit is excluded — "not deciding this here" is neither agreement nor override, so it is not a label. Only tools the model may judge (`--tools`, default `Bash,PowerShell`) are mined.
+
+Then adopt the winning prompt into `[approval.llm] system`, which lives in config precisely so it can be tuned without rebuilding.
 
 ### Endpoint and local models
 

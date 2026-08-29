@@ -481,6 +481,10 @@ mod tui {
         ctrl_c_armed: bool,
         // Set to the model name when LLM auto-approval is live, for the footer indicator.
         llm_status: Option<String>,
+        // Per-request one-line model status, keyed by request id, so the approval zone can say
+        // where the model got to. The AutoApprover owns the state machine; this is its
+        // rendering projection, which keeps `ui` a pure function of `App`.
+        llm_labels: HashMap<String, String>,
     }
 
     impl App {
@@ -493,6 +497,7 @@ mod tui {
                 should_quit: false,
                 ctrl_c_armed: false,
                 llm_status: None,
+                llm_labels: HashMap::new(),
             }
         }
 
@@ -703,6 +708,7 @@ mod tui {
     // The fields a worker needs, pulled out so spawning doesn't borrow the pending list.
     struct SpawnReq {
         id: String,
+        key: String,
         target: String,
         tool: String,
         cwd: Option<String>,
@@ -721,6 +727,29 @@ mod tui {
         tx: Sender<(String, LlmReport)>,
         rx: Receiver<(String, LlmReport)>,
         state: HashMap<String, LlmPhase>,
+        // Verdicts reusable for an identical (tool, command, cwd) until `cache_ttl_ms` old.
+        // With the model consulted on every passthrough and several sessions sharing one
+        // watch, the same command recurs constantly.
+        cache: HashMap<String, CachedVerdict>,
+        // Request id -> cache key, so an arriving worker result knows which entry to fill.
+        keys: HashMap<String, String>,
+        cache_ttl_ms: u64,
+        // Consults currently on a worker thread, capped at `max_concurrent`; the excess waits
+        // for a later tick rather than piling onto a rate-limited endpoint.
+        in_flight: usize,
+        max_concurrent: usize,
+    }
+
+    struct CachedVerdict {
+        at_ms: u64,
+        kind: &'static str,
+        reason: Option<String>,
+    }
+
+    // Identity of a consult for cache purposes. The model is given exactly the tool, cwd and
+    // command, so two calls agreeing on all three cannot receive a different verdict.
+    fn cache_key(tool: &str, target: &str, cwd: Option<&str>) -> String {
+        format!("{tool}\u{1f}{}\u{1f}{target}", cwd.unwrap_or(""))
     }
 
     impl AutoApprover {
@@ -764,10 +793,27 @@ mod tui {
                 tx,
                 rx,
                 state: HashMap::new(),
+                cache: HashMap::new(),
+                keys: HashMap::new(),
+                cache_ttl_ms: llm.cache_ttl_ms,
+                in_flight: 0,
+                max_concurrent: llm.max_concurrent,
             })
         }
 
-        fn spawn(&self, s: &SpawnReq) {
+        // A cached verdict for this exact call, if one is still within its TTL. A zero TTL
+        // disables the cache outright.
+        fn cached(&self, key: &str, now: u64) -> Option<&CachedVerdict> {
+            if self.cache_ttl_ms == 0 {
+                return None;
+            }
+            self.cache
+                .get(key)
+                .filter(|c| now.saturating_sub(c.at_ms) < self.cache_ttl_ms)
+        }
+
+        fn spawn(&mut self, s: &SpawnReq) {
+            self.in_flight += 1;
             let rendered = self.prompt.render(&PromptVars {
                 command: &s.target,
                 tool: &s.tool,
@@ -829,6 +875,17 @@ mod tui {
             let mut changed = false;
             while let Ok((id, rep)) = self.rx.try_recv() {
                 changed = true;
+                self.in_flight = self.in_flight.saturating_sub(1);
+                if let Some(key) = self.keys.remove(&id) {
+                    self.cache.insert(
+                        key,
+                        CachedVerdict {
+                            at_ms: now,
+                            kind: rep.kind,
+                            reason: rep.reason.clone(),
+                        },
+                    );
+                }
                 let proposable = rep.kind == "safe";
                 let note = if proposable {
                     format!(
@@ -877,20 +934,33 @@ mod tui {
             let live: std::collections::HashSet<String> =
                 app.pending.iter().map(|p| p.request.id.clone()).collect();
             self.state.retain(|id, _| live.contains(id));
+            self.keys.retain(|id, _| live.contains(id));
 
             let mut to_spawn: Vec<SpawnReq> = Vec::new();
+            let mut to_reuse: Vec<(String, String, &'static str, Option<String>)> = Vec::new();
             let mut to_apply: Vec<usize> = Vec::new();
             for (i, p) in app.pending.iter().enumerate() {
                 match self.state.get(&p.request.id) {
                     None if self.llm_eligible(&p.request.tool)
                         && now.saturating_sub(p.request.ts_ms) >= self.queue_wait_ms =>
                     {
-                        to_spawn.push(SpawnReq {
-                            id: p.request.id.clone(),
-                            target: p.request.target.clone(),
-                            tool: p.request.tool.clone(),
-                            cwd: p.request.cwd.clone(),
-                        });
+                        let key =
+                            cache_key(&p.request.tool, &p.request.target, p.request.cwd.as_deref());
+                        match self.cached(&key, now) {
+                            Some(c) => to_reuse.push((
+                                p.request.id.clone(),
+                                p.request.target.clone(),
+                                c.kind,
+                                c.reason.clone(),
+                            )),
+                            None => to_spawn.push(SpawnReq {
+                                id: p.request.id.clone(),
+                                key,
+                                target: p.request.target.clone(),
+                                tool: p.request.tool.clone(),
+                                cwd: p.request.cwd.clone(),
+                            }),
+                        }
                     }
                     Some(LlmPhase::Proposed { at_ms, .. })
                         if now.saturating_sub(*at_ms) >= self.proposal_wait_ms =>
@@ -901,7 +971,56 @@ mod tui {
                 }
             }
 
-            changed |= !to_spawn.is_empty();
+            // A cached verdict resolves without a call, but is still announced — a decision
+            // that happens silently is a decision the operator cannot audit.
+            changed |= !to_reuse.is_empty();
+            for (id, target, kind, reason) in to_reuse {
+                let note = if kind == "safe" {
+                    self.state.insert(
+                        id.clone(),
+                        LlmPhase::Proposed {
+                            reason: reason.clone().unwrap_or_default(),
+                            at_ms: now,
+                        },
+                    );
+                    format!(
+                        "model (cached): SAFE — {} · auto-approve in {}s unless you act",
+                        reason.as_deref().unwrap_or(""),
+                        self.proposal_wait_ms / 1000
+                    )
+                } else {
+                    self.state.insert(id.clone(), LlmPhase::Declined);
+                    format!("model (cached): {kind} · passthrough")
+                };
+                push_capped(&mut app.llm_stream, stream_note(&note), LLM_STREAM_CAP);
+                log_event(
+                    log_path,
+                    "llm_cache_hit",
+                    serde_json::json!({
+                        "id": id,
+                        "model": self.cfg.model,
+                        "target": target,
+                        "verdict": kind,
+                        "reason": reason,
+                    }),
+                );
+            }
+
+            // Spawn up to the concurrency ceiling; the remainder is reconsidered next tick.
+            let slots = self.max_concurrent.saturating_sub(self.in_flight);
+            let deferred = to_spawn.len().saturating_sub(slots);
+            to_spawn.truncate(slots);
+            if deferred > 0 {
+                push_capped(
+                    &mut app.llm_stream,
+                    stream_note(&format!(
+                        "{deferred} consult(s) queued — {} in flight (max {})",
+                        self.in_flight, self.max_concurrent
+                    )),
+                    LLM_STREAM_CAP,
+                );
+            }
+            changed |= !to_spawn.is_empty() || deferred > 0;
             for s in &to_spawn {
                 self.spawn(s);
                 log_event(
@@ -921,6 +1040,7 @@ mod tui {
                     LLM_STREAM_CAP,
                 );
                 self.state.insert(s.id.clone(), LlmPhase::Requested);
+                self.keys.insert(s.id.clone(), s.key.clone());
             }
 
             // Apply highest index first so earlier removals don't shift later indices.
@@ -974,8 +1094,114 @@ mod tui {
             if app.focus >= app.pending.len() {
                 app.focus = app.pending.len().saturating_sub(1);
             }
+            self.project_labels(app, now);
             changed
         }
+
+        // Refresh the per-request model status the approval zone renders. With the model going
+        // first, a pending call is almost always mid-consult when the operator looks at it, and
+        // a row that says nothing reads as "yours to decide" when it is not yet.
+        fn project_labels(&self, app: &mut App, now: u64) {
+            app.llm_labels.clear();
+            for p in &app.pending {
+                if !self.llm_eligible(&p.request.tool) {
+                    continue;
+                }
+                let label = match self.state.get(&p.request.id) {
+                    Some(LlmPhase::Requested) => "consulting model…".to_string(),
+                    Some(LlmPhase::Proposed { reason, at_ms }) => {
+                        let left = self
+                            .proposal_wait_ms
+                            .saturating_sub(now.saturating_sub(*at_ms));
+                        format!(
+                            "model: SAFE — {reason} · auto-approves in {}.{}s",
+                            left / 1000,
+                            (left % 1000) / 100
+                        )
+                    }
+                    Some(LlmPhase::Declined) => {
+                        "model: not safe to auto-approve · yours to decide".to_string()
+                    }
+                    None => "queued for the model…".to_string(),
+                };
+                app.llm_labels.insert(p.request.id.clone(), label);
+            }
+        }
+    }
+
+    // The commit kind a key represents, or None for keys that don't resolve a call.
+    fn commit_label(key: &Key) -> Option<&'static str> {
+        match key {
+            Key::Commit(CommitMode::Always) => Some("always"),
+            Key::Commit(CommitMode::Once) => Some("once"),
+            Key::SkipCall => Some("skip"),
+            _ => None,
+        }
+    }
+
+    // Record what the operator decided, alongside the model's standing opinion. This is the
+    // only place the two are observable together, and their disagreement is what tunes the
+    // prompt (docs/B-ai-first-gating.md §B6) — without it, an override leaves no trace at all.
+    fn log_operator_commit(
+        log_path: &Path,
+        app: &App,
+        mode: &'static str,
+        auto: Option<&AutoApprover>,
+    ) {
+        let Some(p) = app.focused() else {
+            return;
+        };
+        let lanes: Vec<serde_json::Value> = p
+            .request
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| {
+                let rung = p.selected_rung(i);
+                serde_json::json!({
+                    "node": n.command,
+                    "args": n.args,
+                    "shell": n.shell,
+                    "lane": match p.choices[i] {
+                        Choice::Allow => "allow",
+                        Choice::Ask => "ask",
+                        Choice::Deny => "deny",
+                    },
+                    "scope_rung": p.scope_idx[i],
+                    "rule_target": rung.target,
+                    "rule_args": rung.args,
+                })
+            })
+            .collect();
+        // Present only when the model had reached a verdict on this call; absent means the
+        // operator acted before the model answered, which is not a disagreement.
+        let llm = auto.and_then(|a| match a.state.get(&p.request.id) {
+            Some(LlmPhase::Proposed { reason, .. }) => Some(serde_json::json!({
+                "model": a.cfg.model,
+                "verdict": "safe",
+                "reason": reason,
+                "phase": "proposed",
+            })),
+            Some(LlmPhase::Declined) => Some(serde_json::json!({
+                "model": a.cfg.model,
+                "verdict": "not_safe",
+                "phase": "declined",
+            })),
+            _ => None,
+        });
+        log_event(
+            log_path,
+            "operator_commit",
+            serde_json::json!({
+                "id": p.request.id,
+                "tool_name": p.request.tool,
+                "target": p.request.target,
+                "cwd": p.request.cwd,
+                "mode": mode,
+                "lanes": lanes,
+                "lk_llm": llm,
+            }),
+        );
     }
 
     // A dim stream line for model activity, distinct from the gate-decision stream lines.
@@ -1035,6 +1261,9 @@ mod tui {
                 (*c as u8).hash(&mut h);
             }
             p.scope_idx.hash(&mut h);
+            // The model status carries a live countdown, so it must drive redraws — but only
+            // while something is actually pending, which is exactly when the operator is looking.
+            app.llm_labels.get(&p.request.id).hash(&mut h);
         }
         h.finish()
     }
@@ -1142,12 +1371,17 @@ mod tui {
                         continue;
                     }
                     app.ctrl_c_armed = false;
-                    if let Some((verdict, live)) = apply_key(app, map_key(k.code)) {
+                    let key = map_key(k.code);
+                    let commit_mode = commit_label(&key);
+                    if let Some((verdict, live)) = apply_key(app, key) {
                         let vpath = qdir.join(format!("{}.verdict.json", verdict.id));
                         if let Ok(j) = serde_json::to_string(&verdict) {
                             let _ = write_atomic(&vpath, &j);
                         }
                         let _ = append_rules(live_path, &live);
+                        if let Some(mode) = commit_mode {
+                            log_operator_commit(log_path, app, mode, auto.as_ref());
+                        }
                         if app.focus < app.pending.len() {
                             app.pending.remove(app.focus);
                         }
@@ -1275,7 +1509,7 @@ mod tui {
         };
 
         let [header, cols] =
-            Layout::vertical([Constraint::Length(3), Constraint::Min(1)]).areas(area);
+            Layout::vertical([Constraint::Length(4), Constraint::Min(1)]).areas(area);
 
         let mut head = vec![Line::from(vec![
             Span::styled(
@@ -1296,6 +1530,16 @@ mod tui {
                 .unwrap_or_default(),
             Style::new().fg(Color::DarkGray),
         )));
+        if let Some(label) = app.llm_labels.get(&p.request.id) {
+            head.push(Line::from(Span::styled(
+                label.clone(),
+                Style::new().fg(if label.contains("SAFE") {
+                    Color::Green
+                } else {
+                    Color::Magenta
+                }),
+            )));
+        }
         // What an *-always commit would persist for the focused node at its selected ladder
         // rung, so the operator sees the exact rule before pressing a/d.
         if let Some(fnode) = p.request.nodes.get(p.cursor) {
@@ -1737,6 +1981,177 @@ mod tui {
             // also exercise the idle (no-pending) layout
             let idle = App::new();
             terminal.draw(|f| ui(f, &idle)).unwrap();
+        }
+
+        // ---- AI-first (docs/B-ai-first-gating.md) ----------------------------------------
+
+        fn approver(cache_ttl_ms: u64, max_concurrent: usize) -> AutoApprover {
+            let (tx, rx) = channel();
+            AutoApprover {
+                cfg: LlmConfig {
+                    model: "test-model".into(),
+                    base_url: "http://localhost/never-called".into(),
+                    api_key: "k".into(),
+                    timeout_ms: 1,
+                    max_attempts: 1,
+                    backoff_ms: 1,
+                },
+                prompt: PromptTemplate {
+                    name: "t".into(),
+                    system: "s".into(),
+                    user: "u".into(),
+                },
+                queue_wait_ms: 0,
+                proposal_wait_ms: 5_000,
+                tools: vec!["Bash".into()],
+                tx,
+                rx,
+                state: HashMap::new(),
+                cache: HashMap::new(),
+                keys: HashMap::new(),
+                cache_ttl_ms,
+                in_flight: 0,
+                max_concurrent,
+            }
+        }
+
+        fn cached(kind: &'static str, at_ms: u64) -> CachedVerdict {
+            CachedVerdict {
+                at_ms,
+                kind,
+                reason: Some("fine".into()),
+            }
+        }
+
+        #[test]
+        fn cache_key_separates_tool_cwd_and_command() {
+            let a = cache_key("Bash", "ls", Some("/p"));
+            assert_ne!(a, cache_key("PowerShell", "ls", Some("/p")));
+            assert_ne!(a, cache_key("Bash", "ls -l", Some("/p")));
+            assert_ne!(a, cache_key("Bash", "ls", Some("/other")));
+            assert_eq!(a, cache_key("Bash", "ls", Some("/p")));
+        }
+
+        // A key must not be forgeable by a command that embeds the separator.
+        #[test]
+        fn cache_key_fields_cannot_collide() {
+            assert_ne!(
+                cache_key("Bash", "b", Some("a")),
+                cache_key("Bash", "", Some("a\u{1f}b"))
+            );
+        }
+
+        #[test]
+        fn cache_expires_at_ttl_and_zero_ttl_disables() {
+            let mut a = approver(1_000, 4);
+            a.cache.insert("k".into(), cached("safe", 0));
+            assert!(a.cached("k", 999).is_some(), "inside the window");
+            assert!(a.cached("k", 1_000).is_none(), "at the window edge");
+
+            let mut off = approver(0, 4);
+            off.cache.insert("k".into(), cached("safe", 0));
+            assert!(off.cached("k", 0).is_none(), "ttl 0 disables the cache");
+        }
+
+        // The whole point of queue_wait_ms = 0: a request is eligible the moment it lands.
+        #[test]
+        fn zero_queue_wait_makes_a_fresh_request_eligible_immediately() {
+            let a = approver(0, 4);
+            assert_eq!(a.queue_wait_ms, 0);
+            let p = Pending::new(req(), &ApprovalConfig::default());
+            assert!(a.llm_eligible(&p.request.tool));
+            assert_eq!(0u64.saturating_sub(p.request.ts_ms), 0);
+        }
+
+        #[test]
+        fn labels_report_each_phase_and_skip_ineligible_tools() {
+            let mut a = approver(0, 4);
+            let mut app = pending_app();
+            let id = app.pending[0].request.id.clone();
+
+            a.state.insert(id.clone(), LlmPhase::Requested);
+            a.project_labels(&mut app, 0);
+            assert_eq!(app.llm_labels.get(&id).unwrap(), "consulting model…");
+
+            a.state.insert(
+                id.clone(),
+                LlmPhase::Proposed {
+                    reason: "read-only".into(),
+                    at_ms: 0,
+                },
+            );
+            a.project_labels(&mut app, 2_000);
+            let l = app.llm_labels.get(&id).unwrap();
+            assert!(l.contains("SAFE"), "{l}");
+            assert!(l.contains("read-only"), "{l}");
+            assert!(
+                l.contains("3.0s"),
+                "countdown should show the remaining window: {l}"
+            );
+
+            a.state.insert(id.clone(), LlmPhase::Declined);
+            a.project_labels(&mut app, 0);
+            assert!(app.llm_labels.get(&id).unwrap().contains("yours to decide"));
+
+            // A tool the model may not judge gets no label at all, rather than a misleading one.
+            a.tools.clear();
+            a.project_labels(&mut app, 0);
+            assert!(app.llm_labels.is_empty());
+        }
+
+        #[test]
+        fn commit_label_names_only_resolving_keys() {
+            assert_eq!(
+                commit_label(&Key::Commit(CommitMode::Always)),
+                Some("always")
+            );
+            assert_eq!(commit_label(&Key::Commit(CommitMode::Once)), Some("once"));
+            assert_eq!(commit_label(&Key::SkipCall), Some("skip"));
+            assert_eq!(commit_label(&Key::Right), None);
+            assert_eq!(commit_label(&Key::Quit), None);
+        }
+
+        // The disagreement signal: the operator's lanes and the model's standing verdict must
+        // land in one record, or an override leaves no trace (docs/B-ai-first-gating.md §B6).
+        #[test]
+        fn operator_commit_records_lanes_and_model_verdict() {
+            let tmp = tempfile::tempdir().unwrap();
+            let log = tmp.path().join("hook.jsonl");
+            let mut a = approver(0, 4);
+            let mut app = pending_app();
+            let id = app.pending[0].request.id.clone();
+            a.state.insert(
+                id.clone(),
+                LlmPhase::Proposed {
+                    reason: "read-only".into(),
+                    at_ms: 0,
+                },
+            );
+            apply_key(&mut app, Key::Right); // move node 0 into ASK — an override of "safe"
+            log_operator_commit(&log, &app, "always", Some(&a));
+
+            let line = std::fs::read_to_string(&log).unwrap();
+            let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+            assert_eq!(v["lk_event"], "operator_commit");
+            assert_eq!(v["mode"], "always");
+            assert_eq!(v["lanes"][0]["lane"], "ask");
+            assert_eq!(v["lanes"][1]["lane"], "allow");
+            assert_eq!(v["lanes"][0]["node"], "gh");
+            assert_eq!(v["lk_llm"]["verdict"], "safe");
+            assert_eq!(v["lk_llm"]["reason"], "read-only");
+        }
+
+        // Acting before the model answers is not a disagreement, so no verdict is attributed.
+        #[test]
+        fn operator_commit_omits_model_when_it_had_not_answered() {
+            let tmp = tempfile::tempdir().unwrap();
+            let log = tmp.path().join("hook.jsonl");
+            let a = approver(0, 4);
+            let app = pending_app();
+            log_operator_commit(&log, &app, "once", Some(&a));
+            let v: serde_json::Value =
+                serde_json::from_str(std::fs::read_to_string(&log).unwrap().trim()).unwrap();
+            assert!(v["lk_llm"].is_null());
         }
     }
 }
