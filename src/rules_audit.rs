@@ -128,6 +128,21 @@ impl Rule {
 // A block holds exactly one rule; whichever table it landed in is the table it belongs to.
 // Anything else — a `[[group]]`, a table this audit does not know, an unparseable block, a
 // decision string the loader would reject — yields None and is kept untouched.
+// Provenance as recorded by `live_rules::RuleSource::reason`. Rules written before A7 carry
+// a bare "approval-tui" and are reported as unattributed rather than guessed at.
+fn source_of_block(text: &str) -> Option<&'static str> {
+    let reason = text
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("reason = "))?
+        .trim()
+        .trim_matches('"');
+    match reason {
+        r if r.starts_with("approval-tui: operator") => Some("operator"),
+        r if r.starts_with("approval-tui: llm") => Some("llm"),
+        _ => None,
+    }
+}
+
 fn rule_from_block(text: &str) -> Option<Rule> {
     let raw: RawConfig = toml::from_str(text).ok()?;
     let found = [
@@ -684,6 +699,9 @@ struct Row {
     target: String,
     args: Option<String>,
     verdict: Verdict,
+    // Who wrote the rule, read back from its `reason` line (A7). `None` for the rules that
+    // predate provenance, which is most of an existing file.
+    source: Option<&'static str>,
 }
 
 impl Row {
@@ -796,6 +814,7 @@ pub(crate) fn run(opts: &Options) -> Result<Report, String> {
                 verdict: Verdict::Unanalysable {
                     why: "not a rule table this audit understands".to_string(),
                 },
+                source: source_of_block(&text),
             });
             continue;
         };
@@ -805,6 +824,7 @@ pub(crate) fn run(opts: &Options) -> Result<Report, String> {
             target: rule.target.clone(),
             args: rule.args.clone(),
             verdict: Verdict::Live,
+            source: source_of_block(&text),
         };
 
         let Some(witness) = witness_for(&rule) else {
@@ -1075,6 +1095,23 @@ pub(crate) fn render(report: &Report) -> String {
         report.count(|v| matches!(v, Verdict::Subsumed { .. })),
         report.count(|v| matches!(v, Verdict::Cold)),
         report.count(|v| matches!(v, Verdict::Unanalysable { .. })),
+    ));
+
+    // Who wrote the rules that are not pulling their weight. A model that auto-approves a
+    // burst of one-offs and an operator who deliberately whitelisted something are different
+    // problems, and until A7 they were indistinguishable on disk.
+    let not_live = |want: &str| {
+        report
+            .rows
+            .iter()
+            .filter(|r| r.source == Some(want) && !matches!(r.verdict, Verdict::Live))
+            .count()
+    };
+    out.push_str(&format!(
+        "not live, by source: operator {} · model {} · unattributed {} (written before provenance was recorded)\n",
+        not_live("operator"),
+        not_live("llm"),
+        report.rows.iter().filter(|r| r.source.is_none()).count(),
     ));
 
     if report.removed() == 0 {

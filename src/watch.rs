@@ -303,7 +303,7 @@ mod tui {
     use super::{event_target, unmatched_nodes, Tailer, PRUNE_INTERVAL_MS};
     use crate::config::{load_config, ApprovalConfig, ApprovalLlmConfig, Config};
     use crate::decision::Decision;
-    use crate::live_rules::{append_rules, live_rules_path, LiveRule};
+    use crate::live_rules::{append_rules, live_rules_path, LiveRule, RuleSource};
     use crate::llm::{
         judge, parse_judgement, LlmConfig, PromptTemplate, PromptVars, Verdict as LlmVerdict,
         DEFAULT_BACKOFF_MS, DEFAULT_SYSTEM_PROMPT, DEFAULT_USER_TEMPLATE,
@@ -564,6 +564,9 @@ mod tui {
                     target: rung.target,
                     args: rung.args,
                     allow: choice == Choice::Allow,
+                    // Every commit here is the operator's. The auto-approver re-stamps its
+                    // own before persisting, so the two are never confused on disk.
+                    source: RuleSource::Operator,
                     projects: match p.project_scoped[i] {
                         true => p.project_root().into_iter().collect(),
                         false => Vec::new(),
@@ -1115,7 +1118,10 @@ mod tui {
                 p.choices = vec![Choice::Allow; p.request.nodes.len()];
                 // Auto-approval persists the tightest rung (index 0) — the path/arg-specific rule.
                 p.scope_idx = vec![0; p.request.nodes.len()];
-                let (verdict, live_rules) = build_verdict(p, CommitMode::Always);
+                let (verdict, mut live_rules) = build_verdict(p, CommitMode::Always);
+                for r in live_rules.iter_mut() {
+                    r.source = RuleSource::Llm(self.cfg.model.clone());
+                }
 
                 let vpath = qdir.join(format!("{}.verdict.json", verdict.id));
                 if let Ok(j) = serde_json::to_string(&verdict) {

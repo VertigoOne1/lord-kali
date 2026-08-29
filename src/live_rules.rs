@@ -17,9 +17,30 @@ pub(crate) struct LiveRule {
     // None means command-wide (any args) — used when the node had no arguments.
     pub(crate) args: Option<String>,
     pub(crate) allow: bool,
+    // Who decided this rule. Persisted so an audit can tell a rule you approved from one the
+    // model auto-applied — they carry different weight when deciding what to keep.
+    pub(crate) source: RuleSource,
     // Directories this rule is confined to. Empty means global. This is what makes a broad
     // args pattern acceptable: broad in what it matches, narrow in where it applies.
     pub(crate) projects: Vec<String>,
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub(crate) enum RuleSource {
+    Operator,
+    // The model that judged it. Named, because "which model approved this" is the question
+    // asked when a model is swapped out.
+    Llm(String),
+}
+
+impl RuleSource {
+    // Goes into `reason`, which is also what Claude Code shows when the rule denies a call.
+    fn reason(&self) -> String {
+        match self {
+            RuleSource::Operator => "approval-tui: operator".to_string(),
+            RuleSource::Llm(model) => format!("approval-tui: llm {model}"),
+        }
+    }
 }
 
 pub(crate) fn live_rules_path(approval: &ApprovalConfig) -> PathBuf {
@@ -53,10 +74,22 @@ fn render_rule(r: &LiveRule) -> String {
         );
         block.push_str(&format!("projects = {list}\n"));
     }
-    block.push_str(&format!(
-        "decision = \"{decision}\"\nreason = \"approval-tui\"\n"
-    ));
+    // The reason is deliberately the LAST line, because `identity_of` cuts it off when
+    // comparing rules: a rule that gains provenance must still be recognised as the one
+    // already on disk, or every re-approval would append a near-duplicate.
+    block.push_str(&format!("decision = \"{decision}\"\n"));
+    let reason = toml::Value::String(r.source.reason()).to_string();
+    block.push_str(&format!("reason = {reason}\n"));
     block
+}
+
+// A rule's identity: everything except who wrote it and why. Two rules that gate the same
+// call the same way are the same rule.
+fn identity_of(block: &str) -> &str {
+    match block.find("\nreason = ") {
+        Some(i) => &block[..i],
+        None => block,
+    }
 }
 
 // Append entries to the live file (read-modify-write atomically). Existing rules are
@@ -70,7 +103,7 @@ pub(crate) fn append_rules(path: &Path, rules: &[LiveRule]) -> std::io::Result<(
     let mut changed = false;
     for r in rules {
         let block = render_rule(r);
-        if content.contains(block.trim_start()) {
+        if content.contains(identity_of(block.trim_start())) {
             continue;
         }
         if !content.is_empty() && !content.ends_with('\n') {
@@ -104,6 +137,7 @@ mod tests {
             target: target.into(),
             args: args.map(String::from),
             allow,
+            source: RuleSource::Operator,
             projects: Vec::new(),
         }
     }
@@ -163,6 +197,83 @@ mod tests {
         );
     }
 
+    // ---- A7: provenance -----------------------------------------------------------------
+
+    #[test]
+    fn the_reason_records_who_decided_the_rule() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("99-live.toml");
+        let mut operator = bash("gh", None, true);
+        let mut model = bash("jq", None, true);
+        operator.source = RuleSource::Operator;
+        model.source = RuleSource::Llm("mistralai/mistral-small".into());
+        append_rules(&path, &[operator, model]).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains(r#"reason = "approval-tui: operator""#),
+            "{content}"
+        );
+        assert!(
+            content.contains(r#"reason = "approval-tui: llm mistralai/mistral-small""#),
+            "{content}"
+        );
+        // Provenance is metadata, not policy — the rules must still gate identically.
+        let config = load(&path);
+        assert_eq!(
+            handle_bash(&config.bash, None, "gh pr list").map(|(d, _)| d),
+            Some(Decision::Allow)
+        );
+    }
+
+    // The whole file predates provenance, so an existing rule must be recognised as the same
+    // rule rather than appended again with a longer reason line.
+    #[test]
+    fn a_rule_already_on_disk_without_provenance_is_not_duplicated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("99-live.toml");
+        std::fs::write(
+            &path,
+            "\n[[bash.rules]]\ncommand = \"git\"\nargs = \"push{, **}\"\n\
+             decision = \"allow\"\nreason = \"approval-tui\"\n",
+        )
+        .unwrap();
+
+        append_rules(&path, &[bash("git", Some("push{, **}"), true)]).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            content.matches("[[bash.rules]]").count(),
+            1,
+            "the pre-provenance rule is the same rule: {content}"
+        );
+    }
+
+    // Two rules differing only in who approved them are still one rule.
+    #[test]
+    fn provenance_alone_does_not_make_a_new_rule() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("99-live.toml");
+        let mut by_model = bash("gh", None, true);
+        by_model.source = RuleSource::Llm("m".into());
+        append_rules(&path, &[bash("gh", None, true)]).unwrap();
+        append_rules(&path, &[by_model]).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content.matches("[[bash.rules]]").count(), 1, "{content}");
+    }
+
+    // ...but a genuine difference still appends.
+    #[test]
+    fn a_different_decision_is_a_different_rule() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("99-live.toml");
+        append_rules(&path, &[bash("gh", None, true)]).unwrap();
+        append_rules(&path, &[bash("gh", None, false)]).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content.matches("[[bash.rules]]").count(), 2, "{content}");
+    }
+
     #[test]
     fn identical_rule_is_not_duplicated() {
         let tmp = tempfile::tempdir().unwrap();
@@ -184,6 +295,7 @@ mod tests {
             &path,
             &[LiveRule {
                 projects: Vec::new(),
+                source: RuleSource::Operator,
                 shell: "web-search".into(),
                 target: "**".into(),
                 args: None,
@@ -209,6 +321,7 @@ mod tests {
             &path,
             &[LiveRule {
                 projects: Vec::new(),
+                source: RuleSource::Operator,
                 shell: "web-fetch".into(),
                 target: "https://docs.n8n.io{,/**}".into(),
                 args: None,
@@ -245,6 +358,7 @@ mod tests {
             &path,
             &[LiveRule {
                 projects: Vec::new(),
+                source: RuleSource::Operator,
                 shell: "web-fetch".into(),
                 target: "https://docs.rs/tokio".into(),
                 args: None,
@@ -270,6 +384,7 @@ mod tests {
             &path,
             &[LiveRule {
                 projects: Vec::new(),
+                source: RuleSource::Operator,
                 shell: "file".into(),
                 target: "/home/u/proj/**".into(),
                 args: None,
@@ -312,6 +427,7 @@ mod tests {
             &path,
             &[LiveRule {
                 projects: Vec::new(),
+                source: RuleSource::Operator,
                 shell: "mcp".into(),
                 target: "mcp__playwright__browser_fill_form".into(),
                 args: None,
