@@ -38,7 +38,8 @@ Then point your Claude Code hook at the binary in `~/.claude/settings.json` or `
         "hooks": [
           {
             "type": "command",
-            "command": "$HOME/.local/bin/lord-kali"
+            "command": "$HOME/.local/bin/lord-kali",
+            "async": true
           }
         ]
       }
@@ -47,7 +48,29 @@ Then point your Claude Code hook at the binary in `~/.claude/settings.json` or `
 }
 ```
 
-The `PreToolUse` entry is what does the gating. The `PostToolUse` entry is optional and only used for logging — it lets the log capture what actually ran after a call was allowed or approved (see [Logging](#logging)). Omit it if you only want the gate.
+The `PreToolUse` entry is what does the gating. Everything else is optional.
+
+### Full hook coverage
+
+lord-kali handles ten of Claude Code's hook events. Register the ones you want; each is `"matcher": "*"` pointing at the same binary, which dispatches on the event name.
+
+| event | role | notes |
+|---|---|---|
+| `PreToolUse` | **gate** | the one that blocks. Set an explicit `timeout` (seconds) above `self_timeout_ms` |
+| `PermissionRequest` | **gate** | fires when Claude Code is about to prompt you. Catches the calls lord-kali has no handler for, and prompts raised by Claude Code's own permission rules. Deduped against `PreToolUse` by `tool_use_id`, so one call never reaches the TUI twice |
+| `PostToolUse` | log | what actually ran |
+| `PostToolUseFailure` | log | **a failed call fires this, not `PostToolUse`.** Without it, `watch --tail` counts every failure as a possible rejection |
+| `PermissionDenied` | log | Claude Code's own denials, including auto mode's classifier — carries `denied_by` and `classifier_verdict`. These are otherwise invisible to lord-kali |
+| `SessionStart` / `SessionEnd` | log | session boundaries |
+| `SubagentStart` / `SubagentStop` | log | subagent boundaries |
+| `Stop` | log | turn boundary |
+
+Give the observing events `"async": true` so they run in the background and can never add latency to a tool call. Only the two gate events block.
+
+Two things worth knowing, both from the [hooks reference](https://code.claude.com/docs/en/hooks):
+
+- `PreToolUse` fires **before any permission-mode check**, in every mode including `bypassPermissions`. A hook `deny` cannot be bypassed by changing permission mode. The reverse does not hold — a hook `allow` does not override deny rules in `settings.json`, MCP tools marked `requiresUserInteraction`, or connector tools an organisation set to `ask`. lord-kali can tighten, never loosen.
+- The `command` hook timeout is **600 s by default**, overridable per hook with `timeout` (in seconds). lord-kali still self-times-out at `self_timeout_ms` so its own fallback fires first.
 
 ## Configuration
 
@@ -331,7 +354,12 @@ When `[log]` is enabled, every hook invocation appends one JSON object (one line
 - **`ts_ms`**: epoch milliseconds when the record was written
 - **`lk_event`**: `pre_tool_use` for gate invocations, `post_tool_use` for after-execution records
 
-To capture `post_tool_use` records you must also register the binary as a `PostToolUse` hook (see [Install](#install)). PostToolUse fires only after a tool actually ran (auto-allowed or user-approved), so it never gates — it only logs, and the tool's `tool_response` is stripped to keep records compact.
+`lk_event` is the hook event in snake_case: `pre_tool_use`, `permission_request`, `post_tool_use`, `post_tool_use_failure`, `permission_denied`, `session_start`, `subagent_stop`, and so on. Each is captured only if you registered that event (see [Full hook coverage](#full-hook-coverage)). Unbounded payloads — `tool_response`, `tool_output`, `last_assistant_message` — are stripped to keep records compact.
+
+Two gaps closed by registering more than `PostToolUse`:
+
+- **A failed tool call fires `PostToolUseFailure`, not `PostToolUse`.** Without that event registered, failures are absent from the log entirely, and the `watch --tail` correlation below counts every failure as a possible rejection.
+- **`PermissionDenied` is the only record that Claude Code denied a call itself** — including auto mode's classifier, via `denied_by` and `classifier_verdict`. lord-kali passes a call through, Claude Code kills it downstream, and without this event nothing anywhere records that it happened.
 
 Logging is best-effort: if the log file cannot be created or written, the failure is swallowed so it can never block or alter a gate decision.
 

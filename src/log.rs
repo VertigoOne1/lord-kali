@@ -48,14 +48,39 @@ pub(crate) fn log_event(path: &Path, event: &str, fields: serde_json::Value) {
     append_line_to_path(path, fields.to_string());
 }
 
-pub(crate) fn log_invocation(log_config: &LogConfig, input: &str, trace: &InvocationTrace) {
-    append_log_line(log_config, timestamped_log_line(input, trace));
+// A gate invocation. `hook_event` distinguishes the two events that can gate, so a
+// PermissionRequest decision is not filed as though it were a PreToolUse one.
+pub(crate) fn log_invocation(
+    log_config: &LogConfig,
+    input: &str,
+    trace: &InvocationTrace,
+    hook_event: &str,
+) {
+    append_log_line(log_config, timestamped_log_line(input, trace, hook_event));
 }
 
-// PostToolUse fires only after a tool actually executed (auto-allowed or user-approved
-// at the prompt). It cannot gate, so this path only logs, with no decision and no stdout.
-pub(crate) fn log_post_tool_use(log_config: &LogConfig, input: &str) {
-    append_log_line(log_config, post_tool_use_log_line(input));
+// Events lord-kali observes but never gates — PostToolUse, PostToolUseFailure,
+// PermissionDenied, session and subagent boundaries. They cannot change an outcome, so this
+// path only logs, with no decision and no stdout.
+pub(crate) fn log_observed_event(log_config: &LogConfig, input: &str, hook_event: &str) {
+    append_log_line(log_config, observed_log_line(input, hook_event));
+}
+
+// "PostToolUseFailure" -> "post_tool_use_failure". Derived rather than tabulated, so an event
+// Claude Code adds later gets a sensible key without a code change.
+pub(crate) fn event_key(hook_event: &str) -> String {
+    let mut out = String::with_capacity(hook_event.len() + 4);
+    for (i, c) in hook_event.chars().enumerate() {
+        if c.is_ascii_uppercase() {
+            if i > 0 {
+                out.push('_');
+            }
+            out.push(c.to_ascii_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 pub(crate) fn now_ms() -> u64 {
@@ -177,9 +202,14 @@ fn shape_log_line(
     }
 }
 
-fn post_tool_use_log_line(input: &str) -> String {
-    shape_log_line(input, "post_tool_use", |map| {
+fn observed_log_line(input: &str, hook_event: &str) -> String {
+    shape_log_line(input, &event_key(hook_event), |map| {
+        // Tool payloads and assistant messages are unbounded; the gate never reads them back
+        // and a log that grows by whole tool outputs is a log nobody keeps.
         map.remove("tool_response");
+        map.remove("tool_output");
+        map.remove("updatedOutput");
+        map.remove("last_assistant_message");
     })
 }
 
@@ -205,8 +235,8 @@ fn decision_breakdown(trace: &InvocationTrace) -> serde_json::Value {
     serde_json::Value::Object(obj)
 }
 
-fn timestamped_log_line(input: &str, trace: &InvocationTrace) -> String {
-    shape_log_line(input, "pre_tool_use", |map| {
+fn timestamped_log_line(input: &str, trace: &InvocationTrace, hook_event: &str) -> String {
+    shape_log_line(input, &event_key(hook_event), |map| {
         map.insert("lk_decision".to_string(), decision_breakdown(trace));
     })
 }
@@ -229,6 +259,7 @@ mod tests {
         let line = timestamped_log_line(
             r#"{"tool_name":"Bash","tool_input":{"command":"ls"},"cwd":"/x"}"#,
             &empty_invocation_trace(),
+            "PreToolUse",
         );
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(v["tool_name"], "Bash");
@@ -241,7 +272,7 @@ mod tests {
     #[test]
     fn timestamped_log_line_passes_through_non_object() {
         assert_eq!(
-            timestamped_log_line("not json", &empty_invocation_trace()),
+            timestamped_log_line("not json", &empty_invocation_trace(), "PreToolUse"),
             "not json"
         );
     }
@@ -249,7 +280,7 @@ mod tests {
     #[test]
     fn post_tool_use_line_marks_event_and_strips_response() {
         let input = r#"{"hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{"command":"ls"},"cwd":"/x","session_id":"s1","tool_response":{"stdout":"a","stderr":""}}"#;
-        let line = post_tool_use_log_line(input);
+        let line = observed_log_line(input, "PostToolUse");
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(v["lk_event"], serde_json::json!("post_tool_use"));
         assert_eq!(v["tool_name"], serde_json::json!("Bash"));
@@ -261,10 +292,57 @@ mod tests {
     }
 
     #[test]
+    fn event_key_snake_cases_every_hook_event_name() {
+        assert_eq!(event_key("PostToolUse"), "post_tool_use");
+        assert_eq!(event_key("PostToolUseFailure"), "post_tool_use_failure");
+        assert_eq!(event_key("PermissionDenied"), "permission_denied");
+        assert_eq!(event_key("PermissionRequest"), "permission_request");
+        assert_eq!(event_key("SessionStart"), "session_start");
+        assert_eq!(event_key("Stop"), "stop");
+        // An event Claude Code adds later still gets a usable key.
+        assert_eq!(event_key("SomeFutureEvent"), "some_future_event");
+    }
+
+    // A failure carries `error`, not `tool_response`; the error text is the whole point of
+    // the record, so it must survive the strip.
+    #[test]
+    fn post_tool_use_failure_keeps_the_error() {
+        let input = r#"{"hook_event_name":"PostToolUseFailure","tool_name":"Bash","tool_input":{"command":"ls /nope"},"error":"No such file or directory","tool_use_id":"toolu_1"}"#;
+        let v: serde_json::Value =
+            serde_json::from_str(&observed_log_line(input, "PostToolUseFailure")).unwrap();
+        assert_eq!(v["lk_event"], "post_tool_use_failure");
+        assert_eq!(v["error"], "No such file or directory");
+        assert_eq!(v["tool_use_id"], "toolu_1");
+    }
+
+    // Auto mode's classifier denies calls lord-kali passed through; `denied_by` and
+    // `classifier_verdict` are the only record that it happened.
+    #[test]
+    fn permission_denied_keeps_the_denial_provenance() {
+        let input = r#"{"hook_event_name":"PermissionDenied","tool_name":"Bash","tool_input":{"command":"rm -rf /"},"denied_by":"classifier","classifier_verdict":"destructive"}"#;
+        let v: serde_json::Value =
+            serde_json::from_str(&observed_log_line(input, "PermissionDenied")).unwrap();
+        assert_eq!(v["lk_event"], "permission_denied");
+        assert_eq!(v["denied_by"], "classifier");
+        assert_eq!(v["classifier_verdict"], "destructive");
+    }
+
+    // Session and subagent events carry no tool at all; they must still log cleanly.
+    #[test]
+    fn non_tool_events_log_without_a_tool() {
+        let input = r#"{"hook_event_name":"SessionStart","session_mode":"startup","session_id":"s9","last_assistant_message":"chatty"}"#;
+        let v: serde_json::Value =
+            serde_json::from_str(&observed_log_line(input, "SessionStart")).unwrap();
+        assert_eq!(v["lk_event"], "session_start");
+        assert_eq!(v["session_mode"], "startup");
+        assert!(v.get("last_assistant_message").is_none());
+    }
+
+    #[test]
     fn pre_tool_use_line_marks_event() {
         let input = r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"ls"},"cwd":"/x"}"#;
         let trace = empty_trace("command_chain");
-        let line = timestamped_log_line(input, &trace);
+        let line = timestamped_log_line(input, &trace, "PreToolUse");
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(v["lk_event"], serde_json::json!("pre_tool_use"));
         assert!(v.get("lk_decision").is_some());

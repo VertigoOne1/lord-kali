@@ -1337,6 +1337,9 @@ mod tui {
                 // Best-effort housekeeping; a prune error must never disturb the watch loop.
                 let _ = prune_log_file(log_path, DEFAULT_RETAIN_DAYS, now);
                 tailer.resync_to_end();
+                // Dedupe markers are only written while this TUI is alive, so this is the
+                // process responsible for clearing them.
+                queue::sweep_markers_in(qdir, approval.self_timeout_ms() * 2);
                 next_prune_ms = now + PRUNE_INTERVAL_MS;
             }
 
@@ -1521,7 +1524,18 @@ mod tui {
         let [header, cols] =
             Layout::vertical([Constraint::Length(4), Constraint::Min(1)]).areas(area);
 
+        // Name the event: a PreToolUse call is blocking an agent right now, whereas a
+        // PermissionRequest is a Claude Code prompt lord-kali intercepted. That changes what
+        // a keystroke here does, so it is not something to leave the operator to infer.
+        let (ev_tag, ev_color) = match p.request.hook_event.as_str() {
+            "PermissionRequest" => ("PERM", Color::Magenta),
+            _ => ("PRE", Color::Blue),
+        };
         let mut head = vec![Line::from(vec![
+            Span::styled(
+                format!("{ev_tag} "),
+                Style::new().fg(ev_color).add_modifier(Modifier::BOLD),
+            ),
             Span::styled(
                 format!("{}: ", p.request.tool),
                 Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
@@ -1533,11 +1547,23 @@ mod tui {
             ),
         ])];
         head.push(Line::from(Span::styled(
-            p.request
-                .cwd
-                .as_deref()
-                .map(|c| format!("cwd {c}"))
-                .unwrap_or_default(),
+            [
+                p.request.cwd.as_deref().map(|c| format!("cwd {c}")),
+                p.request
+                    .agent_type
+                    .as_deref()
+                    .map(|a| format!("agent {a}")),
+                // Only when it is not the ordinary mode; otherwise it is noise on every row.
+                p.request
+                    .permission_mode
+                    .as_deref()
+                    .filter(|m| *m != "default")
+                    .map(|m| format!("mode {m}")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("  ·  "),
             Style::new().fg(Color::DarkGray),
         )));
         if let Some(label) = app.llm_labels.get(&p.request.id) {
@@ -1661,13 +1687,47 @@ mod tui {
         f.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
+    // The short tag naming which hook event a stream line came from. With one event the
+    // source was implicit; with several it changes what the line means — a PRE line is
+    // blocking an agent right now, a DENIED line is already over.
+    fn event_tag(lk_event: &str) -> Option<(&'static str, Color)> {
+        match lk_event {
+            "pre_tool_use" => Some(("PRE", Color::Blue)),
+            "permission_request" => Some(("PERM", Color::Magenta)),
+            "permission_denied" => Some(("DENIED", Color::Red)),
+            "post_tool_use_failure" => Some(("FAIL", Color::Red)),
+            _ => None,
+        }
+    }
+
     fn stream_line(line: &str) -> Option<Line<'static>> {
         let v: serde_json::Value = serde_json::from_str(line).ok()?;
-        if v["lk_event"].as_str()? != "pre_tool_use" {
-            return None;
-        }
+        let lk_event = v["lk_event"].as_str()?;
+        let (tag, tag_color) = event_tag(lk_event)?;
         let tool = v["tool_name"].as_str().unwrap_or("?").to_string();
         let target = event_target(&v);
+
+        // Events that report an outcome rather than make one: nothing to decide, so they
+        // render as a one-line note and never reach the approval zone.
+        if lk_event == "permission_denied" || lk_event == "post_tool_use_failure" {
+            let detail = v["classifier_verdict"]
+                .as_str()
+                .or_else(|| v["denied_by"].as_str())
+                .or_else(|| v["error"].as_str())
+                .unwrap_or("");
+            let mut spans = vec![
+                Span::styled(format!("{tag:<6}"), Style::new().fg(tag_color)),
+                Span::raw(format!(" {tool}: {target}")),
+            ];
+            if !detail.is_empty() {
+                spans.push(Span::styled(
+                    format!("  — {detail}"),
+                    Style::new().fg(Color::DarkGray),
+                ));
+            }
+            return Some(Line::from(spans));
+        }
+
         let final_ = v["lk_decision"]["final"].as_str().unwrap_or("?");
         let (label, color) = match final_ {
             "allow" => ("ALLOW".to_string(), Color::Green),
@@ -1677,6 +1737,7 @@ mod tui {
             other => (other.to_string(), Color::Gray),
         };
         let mut spans = vec![
+            Span::styled(format!("{tag:<5}"), Style::new().fg(tag_color)),
             Span::styled(format!("{label:<5}"), Style::new().fg(color)),
             Span::raw(format!("  {tool}: {target}")),
         ];
@@ -1706,6 +1767,9 @@ mod tui {
 
         fn req() -> QueueRequest {
             QueueRequest {
+                hook_event: "PreToolUse".into(),
+                agent_type: None,
+                permission_mode: None,
                 id: "id1".into(),
                 ts_ms: 0,
                 cwd: None,
@@ -1737,6 +1801,9 @@ mod tui {
 
         fn rm_request() -> QueueRequest {
             QueueRequest {
+                hook_event: "PreToolUse".into(),
+                agent_type: None,
+                permission_mode: None,
                 id: "rm1".into(),
                 ts_ms: 0,
                 cwd: None,
@@ -1831,6 +1898,9 @@ mod tui {
 
         fn mcp_request() -> QueueRequest {
             QueueRequest {
+                hook_event: "PreToolUse".into(),
+                agent_type: None,
+                permission_mode: None,
                 id: "mcp1".into(),
                 ts_ms: 0,
                 cwd: None,
@@ -1927,6 +1997,9 @@ mod tui {
 
         fn one_node_request(shell: &str, target: &str) -> QueueRequest {
             QueueRequest {
+                hook_event: "PreToolUse".into(),
+                agent_type: None,
+                permission_mode: None,
                 id: "u1".into(),
                 ts_ms: 0,
                 cwd: None,
@@ -2149,6 +2222,53 @@ mod tui {
             assert_eq!(v["lanes"][0]["node"], "gh");
             assert_eq!(v["lk_llm"]["verdict"], "safe");
             assert_eq!(v["lk_llm"]["reason"], "read-only");
+        }
+
+        // ---- Hook event labelling (docs/D-hook-coverage.md §D8) --------------------------
+
+        #[test]
+        fn stream_tags_name_the_event_that_produced_the_line() {
+            let pre = r#"{"lk_event":"pre_tool_use","tool_name":"Bash","tool_input":{"command":"ls"},"lk_decision":{"final":"passthrough","nodes":[]}}"#;
+            assert!(render(&stream_line(pre).unwrap()).starts_with("PRE"));
+
+            let perm = r#"{"lk_event":"permission_request","tool_name":"Agent","tool_input":{"command":"x"},"lk_decision":{"final":"ask","reason":"confirm","nodes":[]}}"#;
+            assert!(render(&stream_line(perm).unwrap()).starts_with("PERM"));
+        }
+
+        // Auto mode's classifier denials were invisible to lord-kali entirely; they are
+        // informational, so they render as a note and never become a pending call.
+        #[test]
+        fn permission_denied_renders_its_provenance() {
+            let line = r#"{"lk_event":"permission_denied","tool_name":"Bash","tool_input":{"command":"rm -rf /"},"denied_by":"classifier","classifier_verdict":"destructive"}"#;
+            let out = render(&stream_line(line).unwrap());
+            assert!(out.starts_with("DENIED"), "{out}");
+            assert!(out.contains("rm -rf /"), "{out}");
+            assert!(out.contains("destructive"), "{out}");
+        }
+
+        #[test]
+        fn post_tool_use_failure_renders_the_error() {
+            let line = r#"{"lk_event":"post_tool_use_failure","tool_name":"Bash","tool_input":{"command":"ls /nope"},"error":"No such file"}"#;
+            let out = render(&stream_line(line).unwrap());
+            assert!(out.starts_with("FAIL"), "{out}");
+            assert!(out.contains("No such file"), "{out}");
+        }
+
+        // Events with no operator meaning must not clutter the decision stream.
+        #[test]
+        fn observed_lifecycle_events_produce_no_stream_line() {
+            for line in [
+                r#"{"lk_event":"post_tool_use","tool_name":"Bash"}"#,
+                r#"{"lk_event":"session_start","session_mode":"startup"}"#,
+                r#"{"lk_event":"subagent_stop","agent_type":"Explore"}"#,
+                r#"{"lk_event":"llm_consult","target":"ls"}"#,
+            ] {
+                assert!(stream_line(line).is_none(), "{line} should not render");
+            }
+        }
+
+        fn render(l: &Line<'static>) -> String {
+            l.spans.iter().map(|s| s.content.as_ref()).collect()
         }
 
         // Acting before the model answers is not a disagreement, so no verdict is attributed.

@@ -19,7 +19,25 @@ pub(crate) struct QueueRequest {
     pub(crate) cwd: Option<String>,
     pub(crate) tool: String,
     pub(crate) target: String,
+    // Which hook event produced this — "PreToolUse" blocks an agent right now, whereas
+    // "PermissionRequest" is a prompt lord-kali intercepted. The operator needs to know
+    // which, because it changes what a keystroke does. Defaulted so a request written by an
+    // older binary still loads.
+    #[serde(default = "default_hook_event")]
+    pub(crate) hook_event: String,
+    // The subagent this came from, when it came from one; shown so a call can be attributed
+    // when several sessions share one TUI.
+    #[serde(default)]
+    pub(crate) agent_type: Option<String>,
+    // Claude Code's permission mode for this call. The same command carries different weight
+    // under `plan` than under `bypassPermissions`, so the operator is shown which applied.
+    #[serde(default)]
+    pub(crate) permission_mode: Option<String>,
     pub(crate) nodes: Vec<QueueNode>,
+}
+
+fn default_hook_event() -> String {
+    "PreToolUse".to_string()
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -117,6 +135,67 @@ pub(crate) fn is_tui_live_in(dir: &Path, heartbeat_fresh_ms: u64) -> bool {
     }
 }
 
+// ---- tool_use_id dedupe -------------------------------------------------------------------
+//
+// A single tool call can reach the gate twice: once at PreToolUse, and again at
+// PermissionRequest when Claude Code is about to prompt for it. Without a marker the operator
+// would be asked about the same call twice. PreToolUse marks what it queued; PermissionRequest
+// skips anything already marked. Markers are only ever written while a TUI is alive, so the
+// watch that created the need for them is also the process that sweeps them.
+
+const MARKER_SUFFIX: &str = ".seen";
+
+// tool_use_id is `toolu_<base62>` in practice; anything else is reduced to a safe filename
+// rather than trusted into a path.
+fn marker_in(dir: &Path, tool_use_id: &str) -> PathBuf {
+    let safe: String = tool_use_id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .take(96)
+        .collect();
+    dir.join(format!("{safe}{MARKER_SUFFIX}"))
+}
+
+pub(crate) fn mark_queued_in(dir: &Path, tool_use_id: &str) {
+    // Best-effort: a missing marker only risks a second prompt, never a wrong decision.
+    let _ = write_atomic(&marker_in(dir, tool_use_id), &now_ms().to_string());
+}
+
+pub(crate) fn was_queued_in(dir: &Path, tool_use_id: &str, max_age_ms: u64) -> bool {
+    match std::fs::read_to_string(marker_in(dir, tool_use_id)) {
+        Ok(s) => s
+            .trim()
+            .parse::<u64>()
+            .is_ok_and(|ts| now_ms().saturating_sub(ts) <= max_age_ms),
+        Err(_) => false,
+    }
+}
+
+// Drop markers past their usefulness. Called from the watch loop, which already reads this
+// directory every poll.
+pub(crate) fn sweep_markers_in(dir: &Path, max_age_ms: u64) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let path = e.path();
+        let is_marker = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.ends_with(MARKER_SUFFIX));
+        if !is_marker {
+            continue;
+        }
+        let stale = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .is_none_or(|ts| now_ms().saturating_sub(ts) > max_age_ms);
+        if stale {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
 // Enqueue a request and block until the TUI writes a verdict or the timeout elapses.
 // On timeout the request file is removed so the TUI does not keep showing a dead entry.
 pub(crate) fn submit_and_wait_in(
@@ -201,6 +280,9 @@ mod tests {
     #[test]
     fn request_verdict_round_trip() {
         let req = QueueRequest {
+            hook_event: "PreToolUse".into(),
+            agent_type: None,
+            permission_mode: None,
             id: "s1-1-2".into(),
             ts_ms: 7,
             cwd: Some("/x".into()),
@@ -259,6 +341,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         let req = QueueRequest {
+            hook_event: "PreToolUse".into(),
+            agent_type: None,
+            permission_mode: None,
             id: "sess-9-9".into(),
             ts_ms: 0,
             cwd: None,
@@ -286,6 +371,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         let req = QueueRequest {
+            hook_event: "PreToolUse".into(),
+            agent_type: None,
+            permission_mode: None,
             id: "sess-no-verdict".into(),
             ts_ms: 0,
             cwd: None,
@@ -295,5 +383,69 @@ mod tests {
         };
         assert!(submit_and_wait_in(dir, &req, 30, 10).is_none());
         assert!(!queue_dir_in(dir).join("sess-no-verdict.req.json").exists());
+    }
+
+    // ---- tool_use_id dedupe (docs/D-hook-coverage.md §D8) -------------------------------
+
+    #[test]
+    fn a_marked_call_is_recognised_and_an_unmarked_one_is_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        assert!(!was_queued_in(dir, "toolu_01A", 60_000));
+        mark_queued_in(dir, "toolu_01A");
+        assert!(was_queued_in(dir, "toolu_01A", 60_000));
+        assert!(
+            !was_queued_in(dir, "toolu_01B", 60_000),
+            "a different call must not inherit the marker"
+        );
+    }
+
+    // An expired marker must not suppress a genuinely new prompt.
+    #[test]
+    fn an_expired_marker_no_longer_counts_as_queued() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        mark_queued_in(dir, "toolu_01A");
+        assert!(!was_queued_in(dir, "toolu_01A", 0));
+    }
+
+    // tool_use_id arrives from Claude Code; it must never be able to steer a path.
+    #[test]
+    fn marker_names_cannot_escape_the_queue_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let path = marker_in(dir, "../../etc/passwd");
+        assert_eq!(path.parent().unwrap(), dir);
+        assert!(!path.to_string_lossy().contains(".."));
+        mark_queued_in(dir, "../../etc/passwd");
+        assert!(was_queued_in(dir, "../../etc/passwd", 60_000));
+    }
+
+    #[test]
+    fn sweep_drops_stale_markers_and_keeps_fresh_ones_and_other_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        mark_queued_in(dir, "toolu_fresh");
+        write_atomic(&dir.join("toolu_stale.seen"), "1").unwrap();
+        write_atomic(&dir.join("keep.req.json"), "{}").unwrap();
+
+        sweep_markers_in(dir, 60_000);
+
+        assert!(was_queued_in(dir, "toolu_fresh", 60_000));
+        assert!(!dir.join("toolu_stale.seen").exists());
+        assert!(
+            dir.join("keep.req.json").exists(),
+            "sweeping markers must not touch request files"
+        );
+    }
+
+    // A request written by an older binary predates both fields and must still load.
+    #[test]
+    fn a_request_without_the_new_fields_defaults_to_pre_tool_use() {
+        let json = r#"{"id":"x","ts_ms":1,"cwd":null,"tool":"Bash","target":"ls","nodes":[]}"#;
+        let req: QueueRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.hook_event, "PreToolUse");
+        assert_eq!(req.agent_type, None);
+        assert_eq!(req.permission_mode, None);
     }
 }

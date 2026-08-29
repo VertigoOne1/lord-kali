@@ -1440,6 +1440,9 @@ mod tests {
             cwd: None,
             hook_event_name: None,
             session_id: None,
+            tool_use_id: None,
+            permission_mode: None,
+            agent_type: None,
         }
     }
 
@@ -1703,6 +1706,9 @@ projects = ["/home/user/secret"]
             cwd: Some("/home/u/proj/.claude/worktrees/feat".into()),
             hook_event_name: None,
             session_id: None,
+            tool_use_id: None,
+            permission_mode: None,
+            agent_type: None,
         };
         let trace = dispatch(&config, &hook, hook.cwd.as_deref());
         assert_eq!(trace.kind, "worktree_protection");
