@@ -1,6 +1,11 @@
-# All *.toml files in ~/.config/lord-kali/ are loaded in lexicographic order.
+# All *.toml files in the lord-kali config dir are loaded in lexicographic order.
 # Rules from earlier files match first (first-match-wins priority).
 # Split configs like 00-base.toml, 10-bash.toml, 20-groups.toml are supported.
+#
+# NOTE: the settings sections below ([log], [approval], [approval.llm], [file] enabled /
+# mutation_scope, [worktree-protection], [otel]) belong in `settings.toml`, which is the
+# authoritative source for them and REPLACES what the numbered files say. They are shown here
+# for reference; see "Settings vs rules" in the README.
 
 [log]
 enabled = true
@@ -50,6 +55,26 @@ path = "~/.local/state/lord-kali/hook.jsonl"
 # The prompt defaults to the locked taxonomy in code; override here to tune without rebuilding.
 # system = "..."
 # user = "tool: {{tool}}\ncwd: {{cwd}}\ncommand: {{command}}"
+
+# OpenTelemetry export (opt-in; default off). lord-kali is its own OTel producer with its
+# own service.name and namespace — Claude Code's telemetry is separate and stays separate.
+# Note Claude Code strips OTEL_* from every subprocess it spawns, hooks included, so lord-kali
+# never inherits an endpoint; configure it here.
+#
+# The short-lived gate never exports. `lord-kali watch` tails the JSONL and emits OTLP, so a
+# collector that was down loses nothing — the checkpoint resumes from the last exported record.
+# [otel]
+# enabled = true
+# endpoint = "http://localhost:4318"      # /v1/metrics and /v1/logs are appended
+# protocol = "http/json"                  # anything else is a hard error, never a silent downgrade
+# headers_env = "LORD_KALI_OTEL_HEADERS"  # NAME of an env var holding `k=v,k=v`; values are never logged
+# export_interval_ms = 10000
+# metrics = true
+# logs = true
+# include_command = true                  # ships FULL command lines — see `redact` before using a remote collector
+# redact = ['/[A-Za-z0-9_]*(TOKEN|SECRET|PASSWORD|KEY|PAT)=\S+/']
+# service_name = "lord-kali"
+# checkpoint = "~/.local/state/lord-kali/otel.checkpoint"
 
 [bash]
 allowed_commands = [
